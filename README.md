@@ -2,8 +2,9 @@
 
 **An `htop` for what's inside your GPU, not just how full it is.**
 
-Windows + NVIDIA. A terminal UI that connects per-process GPU memory and engine activity
-with loaded runtimes, model files, and LLM buffer breakdowns.
+Windows + NVIDIA, with Linux and WSL support (see [Linux and WSL](#linux-and-wsl)). A terminal UI
+that connects per-process GPU memory and engine activity with loaded runtimes, model files, and
+LLM buffer breakdowns.
 
 Task Manager says "15 GB used." This tries to answer: *by what? Model weights? KV cache?
 Your browser? The desktop compositor? And why is so much GPU memory in system RAM?*
@@ -86,6 +87,118 @@ If an alternate package index makes `--locked` report a stale lockfile on an unc
 `uv run --frozen gputaskman` uses the checked-in lockfile without re-resolving it. `--frozen`
 skips the consistency check, so do not use it after changing dependencies.
 
+## Linux and WSL
+
+Tagged releases include portable Linux builds: `gputaskman-VERSION-linux-x64.tar.gz` and
+`gputaskman-VERSION-linux-arm64.tar.gz`. They need glibc 2.35 or newer (Ubuntu 22.04, Debian 12,
+or newer) and an NVIDIA driver, and work natively, in containers, and in WSL:
+
+```bash
+tar -xzf gputaskman-VERSION-linux-x64.tar.gz
+cd gputaskman-VERSION-linux-x64
+./gputaskman
+```
+
+Or clone and run from source, in a Linux or WSL shell:
+
+```bash
+git clone https://github.com/shanselman/gputaskman.git
+cd gputaskman
+uv run --locked gputaskman
+```
+
+What can be measured depends on where it runs, and the UI says which mode it is in.
+
+| | Native Linux | WSL, interop on (default) | WSL, interop off or `--no-host` |
+|---|---|---|---|
+| Device totals, load, temperature, power, clocks | NVML | NVML | NVML |
+| Per-process VRAM | NVML, measured (in a container: owner matched, `*` or `?`) | Matched from the Windows host, marked `*` or `?` | `n/a` |
+| Per-process GPU load | NVML (SM, encoder, decoder) | `n/a` for Linux processes | `n/a` |
+| Spill / Paged | Not available (blank) | Windows rows only | Not available |
+| WSL VM total, Windows apps | — | Windows host counters | — |
+| Runtimes, model files, LLM breakdown | `/proc/<pid>/maps`, command line | Same | Same |
+
+**Native Linux** reads per-process memory from NVML's running compute and graphics process lists
+and per-process SM, encoder, and decoder load from NVML utilization samples. Linux has no
+equivalent of WDDM's shared-memory or commit counters, so Spill and Paged stay blank rather than
+showing zero. Only processes you can inspect are listed; other users' processes need `sudo`.
+
+JSON uses `null` for unavailable counters, not a measured zero: spill/commit/paged values on
+native Linux, and per-process engine load for WSL Linux rows. Native NVML engine readings remain
+available even if NVML hides that process's VRAM. Windows host rows retain their measured counters.
+
+**Containers** (Docker, Kubernetes, rented GPU boxes) need one more step: NVML reports *host*
+PIDs, which mean nothing in the container's `/proc`, and the container cannot see the host PID of
+its own processes. gputaskman pairs NVML's unresolved PIDs with the container's processes that
+have `libcuda.so` mapped (NVML-only tools such as `nvidia-smi` open the same device files but
+never load libcuda). Both PID namespaces number processes in creation order, so the pairing is by
+order: `*` when the counts match or a process starting while gputaskman runs pins it, `?` when
+NVML lists more compute processes than the container has (another container on the same GPU).
+Per-process GPU load follows the match. Anything left over is shown as `H:<pid>`,
+*outside this container* (for example, the host's display server), and is never looked up locally.
+
+Live check, on a Vast.ai Docker container (Ubuntu 22.04, RTX 3060 Ti, driver 580.82.09): two
+PyTorch jobs already running at startup, a third started while watching, and one killed, were all
+matched to the right container PIDs with their NVML sizes (1.12, 2.52 and 1.59 GB) and live GPU%.
+An Ollama `qwen3:0.6b` runner was detected and named from Ollama's store with `api+mapped+cmdline`
+evidence, its weights / KV-cache / compute split shown, and the TUI rendered. Bare-metal Linux
+(same PID namespace, no matching needed) is covered by tests but has not been run on hardware.
+
+**WSL** is different, because Windows owns the GPU. Linux cannot see how much VRAM its own
+processes use: `nvidia-smi` lists no processes, NVML's per-process samples carry *Windows* PIDs
+(never looked up in Linux's `/proc`), and Windows charges all Linux GPU memory to the VM worker
+process, `vmwp.exe`. When WSL interop is enabled (`/proc/sys/fs/binfmt_misc/WSLInterop` reads
+`enabled`), gputaskman starts one long-lived `powershell.exe` that reads the Windows GPU counters
+through the same PDH array API as the Windows backend and streams them back once a second:
+
+- **WSL VM (`vmwp.exe`)** is the exact total of Linux GPU memory, across every distro, WSLg, and
+  Docker Desktop.
+- **Windows apps** appear as `W:<pid>` rows with their VRAM, spill, paged, and engine load.
+  Windows and Linux PIDs are separate namespaces, so the prefix keeps them apart.
+- **Linux rows** get a size by matching `vmwp.exe`'s GPU contexts to Linux processes (below).
+
+The first host sample takes about 2.5 s; the TUI shows `starting` until then, and `--once` waits
+for it. The host adapter is paired with the NVML device by memory usage, because WSL's adapter
+LUIDs differ from the host's. An ambiguous pairing shows `unmatched` instead of guessing. With other
+Hyper-V VMs or Windows Sandbox running, the row is labeled `VM worker` because it cannot be tied
+to WSL alone. `--no-host` turns the host stream off; without interop you get device-wide numbers
+and a list of the Linux processes that hold `/dev/dxg`, with VRAM shown as `n/a`.
+
+### How WSL per-process VRAM is matched
+
+`vmwp.exe` exposes one GPU-memory instance per guest GPU context, all with the same name: sizes
+without owners. Measured on WSL2 with driver 610.88, every Linux process that opens `/dev/dxg`
+gets exactly one context (an NVML-only process too, at 0 bytes), and Windows lists them **newest
+first**, keeping that order as contexts come and go. Contexts from outside this distro (WSLg, other
+distros, Docker, services you cannot inspect) are interleaved by their own age.
+
+gputaskman follows the contexts from sample to sample and labels them with evidence:
+
+| Marker | Meaning | Established by |
+|---|---|---|
+| `*` matched | Windows' exact size; the owner is inferred, and only one explanation fits (or every one that fits gives the same size) | A new Linux GPU process and a new context appearing together; elimination; this monitor's own context being the only zero-byte candidate at startup; candidate contexts that are exactly the same size |
+| `?` guess | Heuristic owner for processes that were already running | Newer process ↔ newer context, outside contexts assumed oldest; cached foreign sizes can rank extra candidates but never establish ownership |
+| `n/a` | No context could be assigned | For example, a process that has not created its GPU context yet |
+
+A guess is recomputed every refresh and never counts as evidence for itself. An exited process's
+context is held aside until it disappears, so it is not handed to a newcomer, and a context that
+grows by gigabytes between refreshes (weights uploading) keeps an established owner. Multiple
+zero-byte contexts at startup do not pin the monitor to an arbitrary one that might later grow.
+Foreign sizes observed while only the monitor is running are cached per WSL boot in
+`~/.cache/gputaskman/`, but remain hints: a process may exit while the monitor is off and a local
+process may reuse its size. Observed foreign-context exits and idle samples clear obsolete hints.
+
+The matched size also feeds VRAM sorting, initial model selection, the bounded model-file scan
+priority, and the LLM weights / KV-cache breakdown. Inferred Linux rows remain below the VM total
+and are never added to it again. The inspector and `--json` (`vram_inferred_by`) say which kind
+of match each row has.
+
+In one live check, a 2 GB and a 5 GB PyTorch allocation were matched to the right PIDs at
+2.119 GiB and 4.914 GiB: the allocator's own figure plus about 0.26 GiB of CUDA context.
+That is one machine and driver, not a guarantee. A process that started long before it first used
+the GPU can break the start-order guess, and processes started in the same refresh are ordered by
+guess unless their sizes match.
+
 ## What you get
 
 - **Device view:** VRAM usage, GPU activity, memory activity, PCIe traffic, temperature, power,
@@ -125,6 +238,7 @@ uv run --locked gtm                     # shorter alias
 uv run --locked gputaskman -i 2         # sample every two seconds
 uv run --locked gputaskman --once       # one text snapshot
 uv run --locked gputaskman --json       # one JSON snapshot; implies --once
+uv run --locked gputaskman --no-host    # WSL: don't read Windows host counters through interop
 uv run --locked gputaskman --help
 ```
 
@@ -170,7 +284,8 @@ but a runtime DLL or filename alone does not prove which allocation contains whi
 | Question | Evidence | Confidence / limitation |
 |---|---|---|
 | How full and busy is the card? | WDDM adapter counters and NVML | Measured; driver support varies by metric |
-| Which process uses GPU memory? | WDDM process counters | Measured accounting, not a resource ownership graph |
+| Which process uses GPU memory? | WDDM process counters; NVML on Linux | Measured accounting, not a resource ownership graph |
+| Which WSL process uses GPU memory? | Windows host counters for `vmwp.exe`, matched to Linux processes | Exact VM total; per-process owner inferred (`*`) or guessed (`?`) |
 | Which engines are active? | WDDM engine counters | CUDA can appear on the **3D** engine |
 | Which runtime is loaded? | Mapped DLL names | Detection, not proof that every library is doing GPU work |
 | Which model file is present? | Mapped files, CLI flags, GGUF magic/header | A file mapping does not prove GPU placement |
@@ -181,7 +296,8 @@ but a runtime DLL or filename alone does not prove which allocation contains whi
 
 On GeForce under **WDDM**, Windows manages GPU memory and NVML may report per-process memory as
 `N/A`. Windows GPU counters can still attribute memory and activity across Direct3D, Vulkan,
-OpenGL, and CUDA. NVML remains useful for device-level readings.
+OpenGL, and CUDA. NVML remains useful for device-level readings. Under WSL, `nvidia-smi` lists
+no processes at all; see [Linux and WSL](#linux-and-wsl).
 
 ### DWM, Spill, and Paged: read these carefully
 
@@ -350,7 +466,13 @@ file paths, but model and process names still require review.
 | Symptom | What to check |
 |---|---|
 | `uv` or `git` is not recognized | Install the prerequisites, then open a new terminal |
-| Windows-only message | Run on native Windows, not Linux, macOS, or WSL |
+| "supports Windows and Linux/WSL only" | macOS is not supported |
+| WSL: `Windows host counters: off (WSL interop is disabled)` | Enable `[interop]` in `/etc/wsl.conf`, then `wsl --shutdown`; or accept device-wide numbers |
+| WSL: `starting` for a few seconds | The first Windows counter sample takes about 2.5 s |
+| WSL: `unmatched` | No Windows adapter's usage matched the NVML device; multi-GPU WSL is not validated |
+| WSL: Linux rows show `?` | Processes were running before gputaskman started; they become `*` with evidence (see the matching table) |
+| Linux: a GPU process is missing | Processes owned by other users need `sudo`; Docker and other WSL distros are not visible from this one |
+| Linux container: `H:<pid>` rows | GPU processes outside this container's PID namespace (host or other containers); NVML sees them, the container cannot name them |
 | Empty or incomplete GPU readings | Check the NVIDIA driver and WDDM 2.0+ support in `dxdiag`; use a normal local desktop session |
 | Missing DLLs or model details | Protected processes may deny inspection; basic counters can still work without elevation |
 | No exact LLM breakdown | Enable compatible buffer logging, or use the GGUF estimate; API/log access is optional |
@@ -364,8 +486,9 @@ uv run --locked python -m unittest discover -s tests -v
 uv build
 ```
 
-The Windows CI runs hardware-independent checks on Python 3.11 and 3.13. Live GPU behavior
-still needs a real Windows GPU; the CI does not pretend to validate that.
+CI runs hardware-independent checks on Windows and Ubuntu, Python 3.11 and 3.13. Live GPU behavior
+still needs real hardware; the CI does not pretend to validate that. The WSL matching tests replay
+context sequences measured on a real WSL2 machine.
 
 ### Building portable releases
 
@@ -378,15 +501,20 @@ uv run --locked --group release python tools\build_portable.py --arch x64
 # On a native ARM64 interpreter, use --arch arm64 instead.
 ```
 
+The same command on Linux (`tools/build_portable.py`) produces a `.tar.gz`, which keeps the
+executable bit. The builder refuses to package NVIDIA driver libraries (`libnvidia-ml.so`,
+`libcuda.so`) on either platform; they come from the installed driver.
+
 The builder verifies the interpreter and executable architectures, includes Textual resources
 and dependency licenses, and writes the complete portable ZIP and SHA-256 file to `dist`.
 It does not bundle Windows/NVIDIA DLLs, inference servers, or models. Keep uv for development;
 the executable ZIP is for running the monitor without a Python environment.
 
-The **Portable Windows release** GitHub Actions workflow builds on `windows-2022` (x64) and
-`windows-11-arm` (ARM64). A manual run produces downloadable workflow artifacts without publishing
-a release. A pushed `vVERSION` tag must match `project.version` in `pyproject.toml`; once both builds
-pass, the workflow publishes both ZIPs and checksums together with generated release notes.
+The **Portable release** GitHub Actions workflow builds on `windows-2022` (x64), `windows-11-arm`
+(ARM64), `ubuntu-22.04` (Linux x64), and `ubuntu-22.04-arm` (Linux ARM64). Linux builds use the
+oldest supported Ubuntu because the frozen binary needs the build machine's glibc or newer. A manual run produces downloadable workflow artifacts without publishing
+a release. A pushed `vVERSION` tag must match `project.version` in `pyproject.toml`; once all builds
+pass, the workflow publishes all four archives and checksums together with generated release notes.
 Build jobs have read-only permissions; only the tag-triggered publish job can write releases.
 CI checks the extracted executable's `--help` outside the checkout with Python removed from `PATH`;
 interactive rendering and real GPU snapshots require local hardware testing.
@@ -403,6 +531,8 @@ downloads are bundled in this repository.
 | Module | Responsibility |
 |---|---|
 | `pdh.py` / `dxgi.py` | Windows counters and adapter enumeration |
+| `linux.py` | Linux backend: NVML adapters and per-process usage, container PID matching, WSL detection, `/dev/dxg` holders |
+| `wslhost.py` | WSL: interop check, Windows host counter stream, adapter pairing, context matching |
 | `nvml.py` | NVIDIA device readings |
 | `procinfo.py` | Runtime, mapped-file, and process discovery |
 | `stores.py` | Friendly names from Ollama, LM Studio, and Hugging Face model stores |
@@ -416,6 +546,8 @@ downloads are bundled in this repository.
 - Model identity for non-GGUF runtimes (ONNX Runtime, PyTorch, TensorRT) beyond installed candidates.
 - Explicit provenance and availability for every counter and estimate.
 - Reliable multi-GPU matching and per-device model placement.
+- Bare-metal Linux validation on hardware; AMD and Intel GPUs on Linux through DRM fdinfo.
+- WSL: per-process GPU load for Linux rows, and Ollama's systemd journal as a log source.
 - Live throughput deltas, LM Studio validation, and per-model context accounting.
 - Opt-in ETW file-open tracing to name models loaded by read-and-close runtimes (any whisper or ONNX
   app), correlated with the process's VRAM jump at load time.

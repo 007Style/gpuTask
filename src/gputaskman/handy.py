@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -118,8 +119,14 @@ def inspect_handy(
     localappdata: str | None = None,
 ) -> HandyEvidence | None:
     """Read Handy's selected model and latest model event after this process started."""
-    appdata = os.environ.get("APPDATA", "") if appdata is None else appdata
-    localappdata = os.environ.get("LOCALAPPDATA", "") if localappdata is None else localappdata
+    if sys.platform == "win32":
+        default_data = os.environ.get("APPDATA", "")
+        default_local = os.environ.get("LOCALAPPDATA", "")
+    else:  # Tauri keeps both the settings store and logs/ under the XDG data dir on Linux
+        default_data = default_local = os.environ.get("XDG_DATA_HOME") or os.path.join(
+            os.path.expanduser("~"), ".local", "share")
+    appdata = default_data if appdata is None else appdata
+    localappdata = default_local if localappdata is None else localappdata
     settings_path = os.path.join(appdata, "com.pais.handy", "settings_store.json")
     log_path = os.path.join(localappdata, "com.pais.handy", "logs", "handy.log")
     selected = _selected_model(settings_path)

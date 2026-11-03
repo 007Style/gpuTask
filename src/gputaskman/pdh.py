@@ -13,8 +13,6 @@ from collections import defaultdict
 from ctypes import wintypes
 from dataclasses import dataclass, field
 
-_pdh = ctypes.WinDLL("pdh")
-
 PDH_FMT_DOUBLE = 0x00000200
 PDH_FMT_NOCAP100 = 0x00008000
 PDH_MORE_DATA = 0x800007D2
@@ -37,15 +35,26 @@ class _Item(ctypes.Structure):
     _fields_ = [("szName", ctypes.c_wchar_p), ("FmtValue", _FmtValue)]
 
 
-_pdh.PdhOpenQueryW.argtypes = [wintypes.LPCWSTR, ctypes.c_size_t, ctypes.POINTER(wintypes.HANDLE)]
-_pdh.PdhAddEnglishCounterW.argtypes = [wintypes.HANDLE, wintypes.LPCWSTR, ctypes.c_size_t, ctypes.POINTER(wintypes.HANDLE)]
-_pdh.PdhCollectQueryData.argtypes = [wintypes.HANDLE]
-_pdh.PdhGetFormattedCounterArrayW.argtypes = [
-    wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p,
-]
-_pdh.PdhCloseQuery.argtypes = [wintypes.HANDLE]
-for _fn in ("PdhOpenQueryW", "PdhAddEnglishCounterW", "PdhCollectQueryData", "PdhGetFormattedCounterArrayW", "PdhCloseQuery"):
-    getattr(_pdh, _fn).restype = wintypes.DWORD
+_pdh = None
+
+
+def _load_pdh():
+    """pdh.dll is loaded on first use so this module imports cleanly on Linux."""
+    global _pdh
+    if _pdh is None:
+        lib = ctypes.WinDLL("pdh")
+        lib.PdhOpenQueryW.argtypes = [wintypes.LPCWSTR, ctypes.c_size_t, ctypes.POINTER(wintypes.HANDLE)]
+        lib.PdhAddEnglishCounterW.argtypes = [wintypes.HANDLE, wintypes.LPCWSTR, ctypes.c_size_t, ctypes.POINTER(wintypes.HANDLE)]
+        lib.PdhCollectQueryData.argtypes = [wintypes.HANDLE]
+        lib.PdhGetFormattedCounterArrayW.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p,
+        ]
+        lib.PdhCloseQuery.argtypes = [wintypes.HANDLE]
+        for _fn in ("PdhOpenQueryW", "PdhAddEnglishCounterW", "PdhCollectQueryData", "PdhGetFormattedCounterArrayW", "PdhCloseQuery"):
+            getattr(lib, _fn).restype = wintypes.DWORD
+        _pdh = lib
+    return _pdh
+
 
 _LUID_RE = r"luid_0x([0-9a-fA-F]+)_0x([0-9a-fA-F]+)"
 _PROC_RE = re.compile(rf"pid_(\d+)_{_LUID_RE}_phys_(\d+)")
@@ -63,6 +72,18 @@ class ProcGpu:
     shared: float = 0.0  # bytes resident in shared (system RAM) GPU memory -- "spill" ("Non Local Usage")
     committed: float = 0.0  # all GPU memory this process allocated, resident or not ("Total Committed")
     engines: dict[str, float] = field(default_factory=lambda: defaultdict(float))  # engtype -> util %
+    # False when per-process VRAM is unavailable. Native NVML may still report engines independently;
+    # WSL charges every Linux process's VRAM and engine activity to the Windows VM worker.
+    attributed: bool = True
+    # WSL: VRAM matched from the VM's GPU contexts (see wslhost.ContextTracker). An exact counter value whose
+    # owner is inferred; kept apart from `dedicated` so it isn't counted twice next to the WSL VM row.
+    inferred: float | None = None
+    inferred_by: str = ""  # "consistent" (candidates agree on bytes) | "order" (heuristic owner)
+
+    @property
+    def shown_vram(self) -> float | None:
+        """Measured or inferred bytes for display and priority, not for summing adapter totals."""
+        return self.dedicated if self.attributed else self.inferred
 
     @property
     def paged_out(self) -> float:
@@ -96,6 +117,7 @@ class GpuCounters:
     }
 
     def __init__(self) -> None:
+        _load_pdh()
         self._query = wintypes.HANDLE()
         self._check(_pdh.PdhOpenQueryW(None, 0, ctypes.byref(self._query)), "PdhOpenQuery")
         self._handles: dict[str, wintypes.HANDLE] = {}

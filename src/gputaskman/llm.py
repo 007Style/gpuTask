@@ -14,6 +14,7 @@ import dataclasses
 import json
 import os
 import re
+import sys
 import time
 import urllib.request
 from dataclasses import dataclass, field
@@ -107,7 +108,10 @@ def parse_load_log(path: str, not_before: float = 0.0) -> dict[str, dict[str, in
 
 
 def ollama_log_path() -> str:
-    return os.path.join(os.environ.get("LOCALAPPDATA", ""), "Ollama", "server.log")
+    if sys.platform == "win32":
+        return os.path.join(os.environ.get("LOCALAPPDATA", ""), "Ollama", "server.log")
+    # Linux service installs log to the systemd journal; a user-run `ollama serve` may write here.
+    return os.path.join(os.path.expanduser("~"), ".ollama", "logs", "server.log")
 
 
 # ---------------------------------------------------------------- local servers
@@ -330,7 +334,7 @@ def _merge_api(files: list[MappedModel], server: ServerInfo | None, host: Server
 
 
 def build_view(d: ProcDetail, vram: float, shared: float, server: ServerInfo | None,
-               log_path: str | None = None, host: ServerInfo | None = None) -> LlmView:
+               log_path: str | None = None, host: ServerInfo | None = None, attributed: bool = True) -> LlmView:
     v = LlmView(flags=parse_flags(d.cmdline), server=server, host=host)
     files = [dataclasses.replace(m, sources=list(m.sources)) for m in d.models]  # cached details stay untouched
     matched = _merge_api(files, server, host)
@@ -363,7 +367,7 @@ def build_view(d: ProcDetail, vram: float, shared: float, server: ServerInfo | N
     primaries = [g for g in v.models if g.kind not in _SIDE_KINDS]
     no_kv = bool(primaries) and all(not g.causal for g in primaries)
 
-    total = int(vram)
+    total = int(vram) if attributed else None  # None: the OS can't say how much VRAM this process holds
     if v.log:
         gpu = {dev: kinds for dev, kinds in v.log.items() if is_gpu_device(dev)}
         acc = 0
@@ -376,22 +380,27 @@ def build_view(d: ProcDetail, vram: float, shared: float, server: ServerInfo | N
         cpu_w = sum(k.get("weights", 0) for dev, k in v.log.items() if not is_gpu_device(dev))
         if cpu_w and main and cpu_w > main.token_embd_bytes * 1.5:
             v.notes.append(f"{gb(cpu_w)} of weights are on the CPU side (partial offload or CPU-mapped).")
-        if total > acc:
+        if total is not None and total > acc:
             v.segments.append(Segment("runtime and other overhead", total - acc, "runtime"))
     else:
         ngl = v.flags.get("ngl") if len(v.models) == 1 else None
         weights = sum(g.gpu_weight_bytes(ngl) for g in v.models if g.kind != "LoRA adapter")
         weights += sum(g.tensor_bytes for g in v.models if g.kind == "LoRA adapter")
-        if weights > total * 1.03 and total > 0:
+        if total is not None and weights > total * 1.03 and total > 0:
             v.notes.append(f"Weights need ~{gb(weights)} but the process holds {gb(total)} of VRAM: "
                            "partial offload, paging, or placement on another GPU may explain the gap.")
             weights = total
         if weights:
             label = "weights" if len(v.models) == 1 else f"weights ({len(v.models)} files)"
             v.segments.append(Segment(label, weights, "weights"))
-        rest = total - weights
         kv = v.kv_per_token * v.n_ctx if (v.kv_per_token and v.n_ctx) else 0
-        if kv and kv <= rest:
+        rest = total - weights if total is not None else None
+        if rest is None:
+            if kv:
+                v.segments.append(Segment(f"KV cache ({v.n_ctx:,} ctx, {v.kv_type}) est.", kv, "kv"))
+            v.notes.append("This process's VRAM total is unknown (WSL charges it to the VM on the Windows host, "
+                           "or the driver hides per-process memory); segments are estimates from the model file and launch flags.")
+        elif kv and kv <= rest:
             swa = main.sliding_window if main else None
             v.segments.append(Segment(f"KV cache ({v.n_ctx:,} ctx, {v.kv_type}) est.{' max' if swa else ''}", kv, "kv"))
             if swa:
@@ -405,7 +414,7 @@ def build_view(d: ProcDetail, vram: float, shared: float, server: ServerInfo | N
         elif rest > 0:
             v.segments.append(Segment("KV cache + compute + runtime", rest, "unknown"))
 
-    if not v.models and not v.log and total > 0:
+    if not v.models and not v.log and total:
         v.notes.append("No GGUF mapped. Model may be loaded with --no-mmap or via another format.")
     if no_kv:
         kinds = ", ".join(sorted({f"{g.decision_type} {g.kind}" if g.decision_type else g.kind for g in primaries}))
@@ -416,7 +425,7 @@ def build_view(d: ProcDetail, vram: float, shared: float, server: ServerInfo | N
     if shared > 256 * MiB:
         v.notes.append(f"! {gb(shared)} is in SHARED GPU memory (system RAM over PCIe). "
                        "May include pinned host buffers; under VRAM pressure, fallback can slow inference.")
-    if total < 64 * MiB and v.models:
+    if total is not None and total < 64 * MiB and v.models:
         v.notes.append("Model is mapped but almost nothing is in VRAM: CPU inference, or another GPU.")
     for front in (s for s in (server, host) if s and s.kind == "ollama"):
         mine = [om for om in front.models if om in matched]

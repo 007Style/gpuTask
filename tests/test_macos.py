@@ -61,6 +61,12 @@ class ParseTests(unittest.TestCase):
         self.assertIsNone(macos.parse_accelerator([{"model": "x"}]))
         self.assertIsNone(macos.parse_accelerator(None))
 
+    def test_missing_device_allocation_is_unknown_not_zero(self):
+        stats = accel()[0]["PerformanceStatistics"]
+        del stats["Alloc system memory"]
+        dev = macos.parse_accelerator([{"model": "Apple M4", "PerformanceStatistics": stats}])
+        self.assertIsNone(dev.allocated)
+
     def test_gpu_time_is_kept_per_client(self):
         # WindowServer has several Metal clients; runningboardd has one with no usage yet
         times = macos.parse_clients([client(167, "WindowServer", 53012153708, 17704333, cid=11),
@@ -138,6 +144,23 @@ class CountersTests(unittest.TestCase):
         self.assertTrue(g.attributed)  # owner re-read: now measurable
         self.assertEqual(poller.targets, [(1, "same", True)])
 
+    def test_unknown_process_identity_disables_rate_and_footprint_attribution(self):
+        c, poller = self.counters({1: 3 * GiB}, {1: ME})
+        self.sample(c, accel(), [client(1, "a", 5 * 10**9, cid=7)], now=1.0)
+        self.identities[1] = None
+        procs, _ = self.sample(c, accel(), [client(1, "a", 6 * 10**9, cid=7)], now=2.0)
+        g = procs[macos.ADAPTER_KEY][1]
+        self.assertNotIn("engine", g.available)
+        self.assertFalse(g.attributed)
+        self.assertEqual(poller.targets, [])
+
+        self.identities[1] = "same"
+        procs, _ = self.sample(c, accel(), [client(1, "a", 20 * 10**9, cid=7)], now=3.0)
+        g = procs[macos.ADAPTER_KEY][1]
+        self.assertNotIn("engine", g.available)  # establish a fresh baseline without a fabricated spike
+        procs, _ = self.sample(c, accel(), [client(1, "a", 21 * 10**9, cid=7)], now=4.0)
+        self.assertAlmostEqual(procs[macos.ADAPTER_KEY][1].gpu_pct, 100.0)
+
     def test_root_measures_every_process(self):
         c, poller = self.counters({}, {167: ROOT, 486: ME}, root=True)
         self.sample(c, accel(), [client(167, "WindowServer", 0, cid=1), client(486, "wezterm-gui", 0, cid=2)], now=1.0)
@@ -150,6 +173,32 @@ class CountersTests(unittest.TestCase):
         _, adapters = self.sample(c, [], [], now=2.0)  # ioreg failed or returned nothing
         self.assertIsNone(c.device)
         self.assertNotIn(macos.ADAPTER_KEY, adapters)
+
+    def test_missing_device_allocation_is_unknown_not_zero(self):
+        stats = accel()[0]["PerformanceStatistics"]
+        del stats["Alloc system memory"]
+        entries = [{"model": "Apple M4", "PerformanceStatistics": stats}]
+        c, _ = self.counters({}, {})
+        _, adapters = self.sample(c, entries, [], now=1.0)
+        self.assertIsNone(c.device.mem_used)
+        self.assertIsNone(adapters[macos.ADAPTER_KEY].dedicated)
+
+    def test_failed_client_read_preserves_baseline_and_footprint_targets(self):
+        c, poller = self.counters({1: GiB}, {1: ME})
+        first = [client(1, "python", 10 * 10**9, cid=7)]
+        self.sample(c, accel(), first, now=100.0)
+        previous = c._prev.copy()
+        targets = poller.targets.copy()
+        with patch.object(macos, "_ioreg", return_value=None):
+            _, adapters = self.sample(c, accel(), None, now=101.0)
+        self.assertEqual(c._prev, previous)
+        self.assertEqual(c._last, 100.0)
+        self.assertEqual(poller.targets, targets)
+        self.assertEqual(adapters[macos.ADAPTER_KEY].dedicated, accel()[0]["PerformanceStatistics"]["Alloc system memory"])
+
+        later = [client(1, "python", 11 * 10**9, cid=7)]
+        procs, _ = self.sample(c, accel(), later, now=102.0)
+        self.assertAlmostEqual(procs[macos.ADAPTER_KEY][1].gpu_pct, 50.0)
 
 
 class PollerTests(unittest.TestCase):

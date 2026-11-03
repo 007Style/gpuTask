@@ -55,7 +55,7 @@ class DeviceStats:
     utilization: float | None = None  # Device Utilization %
     renderer: float | None = None
     tiler: float | None = None
-    allocated: int = 0  # Alloc system memory: GPU allocations, all processes
+    allocated: int | None = None  # Alloc system memory: GPU allocations, all processes
 
 
 def parse_accelerator(entries: list | None) -> DeviceStats | None:
@@ -63,10 +63,11 @@ def parse_accelerator(entries: list | None) -> DeviceStats | None:
         stats = e.get("PerformanceStatistics")
         if not isinstance(stats, dict):
             continue
+        allocated = stats.get("Alloc system memory")
         return DeviceStats(model=str(e.get("model", "Apple GPU")), cores=e.get("gpu-core-count"),
                            utilization=stats.get("Device Utilization %"),
                            renderer=stats.get("Renderer Utilization %"), tiler=stats.get("Tiler Utilization %"),
-                           allocated=int(stats.get("Alloc system memory", 0)))
+                           allocated=int(allocated) if allocated is not None else None)
     return None
 
 
@@ -250,6 +251,7 @@ class MacCounters:
         self._last: float | None = None  # monotonic time of the previous sample
         self._owners: dict[int, int | None] = {}
         self._names: dict[int, str] = {}
+        self._unknown_identity: set[int] = set()
         self.poller = poller or FootprintPoller()
         self.poller.start()
         self.sample()  # baseline: GPU% is a rate, like the WDDM counters' first collection
@@ -278,25 +280,38 @@ class MacCounters:
         if dev is None:
             self.device = None  # no reading this time: never keep showing the last one as current
         else:
-            adapters[ADAPTER_KEY].dedicated = float(dev.allocated)
+            if dev.allocated is not None:
+                adapters[ADAPTER_KEY].dedicated = float(dev.allocated)
             self.device = NvDevice(index=0, name=dev.model, driver_model="Metal", mem_total=physical_memory(),
                                    mem_used=dev.allocated, util_gpu=dev.utilization, source="IOKit")
+        if clients is None:
+            # A failed client query is not an empty client list: preserve the last valid rate baseline and
+            # footprint targets so the next successful sample spans the full elapsed interval.
+            return procs, adapters
         per_pid = parse_clients(clients)
         elapsed = now - self._last if self._last is not None else None
         targets: list[tuple[float, int, object]] = []
         current: dict[int, tuple[object, dict[int, int]]] = {}
         for pid, times in per_pid.items():
             ident = self._identity(pid)
+            was_unknown = pid in self._unknown_identity
             prev = self._prev.get(pid)
-            if prev is None or prev[0] != ident:
+            if ident is None:
+                self._unknown_identity.add(pid)
+                self._owners.pop(pid, None)
+                self._names.pop(pid, None)
+                prev_times = {}
+            elif prev is None or prev[0] != ident or was_unknown:
                 prev_times = {}
                 self._owners.pop(pid, None)  # new or reused PID: re-read its owner and name
                 self._names.pop(pid, None)
             else:
                 prev_times = prev[1]
-            current[pid] = (ident, times)
-            pct = 0.0
-            if elapsed and elapsed > 0:
+            if ident is not None:
+                current[pid] = (ident, times)
+                self._unknown_identity.discard(pid)
+            pct = None if ident is None or was_unknown else 0.0
+            if pct is not None and elapsed and elapsed > 0:
                 # A client that appeared since the last sample did all of its work in this interval.
                 busy_ns = sum(max(ns - prev_times.get(cid, 0), 0) for cid, ns in times.items())
                 pct = min(busy_ns / 1e9 / elapsed * 100.0, 100.0)
@@ -304,21 +319,27 @@ class MacCounters:
                 self._owners[pid] = self._owner(pid)
             mine = self._root or self._owners[pid] == self._uid
             g = ProcGpu()
-            if pct:
+            if pct is None:
+                g.available.discard("engine")
+            elif pct:
                 g.engines["gpu"] = pct
             if mine:
-                targets.append((pct, pid, ident))
-                size = self.poller.get(pid, ident)
+                if ident is not None:
+                    targets.append((pct or 0.0, pid, ident))
+                    size = self.poller.get(pid, ident)
+                else:
+                    size = None
                 if size is None:
                     g.attributed = False  # not measured yet (or footprint failed): unknown, not zero
                 else:
                     g.dedicated = float(size)
             else:
                 g.attributed = False  # footprint needs root for other users' processes
-                if pct < 0.5 and self._name(pid).lower() not in ALWAYS_SHOWN:
+                if (pct is None or pct < 0.5) and self._name(pid).lower() not in ALWAYS_SHOWN:
                     continue
             procs[ADAPTER_KEY][pid] = g
         self._prev, self._last = current, now
+        self._unknown_identity.intersection_update(per_pid)
         self._owners = {p: o for p, o in self._owners.items() if p in per_pid}
         self._names = {p: n for p, n in self._names.items() if p in per_pid}
         targets.sort(key=lambda t: -t[0])

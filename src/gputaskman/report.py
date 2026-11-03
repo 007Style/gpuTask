@@ -34,6 +34,11 @@ def has_wddm_counters(s: Snapshot, row: ProcRow) -> bool:
     return s.backend == "wddm" or row.origin == "windows"
 
 
+def has_spill_counters(s: Snapshot, row: ProcRow) -> bool:
+    """Per-process GPU memory in system RAM: WDDM's non-local usage, or amdgpu's GTT on Linux."""
+    return (has_wddm_counters(s, row) or (s.backend == "drm" and not row.host)) and "shared" in row.gpu.available
+
+
 def has_engine_counters(s: Snapshot, row: ProcRow) -> bool:
     return (s.backend != "wsl" or row.origin == "windows") and "engine" in row.gpu.available
 
@@ -51,6 +56,11 @@ ORDER_NOTE = ("? order guess: the size is exact but several owners fit, so newer
               "GPU contexts / PIDs and outside ones are assumed oldest. Cached foreign-size hints only rank extra "
               "candidates; they never prove ownership. Becomes * with evidence, such as a process starting while "
               "gputaskman runs.")
+
+
+DRM_UNSPLIT_NOTE = ("VRAM n/a: this kernel's amdgpu fdinfo has no drm-shared-* keys, so resident memory includes "
+                    "every buffer imported from other processes and would be counted once per importer. Newer "
+                    "kernels report shared buffers separately.")
 
 
 def inferred_note(g) -> str:
@@ -73,7 +83,8 @@ def to_dict(s: Snapshot) -> dict:
             "vram_attributed": p.gpu.attributed, "vram_inferred_bytes": p.gpu.inferred,
             "vram_inferred_by": p.gpu.inferred_by or None,
             "vram_bytes": int(p.gpu.dedicated) if p.gpu.attributed and "dedicated" in p.gpu.available else None,
-            "shared_bytes": int(p.gpu.shared) if wddm and "shared" in p.gpu.available else None,
+            "vram_shared_bytes": int(p.gpu.shared_vram) if s.backend == "drm" and not p.host else None,
+            "shared_bytes": int(p.gpu.shared) if has_spill_counters(s, p) else None,
             "committed_bytes": int(p.gpu.committed) if wddm and "committed" in p.gpu.available else None,
             "paged_out_bytes": int(p.gpu.paged_out) if wddm and p.gpu.paged_available else None,
             "gpu_pct": round(p.gpu.gpu_pct, 1) if engines else None,
@@ -129,7 +140,7 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
         used = gb(s.vram_used) if s.vram_used is not None else "N/A"
         shared = gb(s.shared_used) if s.shared_used is not None else "N/A"
         memory = f"VRAM {used} / {gb(s.vram_total)}"
-        if s.backend == "wddm" or s.host_data:
+        if s.backend in ("wddm", "drm") or s.host_data:
             memory += f"   shared (in system RAM) {shared}"
         out.append(memory)
     if s.backend == "wsl":
@@ -155,7 +166,7 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
     out.append(f"{'PID':>{w}}  {'PROCESS':<24} {'KIND':<10} {'RUNTIME':<24} {'VRAM':>9} {'SPILL':>8} {'PAGED':>8} {'GPU%':>5}  INSIDE")
     for p in shown:
         wddm = has_wddm_counters(s, p)
-        spill = gb(p.gpu.shared) if wddm and p.gpu.shared >= 1 << 20 else ""
+        spill = gb(p.gpu.shared) if has_spill_counters(s, p) and p.gpu.shared >= 1 << 20 else ""
         paged = gb(p.gpu.paged_out) if wddm and p.gpu.paged_out >= 1 << 20 else ""
         if wddm and "shared" not in p.gpu.available:
             spill = "N/A"
@@ -169,6 +180,8 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
         out.append(INFERRED_NOTE)
     if any(p.gpu.inferred_by == "order" for p in shown):
         out.append(ORDER_NOTE)
+    if s.backend == "drm" and any(not p.host and not p.gpu.attributed for p in shown):
+        out.append(DRM_UNSPLIT_NOTE)
     if s.backend == "wsl" and s.wsl_split and any(not p.host and not p.gpu.attributed and p.gpu.inferred is None
                                                   for p in s.procs):
         out.append(f"Linux VRAM split: {s.wsl_split}")

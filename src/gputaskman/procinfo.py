@@ -438,7 +438,7 @@ def classify(d: ProcDetail, engines: dict[str, float]) -> str:
         return "decision?"
     if "llama.cpp" in d.runtimes or n.startswith(LLM_NAMES):
         return "LLM"
-    video = engines.get("decode", 0) + engines.get("encode", 0) > 1
+    video = engines.get("decode", 0) + engines.get("encode", 0) + engines.get("video", 0) > 1
     if d.is_ai and not video:
         return "AI"
     if n in BROWSERS:

@@ -84,6 +84,9 @@ class ProcGpu:
     # owner is inferred; kept apart from `dedicated` so it isn't counted twice next to the WSL VM row.
     inferred: float | None = None
     inferred_by: str = ""  # "consistent" (candidates agree on bytes) | "order" (heuristic owner)
+    # amdgpu (DRM fdinfo): resident VRAM in buffers shared with other DRM clients, kept out of `dedicated`. fdinfo
+    # can't say which client owns a shared buffer, so it is shown apart and left in the adapter's unattributed part.
+    shared_vram: float = 0.0
 
     @property
     def shown_vram(self) -> float | None:

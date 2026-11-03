@@ -172,7 +172,7 @@ gputaskman follows the contexts from sample to sample and labels them with evide
 
 | Marker | Meaning | Established by |
 |---|---|---|
-| `*` matched | Windows' exact size; the owner is inferred, and only one explanation fits | A new Linux GPU process and a new context appearing together; elimination; contexts seen while no Linux process in this distro used the GPU (remembered for this WSL boot in `~/.cache/gputaskman/`); this monitor's own 0-byte context being newest at startup |
+| `*` matched | Windows' exact size; the owner is inferred, and only one explanation fits (or every one that fits gives the same size) | A new Linux GPU process and a new context appearing together; elimination; contexts seen when gputaskman starts while no other Linux process in this distro uses the GPU (remembered for this WSL boot in `~/.cache/gputaskman/`); this monitor's own 0-byte context being newest at startup; candidate contexts that are exactly the same size |
 | `?` guess | Start-order guess for processes that were already running | Newer process ↔ newer context, outside contexts assumed oldest |
 | `n/a` | No context could be assigned | For example, a process that has not created its GPU context yet |
 

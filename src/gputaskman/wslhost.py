@@ -305,8 +305,8 @@ class ContextTracker:
 
     Contexts are aligned sample to sample (survivors keep their order). A match becomes *sure* only from
     evidence: a new Linux GPU process and a new context appearing together, elimination (as many unsure
-    contexts as unsure processes, and just one process), contexts seen while no Linux process holds the GPU
-    (foreign; cached per WSL boot), or this monitor's own 0-byte context being the newest at startup.
+    contexts as unsure processes, and just one process), contexts seen at startup while no other Linux process
+    holds the GPU (foreign; cached per WSL boot), or this monitor's own 0-byte context being the newest at startup.
     Everything else is an order guess (newest process <-> newest context, foreign assumed oldest),
     recomputed each sample and never used as evidence.
     """
@@ -453,6 +453,9 @@ class ContextTracker:
         elif first:
             if self.self_pid in start and cur and cur[0].value <= self.TOL_MIN:
                 cur[0].label, cur[0].sure = self.self_pid, True  # our NVML context: newest when we start
+            if set(start) == {self.self_pid} and cur and cur[0].label == self.self_pid:
+                for e in cur[1:]:  # nothing else in this distro holds the GPU: the rest is foreign
+                    e.label, e.sure = FOREIGN, True
             for v in self.cached_foreign:
                 free = [e for e in reversed(cur) if e.label is None and abs(e.value - v) <= self._tol(v)]
                 if free:
@@ -482,8 +485,9 @@ class ContextTracker:
             if len(free) == len(unsure) == 1 and not recent:
                 free[0].label, free[0].sure = unsure[0], True
             else:
+                # Exactly equal only: within tolerance, a swapped owner would show the wrong bytes.
                 same = (len(free) == len(unsure) > 1 and not recent
-                        and all(abs(e.value - free[0].value) <= self._tol(free[0].value) for e in free))
+                        and all(e.value == free[0].value for e in free))
                 for pid, e in zip(unsure, free):  # newest process <-> newest context; leftovers are foreign
                     # Equal sizes make the shown bytes right, not the owner: never carried as evidence.
                     e.label, e.same = pid, same

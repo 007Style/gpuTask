@@ -38,7 +38,8 @@ def vram_label(g) -> str:
 
 
 INFERRED_NOTE = ("* matched: the size is exact (Windows' counter for a WSL VM GPU context, or NVML for a host PID "
-                 "seen from a container); which local process owns it is inferred, and only one explanation fits.")
+                 "seen from a container); which local process owns it is inferred, and only one explanation fits "
+                 "(or every one that fits gives the same size).")
 ORDER_NOTE = ("? order guess: the size is exact but several owners fit, so newer processes are paired with newer "
               "GPU contexts / PIDs and outside ones are assumed oldest. Becomes * with evidence, such as a process "
               "starting while gputaskman runs.")
@@ -111,15 +112,16 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
                    f"PCIe rx {format_metric(rx, '.0f')} MB/s "
                    f"tx {format_metric(tx, '.0f')} MB/s")
     out.append("")
-    out.append(f"{'PID':>7}  {'PROCESS':<24} {'KIND':<10} {'RUNTIME':<24} {'VRAM':>9} {'SPILL':>8} {'PAGED':>8} {'GPU%':>5}  INSIDE")
-    for p in s.procs[:limit]:
+    shown = s.procs[:limit]
+    w = max([7] + [len(p.pid_label) for p in shown])  # host PIDs like W:120880 are wider
+    out.append(f"{'PID':>{w}}  {'PROCESS':<24} {'KIND':<10} {'RUNTIME':<24} {'VRAM':>9} {'SPILL':>8} {'PAGED':>8} {'GPU%':>5}  INSIDE")
+    for p in shown:
         spill = gb(p.gpu.shared) if p.gpu.shared >= 1 << 20 else ""
         paged = gb(p.gpu.paged_out) if p.gpu.paged_out >= 1 << 20 else ""
         pid = p.pid_label
         pct = f"{p.gpu.gpu_pct:.0f}" if p.gpu.attributed else "n/a"
-        out.append(f"{pid:>7}  {p.name[:24]:<24} {p.kind:<10} {p.runtime[:24]:<24} {vram_label(p.gpu):>9} {spill:>8} "
+        out.append(f"{pid:>{w}}  {p.name[:24]:<24} {p.kind:<10} {p.runtime[:24]:<24} {vram_label(p.gpu):>9} {spill:>8} "
                    f"{paged:>8} {pct:>5}  {p.inside}")
-    shown = s.procs[:limit]
     if any(p.gpu.inferred_by == "consistent" for p in shown):
         out.append(INFERRED_NOTE)
     if any(p.gpu.inferred_by == "order" for p in shown):
@@ -128,7 +130,7 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
                                                   for p in s.procs):
         out.append(f"Linux VRAM split: {s.wsl_split}")
     if s.backend == "wsl" and not any(not p.host for p in s.procs):
-        out.append(f"{'':>7}  {WSL_EMPTY}")
+        out.append(f"{'':>{w}}  {WSL_EMPTY}")
     for p in s.procs:
         if p.handy:
             out.append("")

@@ -177,11 +177,17 @@ class TrackerTests(unittest.TestCase):
 
     def test_new_process_waits_for_its_own_context_instead_of_eliminating(self):
         t = self.make()
-        h = [("S", 900)]
-        self.check(self.step(t, [0.0, 0.15], h), {})  # 0.15: WSLg, not yet known as foreign
+        self.check(self.step(t, [0.0, 2.0, 0.15], [("S", 900), ("B", 10)]), {"B": (2.0, "?")})
+        h = [("S", 900)]  # B exits; 0.15 (WSLg) was never seen without B, so it isn't known as foreign
+        self.check(self.step(t, [0.0, 0.15], h), {})
         h.append(("A", 1001))
         self.check(self.step(t, [0.0, 0.15], h), {"A": (0.15, "?")})  # A's context isn't there yet
         self.check(self.step(t, [6.0, 0.0, 0.15], h), {"A": (6.0, "*")})
+
+    def test_startup_with_only_this_monitor_teaches_foreign(self):
+        self.step(self.make(), [0.0, 0.15], [("S", 900)])  # only gputaskman holds the GPU: 0.15 is foreign
+        t = self.make()  # a later start in the same boot, with a job already running
+        self.check(self.step(t, [0.0, 2.0, 0.15], [("S", 900), ("X", 5)]), {"X": (2.0, "*")})
 
     def test_a_reused_pid_is_a_new_process(self):
         t = self.make()
@@ -248,6 +254,11 @@ class TrackerTests(unittest.TestCase):
         t = self.make()
         self.check(self.step(t, [0.0, 0.4, 0.4], [("S", 900), ("F1", 5), ("F2", 6)]),
                    {"F1": (0.4, "*"), "F2": (0.4, "*")})
+
+    def test_nearly_equal_sizes_stay_guesses(self):
+        t = self.make()  # 0.40 vs 0.42 GiB: within tolerance, but swapping owners changes the shown bytes
+        self.check(self.step(t, [0.0, 0.4, 0.42], [("S", 900), ("F1", 5), ("F2", 6)]),
+                   {"F1": (0.42, "?"), "F2": (0.4, "?")})
 
     def test_different_adapter_resets_history(self):
         self.make().update(RTX, at([0.4]), [], now=self.clock)

@@ -5,7 +5,12 @@ import unittest
 import zipfile
 import hashlib
 
-from tools.build_portable import architecture, check_executable, create_archive, nvidia_license, validate_version
+import os
+import stat
+import tarfile
+
+from tools.build_portable import (architecture, check_elf, check_executable, create_archive, create_linux_archive,
+                                  nvidia_license, target, validate_version)
 
 
 class PortableTests(unittest.TestCase):
@@ -77,6 +82,63 @@ class PortableTests(unittest.TestCase):
             (root / "NVML.dll").write_bytes(b"driver")
             with self.assertRaisesRegex(ValueError, "must not be distributed"):
                 create_archive(root, root / "output", "0.1.0", "arm64")
+
+
+class LinuxPortableTests(unittest.TestCase):
+    def write_elf(self, path, machine):
+        header = bytearray(64)
+        header[:4] = b"\x7fELF"
+        header[4], header[5] = 2, 1  # 64-bit, little-endian
+        struct.pack_into("<H", header, 18, machine)
+        path.write_bytes(bytes(header))
+        path.chmod(0o755)
+
+    def test_linux_interpreters_map_to_targets(self):
+        self.assertEqual(target("linux-x86_64"), ("linux", "x64"))
+        self.assertEqual(target("linux-aarch64"), ("linux", "arm64"))
+        self.assertEqual(architecture("linux-x86_64"), "x64")
+        with self.assertRaises(ValueError):
+            target("linux-i686")
+
+    def test_elf_machine(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            exe = Path(temporary) / "gputaskman"
+            for arch, machine in [("x64", 0x3E), ("arm64", 0xB7)]:
+                self.write_elf(exe, machine)
+                check_elf(exe, arch)
+            with self.assertRaises(ValueError):
+                check_elf(exe, "x64")
+            exe.write_bytes(b"MZ not an elf")
+            with self.assertRaises(ValueError):
+                check_elf(exe, "x64")
+
+    def test_tarball_keeps_executable_bit_and_has_checksum(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = root / "bundle"
+            (bundle / "_internal").mkdir(parents=True)
+            self.write_elf(bundle / "gputaskman", 0x3E)
+            (bundle / "_internal" / "data.css").write_text("resource", encoding="utf-8")
+            archive = create_linux_archive(bundle, root / "output", "0.1.0", "x64")
+            self.assertEqual(archive.name, "gputaskman-0.1.0-linux-x64.tar.gz")
+            with tarfile.open(archive) as packed:
+                members = {m.name: m for m in packed.getmembers()}
+            self.assertEqual(set(members), {"gputaskman-0.1.0-linux-x64/gputaskman",
+                                            "gputaskman-0.1.0-linux-x64/_internal/data.css"})
+            self.assertTrue(members["gputaskman-0.1.0-linux-x64/gputaskman"].mode & stat.S_IXUSR)
+            self.assertEqual(members["gputaskman-0.1.0-linux-x64/gputaskman"].uid, 0)
+            expected = hashlib.sha256(archive.read_bytes()).hexdigest()
+            self.assertEqual(Path(f"{archive}.sha256").read_text(encoding="utf-8"), f"{expected}  {archive.name}\n")
+
+    def test_tarball_rejects_driver_libraries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.write_elf(root / "gputaskman", 0x3E)
+            for lib in ("libnvidia-ml.so.1", "libcuda.so.1"):
+                (root / lib).write_bytes(b"driver")
+                with self.assertRaisesRegex(ValueError, "must not be distributed"):
+                    create_linux_archive(root, root / "output", "0.1.0", "x64")
+                os.remove(root / lib)
 
 
 if __name__ == "__main__":

@@ -17,9 +17,9 @@ from rich.console import Console
 from rich.table import Table
 from textual.widgets import Footer, Select, Static
 
-from gputaskman.app import GpuTaskManager, spark
 from gputaskman.amdsmi import AmdSmi
 from gputaskman.adl import Adl, _Metrics
+from gputaskman.app import GpuTaskManager, spark, stacked_bar
 from gputaskman.cli import main
 from gputaskman.collector import ProcRow, Snapshot, select_adapter, select_nv_device
 from gputaskman.dxgi import Adapter
@@ -34,6 +34,11 @@ from gputaskman.procinfo import (AI_KINDS, MappedModel, ProcDetail, ProcInspecto
 from gputaskman.report import to_dict, to_text
 from gputaskman.stores import store_name
 from tools.capture_screenshots import for_publication
+
+
+def native(path: str) -> str:
+    """Windows-style test paths as native paths, so path logic is exercised the same way on Linux."""
+    return path if os.sep == "\\" else "/" + path.split(":", 1)[-1].lstrip("\\").replace("\\", "/")
 
 GiB = 1 << 30
 MiB = 1 << 20
@@ -201,6 +206,7 @@ class DeviceSelectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "out of range"):
             select_adapter([], 1)
 
+    @patch("gputaskman.collector.sys.platform", "win32")
     def test_nvml_matches_pci_address_not_name_or_index(self):
         gpu = Adapter(1, "NVIDIA RTX Spark", 0x10DE, 64 * GiB, 0, False, (10, 0, 0))
         npu = NvDevice(index=0, name="NVIDIA NPU", driver_model="MCDM")
@@ -258,6 +264,15 @@ class MemoryTests(unittest.TestCase):
         output = io.StringIO()
         Console(file=output, width=120).print(GpuTaskManager().render_device(s))
         self.assertIn("N/A", output.getvalue())
+    def test_best_vram_keeps_measured_and_inferred_zero_distinct_from_unknown(self):
+        gpu = ProcGpu(dedicated=0, inferred=8 * GiB)
+        self.assertEqual(gpu.shown_vram, 0)
+        gpu.attributed = False
+        self.assertEqual(gpu.shown_vram, 8 * GiB)
+        gpu.inferred = 0
+        self.assertEqual(gpu.shown_vram, 0)
+        gpu.inferred = None
+        self.assertIsNone(gpu.shown_vram)
 
     def test_local_counters_are_preferred(self):
         self.assertTrue(GpuCounters._COUNTERS["dedicated"][0].endswith(r"\Local Usage"))
@@ -346,7 +361,7 @@ class MemoryTests(unittest.TestCase):
     def test_capture_does_not_change_original_or_publish_command_line(self):
         original = snapshot()
         original.procs[0].llm.models = [
-            GgufInfo(path=r"C:\Users\example\models\model.gguf", file_size=1, version=3)
+            GgufInfo(path=native(r"C:\Users\example\models\model.gguf"), file_size=1, version=3)
         ]
         public = for_publication(original)
         self.assertEqual(public.procs[0].detail.cmdline, [])
@@ -527,7 +542,7 @@ class IdentityTests(unittest.TestCase):
             for path, store in cases:
                 with self.subTest(path=path, store=store), \
                         patch("gputaskman.procinfo.store_name", return_value=store):
-                    m = make_model(path, 1000, 0, False, "mapped", store)
+                    m = make_model(native(path), 1000, 0, False, "mapped", store)
                     self.assertEqual(m.kind_hint, expected)
                     self.assertEqual(m.sources, ["mapped"])
                     self.assertEqual(m.evidence, "in use (mapped)")
@@ -803,6 +818,48 @@ class UiTests(unittest.IsolatedAsyncioTestCase):
         output = io.StringIO()
         Console(file=output, width=widget.content_size.width, color_system=None).print(widget.content)
         return output.getvalue()
+
+    async def test_wsl_sort_selection_and_bar_use_inferred_vram_without_double_counting(self):
+        s = snapshot()
+        s.backend = "wsl"
+        small = ProcRow(10, "small", "LLM", ProcGpu(attributed=False, inferred=2 * GiB, inferred_by="order"),
+                        ProcDetail(10, "small"), LlmView())
+        large = ProcRow(20, "large", "LLM", ProcGpu(attributed=False, inferred=8 * GiB, inferred_by="order"),
+                        ProcDetail(20, "large"), LlmView())
+        vm = ProcRow(30, "WSL VM", "wsl-vm", ProcGpu(dedicated=10 * GiB), ProcDetail(30, "WSL VM"),
+                     host=True, origin="windows")
+        host = ProcRow(40, "browser.exe", "browser", ProcGpu(dedicated=3 * GiB), ProcDetail(40, "browser.exe"),
+                       host=True, origin="windows")
+        s.procs = [small, large, host, vm]
+        with patch.object(GpuTaskManager, "poll"), patch("gputaskman.app.stacked_bar", wraps=stacked_bar) as bar:
+            app = GpuTaskManager()
+            async with app.run_test(size=(180, 42)) as pilot:
+                app.apply(s)
+                await pilot.pause()
+                self.assertEqual(app.selected_key, large.key)
+                self.assertEqual([r.key for r in app.visible_rows(s)], [vm.key, large.key, small.key, host.key])
+                self.assertEqual(bar.call_args.args[1], 8 * GiB)
+                table = app.query_one("#procs")
+                self.assertEqual(table.get_cell(large.key, "VRAM").plain, "8.00 GB?")
+                for column in ("GPU%", "3D", "Copy", "Video"):
+                    self.assertEqual(table.get_cell(large.key, column).plain, "n/a")
+                self.assertEqual(s.attributed, 13 * GiB)
+
+    async def test_native_hidden_vram_keeps_engine_reading_in_ui(self):
+        s = snapshot()
+        s.backend = "nvml"
+        s.procs = [ProcRow(10, "python3", "AI", ProcGpu(attributed=False, engines={"compute": 65}),
+                           ProcDetail(10, "python3"))]
+        with patch.object(GpuTaskManager, "poll"):
+            app = GpuTaskManager()
+            app.selected_key = "10"
+            async with app.run_test(size=(180, 42)) as pilot:
+                app.apply(s)
+                await pilot.pause()
+                self.assertEqual(app.query_one("#procs").get_cell("10", "GPU%").plain, "65")
+                hdr = app.query_one("#inspector", Static).content.renderables[0].plain
+                self.assertIn("compute 65%", hdr)
+                self.assertIn("spill(RAM) n/a", hdr)
 
     async def test_eighth_chart_records_sm_clock_with_scale_and_missing_readings(self):
         with patch.object(GpuTaskManager, "poll"):

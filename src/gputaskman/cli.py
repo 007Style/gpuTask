@@ -14,6 +14,8 @@ def main() -> None:
     ap.add_argument("--json", action="store_true", help="print one JSON snapshot and exit (implies --once)")
     ap.add_argument("--gpu", type=int, default=0, help="GPU index (default 0)")
     ap.add_argument("--list-gpus", action="store_true", help="list selectable GPU adapters and exit")
+    ap.add_argument("--no-host", action="store_true",
+                    help="WSL: don't read Windows host GPU counters through interop (WSL VM total, Windows apps)")
     ap.add_argument("-i", "--interval", type=float, default=1.0, help="refresh seconds (default 1)")
     args = ap.parse_args()
     if args.gpu < 0:
@@ -21,8 +23,8 @@ def main() -> None:
     if not math.isfinite(args.interval) or args.interval <= 0:
         ap.error("--interval must be a finite number greater than zero")
 
-    if sys.platform != "win32":
-        sys.exit("gputaskman currently supports Windows (WDDM) only.")
+    if sys.platform != "win32" and not sys.platform.startswith("linux"):
+        sys.exit("gputaskman supports Windows (WDDM) and Linux/WSL (NVML) only.")
 
     if args.list_gpus:
         from .collector import enumerate_adapters, ordered_adapters
@@ -44,10 +46,12 @@ def main() -> None:
         from .report import dump
 
         try:
-            c = Collector(args.gpu, scan_budget=None)  # one-shot: identify everything in this sample
+            c = Collector(args.gpu, scan_budget=None, host=not args.no_host)  # one-shot: identify everything now
         except ValueError as error:
             ap.error(str(error))
         try:
+            if c.host is not None:
+                c.host.wait(15.0)  # WSL: the first Windows counter sample takes several seconds
             time.sleep(1.0)  # engine utilization is a rate; needs two samples
             print(dump(c.sample(), args.json))
         finally:
@@ -56,4 +60,4 @@ def main() -> None:
 
     from .app import GpuTaskManager
 
-    GpuTaskManager(gpu_index=args.gpu, interval=args.interval).run()
+    GpuTaskManager(gpu_index=args.gpu, interval=args.interval, host=not args.no_host).run()

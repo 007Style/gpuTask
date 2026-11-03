@@ -17,7 +17,7 @@ from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Markdown, Select, Static
 from textual.worker import get_current_worker
 
-from .collector import Collector, ProcRow, Snapshot
+from .collector import BACKEND, Collector, ProcRow, Snapshot
 from .llm import gb
 from .nvml import NvDevice, format_metric
 from .report import METAL_NOTE, WSL_EMPTY, has_engine_counters, has_wddm_counters, inferred_note, vram_label, wsl_note
@@ -232,7 +232,7 @@ class GpuTaskManager(App):
                 with Horizontal(id="chart-controls"):
                     yield Static("Charts", id="chart-label")
                     yield Select(
-                        [("All charts", -1), *((name, index) for index, name in enumerate(self.CHARTS))],
+                        [("All charts", -1), *((self.CHARTS[index], index) for index in self.available_charts)],
                         value=-1, allow_blank=False, compact=True, id="chart-mode",
                     )
                     yield Static("Click to choose · c cycles", id="chart-hint")
@@ -390,9 +390,7 @@ class GpuTaskManager(App):
         widget = self.query_one("#charts", Static)
         # Reserve the border, padding, and scrollbar even before child resize events arrive.
         width = max(1, self.size.width - 6)
-        indices = list(range(len(self.CHARTS))) if self.chart_idx == -1 else [self.chart_idx]
-        if self.snap.backend == "metal" and self.chart_idx == -1:
-            indices = [i for i in indices if self.CHARTS[i] in METAL_CHARTS]  # IOKit has no clocks/power/temp
+        indices = list(self.available_charts) if self.chart_idx == -1 else [self.chart_idx]
         columns = min(len(indices), 3, max(1, (width + 2) // 46))
         cell_width = max(1, (width - 2 * (columns - 1)) // columns)
         grid = Table.grid(padding=(0, 2), pad_edge=False, expand=True)
@@ -452,6 +450,7 @@ class GpuTaskManager(App):
             e = r.gpu.engines
             wddm = has_wddm_counters(s, r)
             engines = has_engine_counters(s, r)
+            split = engines and s.backend != "metal"  # Metal reports one GPU time, no per-engine split
             spill = Text(gb(r.gpu.shared) if wddm and r.gpu.shared >= 1 << 20 else "", justify="right",
                          style="bold red" if r.gpu.shared >= 256 << 20 and r.kind in ("LLM", "AI") else "yellow")
             paged = Text(gb(r.gpu.paged_out) if wddm and r.gpu.paged_out >= 1 << 20 else "", justify="right", style="grey62")
@@ -462,9 +461,9 @@ class GpuTaskManager(App):
                 Text(" ".join(r.detail.runtimes[:3]), style="grey70"),
                 Text(vram_label(r.gpu), justify="right", style="bold" if r.gpu.attributed else "grey62"), spill, paged,
                 pct(r.gpu.gpu_pct if engines else None),
-                pct(e.get("3d", 0) + e.get("compute", 0) if engines else None),
-                pct(e.get("copy", 0) if engines else None),
-                pct(e.get("decode", 0) + e.get("encode", 0) if engines else None),
+                pct(e.get("3d", 0) + e.get("compute", 0) if split else None),
+                pct(e.get("copy", 0) if split else None),
+                pct(e.get("decode", 0) + e.get("encode", 0) if split else None),
                 Text(r.inside, style="magenta" if r.llm else "grey62", overflow="ellipsis", no_wrap=True),
                 key=r.key,
             )
@@ -597,8 +596,17 @@ class GpuTaskManager(App):
         if self.snap:
             self.render_table(self.snap)
 
+    @property
+    def available_charts(self) -> list[int]:
+        """Chart indices this backend has data for: IOKit (macOS) has no clocks, power, temperature or codecs."""
+        if BACKEND == "metal":
+            return [i for i, name in enumerate(self.CHARTS) if name in METAL_CHARTS]
+        return list(range(len(self.CHARTS)))
+
     def action_cycle_chart(self) -> None:
-        self.query_one("#chart-mode", Select).value = (self.chart_idx + 2) % (len(self.CHARTS) + 1) - 1
+        order = [-1, *self.available_charts]
+        nxt = order[(order.index(self.chart_idx) + 1) % len(order)] if self.chart_idx in order else -1
+        self.query_one("#chart-mode", Select).value = nxt
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "chart-mode" and isinstance(event.value, int):

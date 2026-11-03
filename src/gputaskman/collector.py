@@ -152,6 +152,7 @@ def select_nv_device(adapter: Adapter | None, devices: list[NvDevice], gpu_index
 
 class Collector:
     DEEP_TOP_N = 25  # memory-map candidates: the top N VRAM users plus anything busy
+    _mac_driver = ""  # "macOS 26.3.1" on the metal backend, read once at startup
     SCAN_BUDGET = 0.15  # seconds of memory-map scanning per sample; leftovers wait for the next sample
 
     def __init__(self, gpu_index: int = 0, scan_budget: float | None = SCAN_BUDGET, host: bool = True) -> None:
@@ -159,6 +160,7 @@ class Collector:
         self.adapter = select_adapter(self.adapters, gpu_index)
         self.counters = GpuCounters()
         self.nvml = Nvml()
+        self._mac_driver = f"macOS {macos_version()}".strip() if BACKEND == "metal" else ""
         self.inspector = ProcInspector()
         self.prober = ServerProber()
         self.scan_budget = scan_budget  # None = scan every candidate now (one-shot output)
@@ -177,13 +179,6 @@ class Collector:
         self.tracker = ContextTracker(self_pid=os.getpid()) if self.host is not None else None
         self._own_start = time.time()  # our NVML context is created now, not when the process started
         self._host_restarted = time.time()
-
-    def _driver(self) -> str:
-        if BACKEND == "metal":
-            if not hasattr(self, "_macos"):
-                self._macos = f"macOS {macos_version()}".strip()
-            return self._macos
-        return self.nvml.driver
 
     def _parent_ports(self, pid: int, depth: int = 2) -> list[int]:
         d = self.inspector.get(pid)
@@ -205,15 +200,16 @@ class Collector:
         luid = self.adapter.luid if self.adapter else (next(iter(per_luid), 0))
         procs = per_luid.get(luid, {})
         a = adapters.get(luid)
-        nvs = self.nvml.sample() if self.nvml.ok else []
-        nv = select_nv_device(self.adapter, nvs, self.gpu_index)
         if BACKEND == "metal":
-            nv = self.counters.device  # IOKit's device stats in the shape the header renders
+            nv = self.counters.device  # IOKit's device stats in the shape the header renders (no NVML on macOS)
+        else:
+            nvs = self.nvml.sample() if self.nvml.ok else []
+            nv = select_nv_device(self.adapter, nvs, self.gpu_index)
         total = (nv.mem_total if nv else 0) or (self.adapter.dedicated_vram if self.adapter else 0)
 
         snap = Snapshot(
             taken=time.time(), adapter=self.adapter, adapters=self.adapters, nv=nv,
-            driver=self._driver(), cuda=self.nvml.cuda_version, vram_total=total,
+            driver=self._mac_driver or self.nvml.driver, cuda=self.nvml.cuda_version, vram_total=total,
             vram_used=int(a.dedicated) if a else (nv.mem_used if nv else 0),
             shared_used=int(a.shared) if a else 0, backend=BACKEND,
         )

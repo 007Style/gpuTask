@@ -218,7 +218,7 @@ def _is_system_path(exe: str) -> bool:
     if sys.platform == "win32":
         return exe.startswith(os.path.normcase(os.environ.get("SystemRoot", r"C:\Windows")))
     # /usr/bin/python3 is shared by every Python app: walking /usr/bin finds nothing about the process.
-    return exe.startswith(_LINUX_SYSTEM_DIRS) or (sys.platform == "darwin" and exe.startswith(("/system/", "/System/")))
+    return exe.startswith(_LINUX_SYSTEM_DIRS) or (sys.platform == "darwin" and exe.startswith("/System/"))
 
 
 def _data_dirs() -> list[str]:
@@ -442,4 +442,6 @@ def classify(d: ProcDetail, engines: dict[str, float]) -> str:
         return "compute"
     if ("D3D12" in d.runtimes or "Vulkan" in d.runtimes) and engines.get("3d", 0) > 10:
         return "3D/game"
+    if "Metal" in d.runtimes and engines.get("gpu", 0) > 10 and n not in COMPOSITORS:
+        return "3D/game"  # macOS: Metal reports one GPU time, no 3D/compute split
     return "app"

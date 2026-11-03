@@ -210,15 +210,23 @@ macOS exposes without root:
 |---|---|---|
 | GPU memory (header) | IOAccelerator `PerformanceStatistics`: `Alloc system memory` (all GPU allocations) out of physical RAM | device |
 | GPU% (header) | `Device Utilization %` | device |
-| GPU% | Each Metal client (`AGXDeviceUserClient`) names its creator PID and keeps a cumulative `accumulatedGPUTime`; the rate between samples | every process |
+| GPU% | Each Metal client (`AGXDeviceUserClient`) names its creator PID and keeps a cumulative `accumulatedGPUTime`; the rate between samples, per client (a closed client never hides the others' work) | every process |
 | VRAM | `footprint`: the process's memory macOS charges to graphics (the `(graphics)` categories: Metal buffers, textures) | your own processes |
 | Runtime, model files | Mapped files from `proc_pidinfo` region walks (psutil has no memory maps on macOS): `libggml*.dylib`, `libllama*.dylib`, `libmlx*.dylib`, `libtorch_cpu.dylib`, the Metal driver bundle | your own processes |
 
 Other users' processes (WindowServer, system daemons) show GPU% with memory `n/a`: `footprint` needs
-root for them. Idle ones are left out of the table, except WindowServer. `footprint` takes ~70 ms per
-process, so it runs in a background thread, busiest process first; a new process shows `n/a` for a
-second or two until its first measurement. Spill, paged, clocks, power, and temperature are not
-available.
+root for them. Idle ones are left out of the table, except WindowServer. Run with `sudo` to measure
+every process's memory. `footprint` takes ~70 ms per process, so it runs in a background thread:
+busy processes and new ones every pass (~2 s), idle ones every 30 s. A new process shows `n/a` for a
+second or two until its first measurement; a single failed measurement keeps the last size, and three
+in a row back off for a minute. Measurements are tied to the process's start time, so a reused PID
+never shows the previous process's numbers.
+
+Metal reports one GPU time per process, with no 3D/compute/copy/video split, so those columns show
+`n/a`; a Metal process above 10% GPU is classified `3D/game` unless something more specific applies
+(AI runtime, browser, compositor). Spill, paged, clocks, power, and temperature are not available, so
+the chart picker offers only GPU and GPU memory. Handy's log is read from
+`~/Library/Logs/com.pais.handy/handy.log`.
 
 Live check on an M4 Mac mini (macOS 26.3.1): a PyTorch MPS job with a 2 GiB buffer and a matmul loop
 showed `Python  AI  PyTorch+Metal  3.06 GB  99%`, with device utilization at 99% and allocated GPU

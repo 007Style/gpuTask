@@ -122,7 +122,7 @@ def inspect_handy(
     if sys.platform == "win32":
         default_data = os.environ.get("APPDATA", "")
         default_local = os.environ.get("LOCALAPPDATA", "")
-    elif sys.platform == "darwin":  # Tauri's app data dir on macOS (logs/ location unverified)
+    elif sys.platform == "darwin":  # Tauri: app data in Application Support, logs in ~/Library/Logs/<identifier>
         default_data = default_local = os.path.join(os.path.expanduser("~"), "Library", "Application Support")
     else:  # Tauri keeps both the settings store and logs/ under the XDG data dir on Linux
         default_data = default_local = os.environ.get("XDG_DATA_HOME") or os.path.join(
@@ -130,7 +130,10 @@ def inspect_handy(
     appdata = default_data if appdata is None else appdata
     localappdata = default_local if localappdata is None else localappdata
     settings_path = os.path.join(appdata, "com.pais.handy", "settings_store.json")
-    log_path = os.path.join(localappdata, "com.pais.handy", "logs", "handy.log")
+    if sys.platform == "darwin" and localappdata == default_local:
+        log_path = os.path.join(os.path.expanduser("~"), "Library", "Logs", "com.pais.handy", "handy.log")
+    else:
+        log_path = os.path.join(localappdata, "com.pais.handy", "logs", "handy.log")
     selected = _selected_model(settings_path)
     event = _last_model_event(log_path, process_started)
     if not selected and not event:

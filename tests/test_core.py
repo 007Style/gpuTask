@@ -675,6 +675,12 @@ class ChartTests(unittest.TestCase):
 
 
 class UiTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        # These snapshots are NVIDIA/WDDM ones: render them with that backend's charts on every OS (macOS too).
+        backend = patch("gputaskman.app.BACKEND", "wddm")
+        backend.start()
+        self.addCleanup(backend.stop)
+
     def chart_text(self, app):
         widget = app.query_one("#charts", Static)
         output = io.StringIO()

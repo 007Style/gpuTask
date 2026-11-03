@@ -70,15 +70,17 @@ def parse_accelerator(entries: list | None) -> DeviceStats | None:
     return None
 
 
-def parse_clients(entries: list | None) -> dict[int, int]:
-    """{pid: accumulated GPU ns} summed over that process's Metal clients."""
-    out: dict[int, int] = defaultdict(int)
-    for e in entries or []:
+def parse_clients(entries: list | None) -> dict[int, dict[int, int]]:
+    """{pid: {client id: accumulated GPU ns}}. Rates are taken per client: a closed client takes its
+    accumulated time with it, so per-process sums would drop and hide real work."""
+    out: dict[int, dict[int, int]] = defaultdict(dict)
+    for i, e in enumerate(entries or []):
         m = _CREATOR.match(str(e.get("IOUserClientCreator", "")))
         if not m:
             continue
-        pid = int(m[1])
-        out[pid] += sum(int(u.get("accumulatedGPUTime", 0)) for u in e.get("AppUsage") or [] if isinstance(u, dict))
+        cid = e.get("IORegistryEntryID", -1 - i)
+        out[int(m[1])][cid] = sum(int(u.get("accumulatedGPUTime", 0))
+                                  for u in e.get("AppUsage") or [] if isinstance(u, dict))
     return dict(out)
 
 
@@ -90,7 +92,7 @@ def graphics_bytes(process: dict) -> int:
 def physical_memory() -> int:
     try:
         return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-    except (ValueError, OSError):
+    except (ValueError, OSError, AttributeError):  # no os.sysconf on Windows
         return 0
 
 
@@ -117,18 +119,33 @@ def _owner(pid: int) -> int | None:
         return None
 
 
+def _identity(pid: int) -> float | None:
+    """Process start time: tells a reused PID from the process that had it before."""
+    try:
+        import psutil
+        return psutil.Process(pid).create_time()
+    except Exception:
+        return None
+
+
 class FootprintPoller:
-    """footprint(1) takes ~70 ms per process, too slow for the refresh loop: poll the own-user GPU clients in
-    a background thread, busiest first, and keep the latest graphics size per PID."""
+    """footprint(1) takes ~70 ms per process, too slow for the refresh loop, so a background thread measures
+    the targets: busy or not-yet-measured processes every pass (~2 s), idle ones every 30 s. Results are tied
+    to a process identity (PID + start time), so a measurement never lands on a reused PID."""
 
     CYCLE = 2.0  # seconds between passes
-    DENIED_RETRY = 60.0
+    IDLE_EVERY = 30.0  # re-measure idle processes this often
+    FAIL_LIMIT = 3  # consecutive failures before backing off (one timeout under load is not "denied")
+    FAIL_RETRY = 60.0
 
-    def __init__(self, run=subprocess.run) -> None:
+    def __init__(self, run=subprocess.run, clock=time.monotonic) -> None:
         self._run = run
-        self._targets: list[int] = []
-        self._sizes: dict[int, tuple[int, float]] = {}
-        self._denied: dict[int, float] = {}
+        self._clock = clock
+        self._targets: dict[int, tuple[object, bool]] = {}  # pid -> (identity, busy), busiest first
+        self._sizes: dict[int, tuple[object, int]] = {}  # pid -> (identity, graphics bytes)
+        self._due: dict[int, float] = {}
+        self._fails: dict[int, int] = {}
+        self._retry: dict[int, float] = {}
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._passed = threading.Event()  # set after each completed pass
@@ -140,16 +157,24 @@ class FootprintPoller:
             self._thread = threading.Thread(target=self._loop, name="macos-footprint", daemon=True)
             self._thread.start()
 
-    def set_targets(self, pids: list[int]) -> None:
+    def set_targets(self, targets: list[tuple[int, object, bool]]) -> None:
+        """[(pid, identity, busy)], busiest first. Anything else, or a PID whose identity changed, is forgotten."""
         with self._lock:
-            self._targets = list(pids)
-            self._sizes = {p: v for p, v in self._sizes.items() if p in pids}
+            self._targets = {pid: (ident, busy) for pid, ident, busy in targets}
+            for store in (self._sizes, self._due, self._fails, self._retry):
+                for pid in list(store):
+                    if pid not in self._targets:
+                        del store[pid]
+            for pid, (ident, _) in self._targets.items():
+                if pid in self._sizes and self._sizes[pid][0] != ident:  # reused PID
+                    for store in (self._sizes, self._due, self._fails, self._retry):
+                        store.pop(pid, None)
         self._wake.set()
 
-    def get(self, pid: int) -> int | None:
+    def get(self, pid: int, identity: object = None) -> int | None:
         with self._lock:
             hit = self._sizes.get(pid)
-        return hit[0] if hit else None
+        return hit[1] if hit and hit[0] == identity else None
 
     def measure(self, pid: int) -> int | None:
         with tempfile.TemporaryDirectory() as d:
@@ -168,20 +193,29 @@ class FootprintPoller:
 
     def poll_once(self) -> None:
         with self._lock:
-            targets = list(self._targets)
-        now = time.time()
-        for pid in targets:
+            targets = list(self._targets.items())
+        for pid, (ident, busy) in targets:
             if self._stop:
                 return
-            if now - self._denied.get(pid, -1e9) < self.DENIED_RETRY:
-                continue
+            now = self._clock()
+            with self._lock:
+                if self._retry.get(pid, 0) > now:
+                    continue
+                if not busy and pid in self._sizes and self._due.get(pid, 0) > now:
+                    continue
             size = self.measure(pid)
             with self._lock:
+                if self._targets.get(pid, (None,))[0] != ident:
+                    continue  # exited or reused while footprint ran: don't resurrect it
                 if size is None:
-                    self._denied[pid] = now
-                    self._sizes.pop(pid, None)
+                    self._fails[pid] = self._fails.get(pid, 0) + 1
+                    if self._fails[pid] >= self.FAIL_LIMIT:  # other user's process, or footprint keeps failing
+                        self._retry[pid] = now + self.FAIL_RETRY
+                        self._sizes.pop(pid, None)
                 else:
-                    self._sizes[pid] = (size, time.time())
+                    self._sizes[pid] = (ident, size)
+                    self._fails.pop(pid, None)
+                    self._due[pid] = now + self.IDLE_EVERY
 
     def wait_pass(self, timeout: float) -> bool:
         self._passed.clear()
@@ -189,10 +223,10 @@ class FootprintPoller:
 
     def _loop(self) -> None:
         while not self._stop:
-            start = time.time()
+            start = self._clock()
             self.poll_once()
             self._passed.set()
-            self._wake.wait(max(self.CYCLE - (time.time() - start), 0.2))
+            self._wake.wait(max(self.CYCLE - (self._clock() - start), 0.2))
             self._wake.clear()
 
     def close(self) -> None:
@@ -204,14 +238,19 @@ class MacCounters:
     """Same interface as pdh.GpuCounters: sample() -> ({adapter key: {pid: ProcGpu}}, {adapter key: AdapterGpu}).
     `device` carries the device-wide stats in the NvDevice shape the header already renders."""
 
-    def __init__(self, poller: FootprintPoller | None = None, uid: int | None = None) -> None:
+    def __init__(self, poller: FootprintPoller | None = None, uid: int | None = None, root: bool | None = None,
+                 identity=_identity, owner=_owner) -> None:
         self.ok = True
         self.device: NvDevice | None = None
-        self._prev: dict[int, tuple[int, float]] = {}  # pid -> (gpu ns, wall time)
         self._uid = os.getuid() if uid is None else uid
+        # As root footprint can read every process, so every process is measurable (not only uid 0's).
+        self._root = (os.geteuid() == 0) if root is None else root
+        self._identity, self._owner = identity, owner
+        self._prev: dict[int, tuple[object, dict[int, int]]] = {}  # pid -> (identity, {client id: ns})
+        self._last: float | None = None  # monotonic time of the previous sample
         self._owners: dict[int, int | None] = {}
-        self.poller = poller or FootprintPoller()
         self._names: dict[int, str] = {}
+        self.poller = poller or FootprintPoller()
         self.poller.start()
         self.sample()  # baseline: GPU% is a rate, like the WDDM counters' first collection
 
@@ -230,32 +269,46 @@ class MacCounters:
 
     def sample(self, accel: list | None = None, clients: list | None = None,
                now: float | None = None) -> tuple[dict[int, dict[int, ProcGpu]], dict[int, AdapterGpu]]:
-        now = time.time() if now is None else now
+        now = time.monotonic() if now is None else now  # a rate: immune to wall-clock adjustments
         accel = _ioreg("-d", "1", "-c", "IOAccelerator") if accel is None else accel
         clients = _ioreg("-l", "-c", "AGXDeviceUserClient") if clients is None else clients
         procs: dict[int, dict[int, ProcGpu]] = defaultdict(dict)
         adapters: dict[int, AdapterGpu] = defaultdict(AdapterGpu)
         dev = parse_accelerator(accel)
-        if dev is not None:
+        if dev is None:
+            self.device = None  # no reading this time: never keep showing the last one as current
+        else:
             adapters[ADAPTER_KEY].dedicated = float(dev.allocated)
             self.device = NvDevice(index=0, name=dev.model, driver_model="Metal", mem_total=physical_memory(),
                                    mem_used=dev.allocated, util_gpu=dev.utilization)
-        times = parse_clients(clients)
-        own: list[tuple[float, int]] = []
-        for pid, ns in times.items():
+        per_pid = parse_clients(clients)
+        elapsed = now - self._last if self._last is not None else None
+        targets: list[tuple[float, int, object]] = []
+        current: dict[int, tuple[object, dict[int, int]]] = {}
+        for pid, times in per_pid.items():
+            ident = self._identity(pid)
             prev = self._prev.get(pid)
+            if prev is None or prev[0] != ident:
+                prev_times = {}
+                self._owners.pop(pid, None)  # new or reused PID: re-read its owner and name
+                self._names.pop(pid, None)
+            else:
+                prev_times = prev[1]
+            current[pid] = (ident, times)
             pct = 0.0
-            if prev is not None and now > prev[1] and ns >= prev[0]:
-                pct = min((ns - prev[0]) / 1e9 / (now - prev[1]) * 100.0, 100.0)
+            if elapsed and elapsed > 0:
+                # A client that appeared since the last sample did all of its work in this interval.
+                busy_ns = sum(max(ns - prev_times.get(cid, 0), 0) for cid, ns in times.items())
+                pct = min(busy_ns / 1e9 / elapsed * 100.0, 100.0)
             if pid not in self._owners:
-                self._owners[pid] = _owner(pid)
-            mine = self._owners[pid] == self._uid
+                self._owners[pid] = self._owner(pid)
+            mine = self._root or self._owners[pid] == self._uid
             g = ProcGpu()
             if pct:
                 g.engines["gpu"] = pct
             if mine:
-                own.append((pct, pid))
-                size = self.poller.get(pid)
+                targets.append((pct, pid, ident))
+                size = self.poller.get(pid, ident)
                 if size is None:
                     g.attributed = False  # not measured yet (or footprint failed): unknown, not zero
                 else:
@@ -265,10 +318,11 @@ class MacCounters:
                 if pct < 0.5 and self._name(pid).lower() not in ALWAYS_SHOWN:
                     continue
             procs[ADAPTER_KEY][pid] = g
-        self._prev = {pid: (ns, now) for pid, ns in times.items()}
-        self._owners = {p: o for p, o in self._owners.items() if p in times}
-        self._names = {p: n for p, n in self._names.items() if p in times}
-        self.poller.set_targets([pid for _, pid in sorted(own, reverse=True)])
+        self._prev, self._last = current, now
+        self._owners = {p: o for p, o in self._owners.items() if p in per_pid}
+        self._names = {p: n for p, n in self._names.items() if p in per_pid}
+        targets.sort(key=lambda t: -t[0])
+        self.poller.set_targets([(pid, ident, pct >= 0.5) for pct, pid, ident in targets])
         return procs, adapters
 
     def close(self) -> None:
@@ -314,7 +368,7 @@ def memory_maps(pid: int, max_regions: int = 200_000) -> list[MappedFile]:
     for processes this user can't inspect."""
     lib = _load_libproc()
     info, buf = _RegionInfo(), ctypes.create_string_buffer(4096)
-    page = os.sysconf("SC_PAGE_SIZE")
+    page = os.sysconf("SC_PAGE_SIZE")  # macOS only
     files: dict[str, int] = {}
     addr, n = 0, 0
     while n < max_regions:

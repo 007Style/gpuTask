@@ -53,13 +53,20 @@ def to_dict(s: Snapshot) -> dict:
     nv = dataclasses.asdict(s.nv) if s.nv else None
     procs = []
     for p in s.procs:
+        # Unknown is null, not 0: WSL Linux rows have no per-process counters, and spill/commit only exist
+        # in WDDM (native Windows, or Windows processes seen from WSL).
+        known = p.gpu.attributed
+        wddm = known and (s.backend == "wddm" or p.origin == "windows")
         item = {
             "pid": p.pid, "host": p.origin if p.host else None, "name": p.name, "kind": p.kind, "runtimes": p.detail.runtimes,
             "vram_attributed": p.gpu.attributed, "vram_inferred_bytes": p.gpu.inferred,
             "vram_inferred_by": p.gpu.inferred_by or None,
-            "vram_bytes": int(p.gpu.dedicated) if p.gpu.attributed else None, "shared_bytes": int(p.gpu.shared),
-            "committed_bytes": int(p.gpu.committed), "paged_out_bytes": int(p.gpu.paged_out),
-            "gpu_pct": round(p.gpu.gpu_pct, 1), "engines": {k: round(v, 1) for k, v in p.gpu.engines.items() if v},
+            "vram_bytes": int(p.gpu.dedicated) if known else None,
+            "shared_bytes": int(p.gpu.shared) if wddm else None,
+            "committed_bytes": int(p.gpu.committed) if wddm else None,
+            "paged_out_bytes": int(p.gpu.paged_out) if wddm else None,
+            "gpu_pct": round(p.gpu.gpu_pct, 1) if known else None,
+            "engines": {k: round(v, 1) for k, v in p.gpu.engines.items() if v} if known else None,
             "ports": p.detail.ports, "inside": p.inside,
             "model_files": [dataclasses.asdict(m) for m in p.detail.models],
             "installed_models": [dataclasses.asdict(m) for m in p.detail.candidates],
@@ -142,7 +149,7 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
         if not p.llm:
             continue
         out.append("")
-        out.append(f"== {p.name} ({p.pid})  VRAM {gb(p.gpu.dedicated)}")
+        out.append(f"== {p.name} ({p.pid_label})  VRAM {vram_label(p.gpu)}")
         for i, g in enumerate(p.llm.models):
             kind = p.llm.kind_label(i)
             ev = p.llm.files[i].evidence if i < len(p.llm.files) else ""

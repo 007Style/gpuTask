@@ -314,8 +314,8 @@ class ContextTracker:
     PENDING = 5.0  # seconds a new process may take to create its context
     GONE = 5.0  # seconds an exited process's context may linger in the (older) host sample
     TOL_MIN = 64 * MiB
+    SELF_MAX = 1 * MiB  # an NVML-only context (this monitor) holds 0 bytes
     TOL_REL = 0.10
-    SAVE_EVERY = 60.0
 
     def __init__(self, path: str | None = None, boot_id: str | None = None, self_pid: object = None) -> None:
         self.path = path or _default_cache()
@@ -324,7 +324,6 @@ class ContextTracker:
         self.luid: int | None = None
         self.cached_foreign: list[float] = []
         self._reset()
-        self._saved = 0.0
         try:
             with open(self.path, encoding="utf-8") as f:
                 data = json.load(f)
@@ -381,11 +380,7 @@ class ContextTracker:
                 best, best_cost = out, cost
         return best
 
-    def _save(self, force: bool = False) -> None:
-        now = time.time()
-        if not force and now - self._saved < self.SAVE_EVERY:
-            return
-        self._saved = now
+    def _save(self) -> None:
         try:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
             tmp = f"{self.path}.{os.getpid()}.tmp"
@@ -451,8 +446,12 @@ class ContextTracker:
                 if e.label is None:
                     e.label, e.sure = FOREIGN, True
         elif first:
-            if self.self_pid in start and cur and cur[0].value <= self.TOL_MIN:
-                cur[0].label, cur[0].sure = self.self_pid, True  # our NVML context: newest when we start
+            # Our NVML-only context is 0 bytes and newest at startup, unless another process started after us:
+            # its CUDA context could then be the newest one (and small while it initializes).
+            later = any(t >= start[self.self_pid] for p, t in start.items() if p != self.self_pid) \
+                if self.self_pid in start else True
+            if not later and cur and cur[0].value <= self.SELF_MAX:
+                cur[0].label, cur[0].sure = self.self_pid, True
             if set(start) == {self.self_pid} and cur and cur[0].label == self.self_pid:
                 for e in cur[1:]:  # nothing else in this distro holds the GPU: the rest is foreign
                     e.label, e.sure = FOREIGN, True
@@ -493,11 +492,12 @@ class ContextTracker:
                     e.label, e.same = pid, same
 
         self.entries = cur
+        # Foreign labels only come from evidence, so the cache follows them, including down to none: a cached
+        # context that exited must not later claim a local context of the same size.
         foreign = [e.value for e in cur if e.label == FOREIGN and e.sure]
-        if not start or foreign:
-            changed = sorted(foreign) != sorted(self.cached_foreign)
+        if sorted(foreign) != sorted(self.cached_foreign):
             self.cached_foreign = foreign
-            self._save(force=changed and not start)
+            self._save()
         out = {e.label: ContextGuess(e.value, "consistent" if e.sure or e.same else "order")
                for e in cur if e.label in start}
         return out, reason

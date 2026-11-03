@@ -175,7 +175,7 @@ class GpuTaskManager(App):
         Binding("p", "pause", "Pause"),
         Binding("question_mark", "help", "Explain"),
     ]
-    SORTS = [("VRAM", lambda r: -r.gpu.dedicated), ("GPU%", lambda r: -r.gpu.gpu_pct),
+    SORTS = [("VRAM", lambda r: -r.gpu.shown_vram), ("GPU%", lambda r: -r.gpu.gpu_pct),
              ("spill", lambda r: -r.gpu.shared), ("paged", lambda r: -r.gpu.paged_out),
              ("name", lambda r: r.name.lower())]
     CHART_COLORS = {
@@ -279,7 +279,7 @@ class GpuTaskManager(App):
                 history.append(None)
         self.hist_vram.append(100 * snap.vram_used / snap.vram_total if snap.vram_total else None)
         if not self._auto_selected:
-            llm = next((r for r in sorted(snap.procs, key=lambda r: -r.gpu.dedicated) if r.llm), None)
+            llm = next((r for r in sorted(snap.procs, key=lambda r: -r.gpu.shown_vram) if r.llm), None)
             if llm:
                 self.selected_key = llm.key
             self._auto_selected = True
@@ -415,7 +415,7 @@ class GpuTaskManager(App):
         rows = sorted(rows, key=self.SORTS[self.sort_idx][1])
         vm = next((i for i, r in enumerate(rows) if r.kind == "wsl-vm"), None)
         if vm is not None and self.SORTS[self.sort_idx][0] == "VRAM":
-            # Linux rows have no VRAM of their own here; keep them under the WSL VM row whose total they share.
+            # Linux rows share the WSL VM row's total: keep them under it, ordered by their inferred sizes.
             linux = [r for r in rows if not r.gpu.attributed and not r.host]
             rest = [r for r in rows if r not in linux]
             vm = rest.index(rows[vm])
@@ -501,7 +501,7 @@ class GpuTaskManager(App):
         v = r.llm
         if v:
             width = max(min(self.size.width - 8, 100), 20)
-            total = max(r.gpu.dedicated, sum(x.bytes for x in v.segments), 1)
+            total = max(r.gpu.shown_vram, sum(x.bytes for x in v.segments), 1)
             out.append(stacked_bar([(x.bytes, SEG_STYLE[x.kind]) for x in v.segments], total, width))
             legend = Text()
             for x in v.segments:

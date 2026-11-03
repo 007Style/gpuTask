@@ -168,6 +168,21 @@ class TrackerTests(unittest.TestCase):
         h.remove(("A", 950))  # the oldest job exits; the others keep their contexts
         self.check(self.step(t, [3.05, 0.4, 0.0, 0.0], h), {"F1": (0.4, "*"), "B": (3.05, "*")})
 
+    def test_a_workload_started_after_us_is_not_taken_for_our_context(self):
+        t = self.make()
+        h = [("S", 900), ("W", 950)]  # W created its CUDA context between our NVML init and the first sample
+        self.check(self.step(t, [20 / 1024, 0.0], h), {"W": (0.02, "?")})
+        self.check(self.step(t, [5.0, 0.0], h), {"W": (5.0, "?")})
+
+    def test_cache_forgets_a_foreign_context_that_exited(self):
+        t = self.make()
+        self.check(self.step(t, [0.0, 2.0], [("S", 900)]), {})  # only us: 2.0 is foreign
+        self.check(self.step(t, [0.0], [("S", 900)]), {})  # it exits
+        with open(self.path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["foreign"], [])
+        t = self.make()  # next run, same boot: a local 2 GiB job must not be taken for the old foreign one
+        self.check(self.step(t, [0.0, 2.0], [("S", 900), ("A", 800)]), {"A": (2.0, "*")})
+
     def test_equal_sizes_are_right_now_but_never_evidence_later(self):
         t = self.make()
         h = [("S", 900), ("A", 13), ("B", 14)]

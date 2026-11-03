@@ -207,7 +207,8 @@ class Collector:
 
         snap.host_status = self.host_status
         live = [(pid, g) for pid, g in procs.items() if _is_live(g)]
-        live.sort(key=lambda x: -x[1].dedicated)
+        # WSL Linux rows are ranked by last sample's inferred size, so the deep-scan budget reaches them too
+        live.sort(key=lambda x: -(x[1].dedicated or self._inferred.get(x[0], 0.0)))
         deep_pids = {pid for pid, _ in live[: self.DEEP_TOP_N]} | {pid for pid, g in live if g.gpu_pct >= 2}
         deadline = None if self.scan_budget is None else time.perf_counter() + self.scan_budget
         ollama_runners = []

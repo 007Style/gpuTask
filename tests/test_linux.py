@@ -284,6 +284,28 @@ class UnattributedReportTests(unittest.TestCase):
         self.assertIn("WSL:", text)
         self.assertNotIn("shared (in system RAM)", text)
 
+    def test_json_unknown_counters_are_null_not_zero(self):
+        snap = self.snapshot()
+        win = ProcRow(2744, "dwm.exe", "compositor", ProcGpu(dedicated=GiB, shared=6 << 20, committed=2 * GiB),
+                      ProcDetail(2744, "dwm.exe"), host=True, origin="windows")
+        snap.procs.append(win)
+        linux_row, win_row = to_dict(snap)["processes"]
+        for k in ("shared_bytes", "committed_bytes", "paged_out_bytes", "gpu_pct", "engines"):
+            self.assertIsNone(linux_row[k], k)
+        self.assertEqual((win_row["shared_bytes"], win_row["committed_bytes"]), (6 << 20, 2 * GiB))
+        self.assertEqual(win_row["gpu_pct"], 0.0)  # measured idle
+        snap.backend = "nvml"  # native Linux: NVML measures VRAM and load, but there is no spill/commit
+        snap.procs = [ProcRow(547, "python3", "AI", ProcGpu(dedicated=GiB), ProcDetail(547, "python3"))]
+        row = to_dict(snap)["processes"][0]
+        self.assertEqual((row["vram_bytes"], row["gpu_pct"], row["shared_bytes"]), (GiB, 0.0, None))
+
+    def test_wsl_rows_sort_by_the_size_they_show(self):
+        from gputaskman.app import GpuTaskManager
+        rows = [ProcRow(p, "python3", "AI", ProcGpu(attributed=False, inferred=v, inferred_by="consistent"),
+                        ProcDetail(p, "python3")) for p, v in ((1, GiB), (2, 5 * GiB), (3, None))]
+        key = GpuTaskManager.SORTS[0][1]
+        self.assertEqual([r.pid for r in sorted(rows, key=key)], [2, 1, 3])
+
     def test_empty_wsl_view_explains_itself(self):
         snap = self.snapshot()
         snap.procs = []

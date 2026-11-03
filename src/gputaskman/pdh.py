@@ -81,6 +81,11 @@ class ProcGpu:
     inferred_by: str = ""  # "consistent" (only one explanation fits) | "order" (start-order guess)
 
     @property
+    def shown_vram(self) -> float:
+        """The VRAM figure a row displays: measured, else inferred (WSL), else 0 for sorting."""
+        return self.dedicated if self.attributed else (self.inferred or 0.0)
+
+    @property
     def paged_out(self) -> float:
         """Commit minus local/non-local usage: a non-residency estimate, not an eviction trace."""
         return max(self.committed - self.dedicated - self.shared, 0.0)

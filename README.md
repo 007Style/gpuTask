@@ -16,7 +16,9 @@ Your browser? The desktop compositor? And why is so much GPU memory in system RA
 ## Clone and run
 
 Use **64-bit Windows 10/11**, an **NVIDIA GPU with a current WDDM driver**, and a terminal
-(Windows Terminal is recommended). Development and live workload checks used an RTX 4080 SUPER.
+(Windows Terminal is recommended). Live workload checks have included an RTX 4080 SUPER and an
+RTX Spark N1X on Windows ARM64. CUDA workloads are supported on ARM64 with a compatible NVIDIA
+driver and ARM64 CUDA runtime.
 
 Install [Git for Windows](https://git-scm.com/downloads/win) and
 [uv](https://docs.astral.sh/uv/getting-started/installation/) if needed. With WinGet:
@@ -52,12 +54,16 @@ py -m venv .venv
 No PowerShell activation script or execution-policy change is needed. The pip route resolves
 compatible dependencies; the uv route uses the checked-in lockfile.
 
+If an alternate package index makes `--locked` report a stale lockfile on an unchanged checkout,
+`uv run --frozen gputaskman` uses the checked-in lockfile without re-resolving it. `--frozen`
+skips the consistency check, so do not use it after changing dependencies.
+
 ## What you get
 
 - **Device view:** VRAM usage, GPU activity, memory activity, PCIe traffic, temperature, power and clocks.
 - **Process view:** local GPU memory, GPU-accessible system RAM, estimated non-resident commit,
   engine activity, and detected runtimes such as CUDA, Vulkan, Direct3D, ggml and ONNX Runtime.
-- **Model inspector:** which model each process holds (LLM, decision, embedding, or speech), how
+- **Model inspector:** which model each process holds (LLM, decision, embedding, speech, or diffusion), how
   it was identified, architecture, quantization, layer count, weights, estimated KV cost, and
   buffer sizes from compatible load logs.
 - **Live server hints:** context size, busy slots, throughput when available, and friendly Ollama
@@ -106,9 +112,15 @@ uv run --locked gputaskman --help
 A wide terminal (roughly 140 columns or more) makes the full table easier to read.
 Model/runtime discovery is throttled, so newly loaded models may take about 15 seconds to appear.
 
-`--gpu N` is available, but **single-NVIDIA-GPU systems are the validated configuration**.
-On multi-GPU systems, DXGI and NVML ordering may differ, and buffer logs can span devices;
-cross-device attribution is not yet reliable.
+`--gpu N` selects a detected NVIDIA graphics adapter, ordered by dedicated memory; an out-of-range
+index is rejected rather than silently selecting another device. Compute-only devices such as an
+NPU are not graphics adapters. **Single-NVIDIA-GPU systems are the validated configuration**.
+On multi-GPU systems, adapter names may be ambiguous, DXGI and NVML ordering may differ, and buffer
+logs can span devices; cross-device attribution is not yet reliable.
+
+Unavailable utilization, temperature, power, clock and PCIe readings are displayed as `N/A` in
+text and the TUI and as `null` in JSON. For example, a missing NVML power limit means that the
+driver did not expose that reading; it does not by itself indicate a hardware fault.
 
 ## How can it know what's inside?
 
@@ -168,6 +180,7 @@ reading is NVML's memory-activity percentage, **not measured bandwidth in GB/s**
 | llama.cpp / llama-server | GGUF discovery, CLI settings, buffer logs, `/props` + `/v1/models` state; exercised live |
 | Ollama | Bundled runners, mapped GGUF blobs named from Ollama manifests (`qwen3:14b`), parent `/api/ps`, compatible `server.log`; exercised live |
 | LM Studio | Mapped files named from its models folder, `/api/v1/models` (falls back to `/api/v0/models`); tested with fixture responses, not yet end to end |
+| stable-diffusion.cpp (`--diffusion-model`) | Diffusion, text-encoder and VAE files from launch arguments; no LLM memory breakdown |
 | Hugging Face cache | `models--org--repo` paths are named `org/repo` |
 | Other AI runtimes | DLL detection, plus model files installed with the app (marked *not proven loaded*) |
 

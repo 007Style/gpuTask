@@ -11,12 +11,15 @@ from unittest.mock import patch
 
 from gputaskman.app import GpuTaskManager
 from gputaskman.cli import main
-from gputaskman.collector import ProcRow, Snapshot
+from gputaskman.collector import ProcRow, Snapshot, select_adapter, select_nv_device
+from gputaskman.dxgi import Adapter
 from gputaskman.gguf import GgufInfo, read_gguf
 from gputaskman.llm import (LlmView, ServerInfo, build_view, is_gpu_device, llama_server_models, lmstudio_models,
                             parse_flags, parse_load_log, probe_server)
+from gputaskman.nvml import NvDevice
 from gputaskman.pdh import GpuCounters, ProcGpu
-from gputaskman.procinfo import MappedModel, ProcDetail, ProcInspector, _is_model_file, classify, installed_models
+from gputaskman.procinfo import (MappedModel, ProcDetail, ProcInspector, _is_model_file, _models_from_cmdline,
+                                classify, installed_models)
 from gputaskman.report import to_dict, to_text
 from gputaskman.stores import store_name
 from tools.capture_screenshots import for_publication
@@ -75,6 +78,40 @@ class CliTests(unittest.TestCase):
                     main()
                 collector.return_value.close.assert_called_once()
 
+    def test_out_of_range_gpu_is_rejected(self):
+        adapter = Adapter(1, "NVIDIA GPU", 0x10DE, 16 * GiB, 0, False)
+        output = io.StringIO()
+        with patch("sys.argv", ["gputaskman", "--gpu", "1", "--json"]), \
+                patch("gputaskman.collector.enumerate_adapters", return_value=[adapter]), \
+                patch("gputaskman.collector.Collector") as collector, contextlib.redirect_stderr(output):
+            with self.assertRaises(SystemExit) as error:
+                main()
+        self.assertEqual(error.exception.code, 2)
+        self.assertIn("out of range", output.getvalue())
+        collector.assert_not_called()
+
+
+class DeviceSelectionTests(unittest.TestCase):
+    def test_adapter_indices_do_not_clamp_to_another_gpu(self):
+        gpu = Adapter(1, "NVIDIA GPU", 0x10DE, 16 * GiB, 0, False)
+        software = Adapter(2, "Software", 0x1414, 0, 0, True)
+        self.assertIs(select_adapter([software, gpu], 0), gpu)
+        with self.assertRaisesRegex(ValueError, "out of range"):
+            select_adapter([software, gpu], 1)
+        self.assertIsNone(select_adapter([], 0))
+        with self.assertRaisesRegex(ValueError, "out of range"):
+            select_adapter([], 1)
+
+    def test_nvml_matches_unique_adapter_name_before_index(self):
+        gpu = Adapter(1, "NVIDIA RTX Spark", 0x10DE, 64 * GiB, 0, False)
+        npu = NvDevice(index=0, name="NVIDIA NPU", driver_model="MCDM")
+        nv_gpu = NvDevice(index=1, name="NVIDIA RTX SPARK", driver_model="WDDM")
+        self.assertIs(select_nv_device(gpu, [npu, nv_gpu], 0), nv_gpu)
+        self.assertIs(select_nv_device(None, [npu, nv_gpu], 0), npu)
+        self.assertIsNone(select_nv_device(gpu, [npu], 0))
+        intel = Adapter(2, "Intel GPU", 0x8086, 8 * GiB, 0, False)
+        self.assertIsNone(select_nv_device(intel, [nv_gpu], 0))
+
 
 class MemoryTests(unittest.TestCase):
     def test_local_counters_are_preferred(self):
@@ -99,6 +136,18 @@ class MemoryTests(unittest.TestCase):
         self.assertIn("PAGED", text)
         self.assertNotIn("gen=None", text)
 
+    def test_text_shows_unavailable_device_metrics_without_fabricating_zeroes(self):
+        s = snapshot()
+        s.nv = NvDevice(index=0, util_gpu=0, power_w=2.4, pcie_tx_kbs=0)
+        text = to_text(s)
+        self.assertIn("GPU 0%", text)
+        self.assertIn("mem-bandwidth N/A", text)
+        self.assertIn("2/N/A W", text)
+        self.assertIn("P N/A", text)
+        self.assertIn("PCIe rx N/A MB/s tx 0 MB/s", text)
+        self.assertNotIn("None", text.splitlines()[2])
+        self.assertIsNone(to_dict(s)["device"]["power_limit_w"])
+
     def test_capture_does_not_change_original_or_publish_command_line(self):
         original = snapshot()
         original.procs[0].llm.models = [
@@ -112,6 +161,19 @@ class MemoryTests(unittest.TestCase):
 
 
 class ModelTests(unittest.TestCase):
+    def test_diffusion_arguments_do_not_classify_text_encoder_as_llm(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = [Path(directory) / name for name in ("diffusion.gguf", "encoder.gguf", "vae.safetensors")]
+            for path in paths:
+                path.touch()
+            cmd = ["sd-cli.exe", "--diffusion-model", str(paths[0]),
+                   f"--llm={paths[1]}", "--vae", str(paths[2])]
+            self.assertEqual(_models_from_cmdline(cmd), [str(path) for path in paths])
+            self.assertEqual(_models_from_cmdline(["sd-cli.exe", f"--diffusion-model={paths[0]}"]), [str(paths[0])])
+            d = ProcDetail(1, "sd-cli.exe", cmdline=cmd, runtimes=["ggml"],
+                           models=[MappedModel(str(paths[1]), 0, 0, True, kind="LLM")])
+            self.assertEqual(classify(d, {}), "diffusion")
+
     def test_layer_and_kv_estimates(self):
         model = GgufInfo(
             path="model.gguf", file_size=1000, version=3,
@@ -136,9 +198,10 @@ class ModelTests(unittest.TestCase):
                          {"ctx": 8192, "ngl": -1, "ctk": "q8_0"})
 
     def test_gpu_buffers_exclude_host_and_cpu(self):
-        for device in ("CPU", "CPU_Mapped", "CUDA_Host"):
+        for device in ("CPU", "CPU_Mapped", "CUDA_Host", "Vulkan_Host"):
             self.assertFalse(is_gpu_device(device))
-        self.assertTrue(is_gpu_device("CUDA0"))
+        for device in ("CUDA0", "Vulkan0"):
+            self.assertTrue(is_gpu_device(device))
 
     def test_latest_load_and_multiple_kv_buffers(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -238,6 +301,17 @@ class IdentityTests(unittest.TestCase):
                 patch.object(ProcInspector, "_new", return_value=fresh):
             self.assertIs(inspector.get(42), fresh)
 
+    def test_repeated_model_arguments_do_not_duplicate_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "model.gguf")
+            Path(path).write_bytes(b"not a GGUF")
+            detail = ProcDetail(6, "llama-server.exe", cmdline=["server", "--model", path, "--mmproj", path])
+            with patch("gputaskman.procinfo.psutil.Process") as process:
+                process.return_value.memory_maps.return_value = []
+                ProcInspector().scan(detail)
+        self.assertEqual(len(detail.models), 1)
+        self.assertEqual(detail.models[0].sources, ["cmdline"])
+
     def test_ambiguous_extensions_need_size_or_store(self):
         self.assertFalse(_is_model_file(".bin", 10 * MiB, False, None))  # e.g. a Start menu tile cache
         self.assertTrue(_is_model_file(".bin", 10 * MiB, False, "org/repo"))
@@ -265,8 +339,29 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(v.files[0].evidence, "confirmed (api+mapped)")
         self.assertEqual(d.models[0].sources, ["mapped"])  # cached detail is not mutated
         self.assertIsNone(v.kv_per_token)
-        self.assertEqual([s.label for s in v.segments], ["weights", "compute buffers + CUDA context"])
+        self.assertEqual([s.label for s in v.segments], ["weights", "compute buffers + runtime"])
         self.assertTrue(any("laya decision model" in n for n in v.notes))
+
+    def test_vulkan_log_does_not_label_unknown_overhead_as_cuda(self):
+        laya = gguf("modern-bert", **LAYA)
+        detail = ProcDetail(5, "llama-server.exe", models=[
+            MappedModel("laya.gguf", 1000, 0, True, kind="decision model")
+        ])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "server.log"
+            path.write_text(
+                "load_tensors: Vulkan0 model buffer size = 10 MiB\n"
+                "load_tensors: Vulkan_Host model buffer size = 3 MiB\n"
+                "llama_context: Vulkan0 compute buffer size = 2 MiB\n",
+                encoding="utf-8",
+            )
+            with patch("gputaskman.llm.read_gguf", return_value=laya):
+                view = build_view(detail, 20 * MiB, 0, None, str(path))
+        self.assertEqual([(s.label, s.bytes) for s in view.segments], [
+            ("weights (Vulkan0)", 10 * MiB),
+            ("compute buffers (Vulkan0)", 2 * MiB),
+            ("runtime and other overhead", 8 * MiB),
+        ])
 
     def test_installed_models_are_candidates_only(self):
         with tempfile.TemporaryDirectory() as root:
@@ -305,8 +400,34 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(len(ollama), 1)
         self.assertIn("qwen3:14b", ollama[0])
 
+    def test_runner_and_host_apis_do_not_duplicate_evidence(self):
+        qwen = gguf("qwen3", block_count=1, context_length=4096)
+        model = MappedModel("blob", 1000, 0, True, ["cmdline"], "qwen3:4b", "LLM")
+        detail = ProcDetail(6, "llama-server.exe", models=[model])
+        runner = ServerInfo("llama-server", "http://127.0.0.1:1", model_path="blob")
+        host = ServerInfo("ollama", "http://127.0.0.1:2", models=[{"name": "qwen3:4b", "ctx": 4096}])
+        with patch("gputaskman.llm.read_gguf", return_value=qwen):
+            view = build_view(detail, GiB, 0, runner, host=host)
+        self.assertEqual(view.files[0].sources, ["cmdline", "api"])
+        self.assertEqual(model.sources, ["cmdline"])
+
 
 class UiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unavailable_device_metrics_render_as_na(self):
+        with patch.object(GpuTaskManager, "poll"):
+            app = GpuTaskManager()
+            async with app.run_test(size=(140, 42)):
+                s = snapshot()
+                s.nv = NvDevice(index=0, util_mem=0, power_w=2.4, pcie_tx_kbs=0)
+                app.apply(s)
+                lines = "\n".join(line.plain for line in app.render_device(s).renderables)
+                self.assertIn("2/N/A W", lines)
+                self.assertIn("P N/A", lines)
+                self.assertIn("PCIe↓  N/A", lines)
+                self.assertNotIn("None", lines)
+                self.assertIsNone(app.hist_util[-1])
+                self.assertEqual(app.hist_bw[-1], 0)
+
     async def test_navigation_sort_pause_and_help(self):
         with patch.object(GpuTaskManager, "poll"):
             app = GpuTaskManager()

@@ -39,6 +39,10 @@ class NvDevice:
     compute_cap: str = ""
 
 
+def format_metric(value: float | int | None, spec: str = "", unit: str = "") -> str:
+    return f"{format(value, spec)}{unit}" if value is not None else "N/A"
+
+
 _THROTTLE = {
     0x2: "app-clocks",
     0x4: "sw-power-cap",

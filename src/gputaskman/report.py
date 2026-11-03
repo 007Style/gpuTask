@@ -8,6 +8,7 @@ import os
 
 from .collector import Snapshot
 from .llm import gb
+from .nvml import format_metric
 
 
 def to_dict(s: Snapshot) -> dict:
@@ -52,8 +53,14 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
     out.append(f"{name}  driver {s.driver}  CUDA {s.cuda}  {nv.driver_model if nv else ''}")
     out.append(f"VRAM {gb(s.vram_used)} / {gb(s.vram_total)}   shared (in system RAM) {gb(s.shared_used)}")
     if nv:
-        out.append(f"GPU {nv.util_gpu}%  mem-bandwidth {nv.util_mem}%  {nv.temp}C  {nv.power_w:.0f}/{nv.power_limit_w:.0f} W  "
-                   f"P{nv.pstate}  SM {nv.sm_clock} MHz  PCIe rx {(nv.pcie_rx_kbs or 0) / 1024:.0f} MB/s tx {(nv.pcie_tx_kbs or 0) / 1024:.0f} MB/s")
+        rx = nv.pcie_rx_kbs / 1024 if nv.pcie_rx_kbs is not None else None
+        tx = nv.pcie_tx_kbs / 1024 if nv.pcie_tx_kbs is not None else None
+        pstate = f"P{nv.pstate}" if nv.pstate is not None else "P N/A"
+        out.append(f"GPU {format_metric(nv.util_gpu, unit='%')}  mem-bandwidth {format_metric(nv.util_mem, unit='%')}  "
+                   f"{format_metric(nv.temp, unit='C')}  {format_metric(nv.power_w, '.0f')}/"
+                   f"{format_metric(nv.power_limit_w, '.0f')} W  {pstate}  "
+                   f"SM {format_metric(nv.sm_clock)} MHz  PCIe rx {format_metric(rx, '.0f')} MB/s "
+                   f"tx {format_metric(tx, '.0f')} MB/s")
     out.append("")
     out.append(f"{'PID':>7}  {'PROCESS':<24} {'KIND':<10} {'RUNTIME':<24} {'VRAM':>9} {'SPILL':>8} {'PAGED':>8} {'GPU%':>5}  INSIDE")
     for p in s.procs[:limit]:

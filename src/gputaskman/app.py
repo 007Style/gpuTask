@@ -19,9 +19,11 @@ from textual.worker import get_current_worker
 
 from .collector import Collector, ProcRow, Snapshot
 from .llm import gb
+from .nvml import format_metric
 
 KIND_STYLE = {
     "LLM": "bold magenta", "decision": "bold orchid", "embedding": "plum2", "speech": "light_sky_blue1",
+    "diffusion": "orchid",
     "AI": "medium_purple1", "compute": "orange3", "3D/game": "green3",
     "video": "yellow", "browser": "dodger_blue2", "app": "cyan", "compositor": "grey50",
     "kernel": "grey50", "system": "grey50",
@@ -42,6 +44,7 @@ EXPLAIN = {
                "per-resource names need a graphics debugger (PIX on Windows, NVIDIA Nsight Graphics).",
     "video": "Decoded/encoded video frames and codec surfaces (NVDEC/NVENC).",
     "compute": "CUDA allocations are opaque to the OS. For more detail trace cudaMalloc with Nsight Systems.",
+    "diffusion": "Model components are identified from launch arguments; GPU allocations cannot be split by component.",
     "AI": "ML runtime allocations (tensors, workspaces). PyTorch: torch.cuda.memory_summary(); "
           "ONNX Runtime/DirectML pools are opaque from outside.",
     "app": "UI surfaces: swap chains, window back-buffers, cached bitmaps/glyphs.",
@@ -55,7 +58,7 @@ HELP_MD = """\
 | **Device** totals, load, bandwidth, PCIe, power | NVML (`nvml.dll`) | NVIDIA |
 | **Per-process** VRAM, spill to RAM, per-engine load | Windows WDDM counters (dxgkrnl) | every API incl. **CUDA** |
 | **Which runtime** (CUDA, Vulkan, D3D12, ggml, ONNX, PyTorch...) | DLLs mapped in the process | everything |
-| **Which model file** | memory-mapped files + command line | llama.cpp, LM Studio, Ollama, llama-cpp-python |
+| **Which model file** | memory-mapped files + command line | llama.cpp, stable-diffusion.cpp, LM Studio, Ollama |
 | **Model name & kind** (LLM, decision, embedding, speech) | GGUF header, Ollama/LM Studio/Hugging Face stores, local server APIs | GGUF family |
 | **Weights / KV cache / compute** split | GGUF header math, llama.cpp/Ollama logs, local server APIs | GGUF/llama.cpp family |
 | Per-texture / per-buffer names | needs a debugger (PIX, Nsight) attached to the app | games, 3D apps |
@@ -184,8 +187,8 @@ class GpuTaskManager(App):
         self.snap = snap
         nv = snap.nv
         if nv:
-            self.hist_util.append(nv.util_gpu or 0)
-            self.hist_bw.append(nv.util_mem or 0)
+            self.hist_util.append(nv.util_gpu)
+            self.hist_bw.append(nv.util_mem)
         self.hist_vram.append(100 * snap.vram_used / snap.vram_total if snap.vram_total else 0)
         if not self._auto_selected:
             llm = next((r for r in sorted(snap.procs, key=lambda r: -r.gpu.dedicated) if r.llm), None)
@@ -233,20 +236,26 @@ class GpuTaskManager(App):
 
         lines = [head, vram, legend]
         if nv:
+            rx = nv.pcie_rx_kbs / 1024 if nv.pcie_rx_kbs is not None else None
+            tx = nv.pcie_tx_kbs / 1024 if nv.pcie_tx_kbs is not None else None
+            pstate = f"P{nv.pstate}" if nv.pstate is not None else "P N/A"
             m = Text()
             m.append("GPU ", style="bold")
-            m.append(f"{nv.util_gpu:>3}% ", style="bold green")
+            m.append(f"{format_metric(nv.util_gpu, unit='%'):>4} ", style="bold green")
             m.append(spark(self.hist_util, 24), style="green")
             m.append("  MemBW ", style="bold")
-            m.append(f"{nv.util_mem:>3}% ", style="bold dark_orange")
+            m.append(f"{format_metric(nv.util_mem, unit='%'):>4} ", style="bold dark_orange")
             m.append(spark(self.hist_bw, 24), style="dark_orange")
-            m.append(f"  PCIe↓{(nv.pcie_rx_kbs or 0) / 1024:>5.0f} ↑{(nv.pcie_tx_kbs or 0) / 1024:>4.0f} MB/s")
+            m.append(f"  PCIe↓{format_metric(rx, '.0f'):>5} ↑{format_metric(tx, '.0f'):>4} MB/s")
             if nv.enc or nv.dec:
-                m.append(f"  enc {nv.enc}% dec {nv.dec}%")
+                m.append(f"  enc {format_metric(nv.enc, unit='%')} dec {format_metric(nv.dec, unit='%')}")
             lines.append(m)
-            st = Text(f"{nv.temp}°C  {nv.power_w or 0:.0f}/{nv.power_limit_w or 0:.0f} W  P{nv.pstate}  "
-                      f"SM {nv.sm_clock}/{nv.sm_clock_max} MHz  mem {nv.mem_clock} MHz  "
-                      f"PCIe gen{nv.pcie_gen} x{nv.pcie_width}  CC {nv.compute_cap}", style="grey70")
+            st = Text(f"{format_metric(nv.temp, unit='°C')}  {format_metric(nv.power_w, '.0f')}/"
+                      f"{format_metric(nv.power_limit_w, '.0f')} W  {pstate}  "
+                      f"SM {format_metric(nv.sm_clock)}/{format_metric(nv.sm_clock_max)} MHz  "
+                      f"mem {format_metric(nv.mem_clock)} MHz  "
+                      f"PCIe gen{format_metric(nv.pcie_gen)} x{format_metric(nv.pcie_width)}  "
+                      f"CC {nv.compute_cap or 'N/A'}", style="grey70")
             if nv.throttle:
                 st.append("  throttle: " + ",".join(nv.throttle), style="yellow")
             lines.append(st)

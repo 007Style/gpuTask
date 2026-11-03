@@ -41,7 +41,7 @@ LLM_NAMES = ("llama-", "llama.", "ollama", "lm studio", "lmstudio", "llmster", "
 # GGUF file kind -> process kind, in display priority order
 MODEL_KINDS = {"LLM": "LLM", "decision model": "decision", "embedding model": "embedding",
                "reranker": "embedding", "speech model": "speech"}
-AI_KINDS = {"LLM", "decision", "embedding", "speech", "AI"}
+AI_KINDS = {"LLM", "decision", "embedding", "speech", "diffusion", "AI"}
 MiB = 1 << 20
 INSTALLED_TTL = 300.0
 _SKIP_DIRS = {"ebwebview", "cache", "code cache", "gpucache", "node_modules", "logs", "crashpad", "locales", "__pycache__"}
@@ -58,6 +58,10 @@ class MappedModel:
     store_name: str | None = None  # e.g. "qwen3:14b" from an Ollama manifest
     kind: str = ""  # GGUF kind: LLM, decision model, embedding model, ...
 
+    def add_source(self, source: str) -> None:
+        if source not in self.sources:
+            self.sources.append(source)
+
     @property
     def evidence(self) -> str:
         s = set(self.sources)
@@ -67,6 +71,10 @@ class MappedModel:
         if not how and "installed" in s:
             return "installed, not proven loaded"
         return {"mapped": "in use (mapped)", "cmdline": "launch arg", "api": "reported (api)"}.get(how, how)
+
+
+def _is_diffusion_cmdline(cmd: list[str]) -> bool:
+    return any(arg == "--diffusion-model" or arg.startswith("--diffusion-model=") for arg in cmd)
 
 
 @dataclass
@@ -89,6 +97,10 @@ class ProcDetail:
     def is_ai(self) -> bool:
         return bool(self.models) or any(r in AI_RUNTIMES for r in self.runtimes)
 
+    @property
+    def is_diffusion(self) -> bool:
+        return _is_diffusion_cmdline(self.cmdline)
+
 
 def _match_runtimes(dll_names: set[str]) -> list[str]:
     return [tag for tag, rx in _RUNTIME_RX if any(rx.match(d) for d in dll_names)]
@@ -96,12 +108,14 @@ def _match_runtimes(dll_names: set[str]) -> list[str]:
 
 def _models_from_cmdline(cmd: list[str]) -> list[str]:
     paths = []
+    flags = {"-m", "--model", "--mmproj", "-md", "--model-draft", "--lora"}
+    if _is_diffusion_cmdline(cmd):
+        flags.update(("--diffusion-model", "--vae", "--llm"))
     for i, arg in enumerate(cmd):
         val = None
-        if arg in ("-m", "--model", "--mmproj", "-md", "--model-draft", "--lora") and i + 1 < len(cmd):
-            val = cmd[i + 1]
-        elif arg.startswith("--model="):
-            val = arg.split("=", 1)[1]
+        key, sep, value = arg.partition("=")
+        if key in flags:
+            val = value if sep else (cmd[i + 1] if i + 1 < len(cmd) else None)
         if val and os.path.isfile(val):
             paths.append(os.path.abspath(val))
     return paths
@@ -302,7 +316,7 @@ class ProcInspector:
                 models[path.lower()] = make_model(path, size, m.rss, gg, "mapped", store)
         for path in _models_from_cmdline(d.cmdline):
             if path.lower() in models:
-                models[path.lower()].sources.append("cmdline")
+                models[path.lower()].add_source("cmdline")
             else:
                 models[path.lower()] = make_model(path, os.path.getsize(path), 0, is_gguf(path), "cmdline")
         d.runtimes = _match_runtimes(dlls)
@@ -324,6 +338,8 @@ def classify(d: ProcDetail, engines: dict[str, float]) -> str:
         return "compositor"
     if n in ("csrss.exe", "winlogon.exe", "lsass.exe", "svchost.exe"):
         return "system"
+    if d.is_diffusion:
+        return "diffusion"
     kinds = {MODEL_KINDS[m.kind] for m in d.models if m.kind in MODEL_KINDS}
     for k in ("LLM", "decision", "embedding", "speech"):
         if k in kinds:

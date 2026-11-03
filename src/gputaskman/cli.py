@@ -23,11 +23,22 @@ def main() -> None:
     if sys.platform != "win32":
         sys.exit("gputaskman currently supports Windows (WDDM) only.")
 
+    if args.gpu:
+        from .collector import enumerate_adapters, select_adapter
+
+        try:
+            select_adapter(enumerate_adapters(), args.gpu)
+        except ValueError as error:
+            ap.error(str(error))
+
     if args.once or args.json:
         from .collector import Collector
         from .report import dump
 
-        c = Collector(args.gpu, scan_budget=None)  # one-shot: identify everything in this sample
+        try:
+            c = Collector(args.gpu, scan_budget=None)  # one-shot: identify everything in this sample
+        except ValueError as error:
+            ap.error(str(error))
         try:
             time.sleep(1.0)  # engine utilization is a rate; needs two samples
             print(dump(c.sample(), args.json))

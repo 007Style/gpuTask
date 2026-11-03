@@ -73,20 +73,42 @@ class Snapshot:
         return int(sum(p.gpu.dedicated for p in self.procs))
 
 
+def select_adapter(adapters: list[Adapter], gpu_index: int) -> Adapter | None:
+    hardware = [a for a in adapters if not a.software]
+    choices = [a for a in hardware if a.vendor_id == VENDOR_NVIDIA] or hardware
+    choices.sort(key=lambda a: -a.dedicated_vram)
+    if gpu_index < 0:
+        raise ValueError("--gpu must be a non-negative index")
+    if gpu_index >= len(choices):
+        if not choices and gpu_index == 0:
+            return None
+        raise ValueError(f"--gpu {gpu_index} is out of range; {len(choices)} GPU adapter(s) available")
+    return choices[gpu_index]
+
+
+def select_nv_device(adapter: Adapter | None, devices: list[NvDevice], gpu_index: int) -> NvDevice | None:
+    if adapter:
+        if adapter.vendor_id != VENDOR_NVIDIA:
+            return None
+        matches = [d for d in devices if d.name.casefold() == adapter.name.casefold()]
+        if len(matches) == 1:
+            return matches[0]
+    fallback = devices[gpu_index] if gpu_index < len(devices) else None
+    return None if adapter and fallback and fallback.driver_model == "MCDM" else fallback
+
+
 class Collector:
     DEEP_TOP_N = 25  # memory-map candidates: the top N VRAM users plus anything busy
     SCAN_BUDGET = 0.15  # seconds of memory-map scanning per sample; leftovers wait for the next sample
 
     def __init__(self, gpu_index: int = 0, scan_budget: float | None = SCAN_BUDGET) -> None:
+        self.adapters = [a for a in enumerate_adapters() if not a.software]
+        self.adapter = select_adapter(self.adapters, gpu_index)
         self.counters = GpuCounters()
         self.nvml = Nvml()
         self.inspector = ProcInspector()
         self.prober = ServerProber()
         self.scan_budget = scan_budget  # None = scan every candidate now (one-shot output)
-        self.adapters = [a for a in enumerate_adapters() if not a.software]
-        nv = [a for a in self.adapters if a.vendor_id == VENDOR_NVIDIA] or self.adapters
-        nv.sort(key=lambda a: -a.dedicated_vram)
-        self.adapter = nv[min(gpu_index, len(nv) - 1)] if nv else None
         self.gpu_index = gpu_index
 
     def _parent_ports(self, pid: int, depth: int = 2) -> list[int]:
@@ -110,7 +132,7 @@ class Collector:
         procs = per_luid.get(luid, {})
         a = adapters.get(luid)
         nvs = self.nvml.sample() if self.nvml.ok else []
-        nv = nvs[self.gpu_index] if self.gpu_index < len(nvs) else None
+        nv = select_nv_device(self.adapter, nvs, self.gpu_index)
         total = (nv.mem_total if nv else 0) or (self.adapter.dedicated_vram if self.adapter else 0)
 
         snap = Snapshot(
@@ -140,7 +162,7 @@ class Collector:
                 ollama_runners.append(row)
 
         for row in snap.procs:
-            if row.kind not in AI_KINDS or not (row.detail.models or row.kind == "LLM"):
+            if row.detail.is_diffusion or row.kind not in AI_KINDS or not (row.detail.models or row.kind == "LLM"):
                 continue
             own = self.prober.get(row.detail.ports)
             host = self.prober.get(self._parent_ports(row.pid))  # Ollama / LM Studio front-end process

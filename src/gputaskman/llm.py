@@ -301,7 +301,7 @@ def _merge_api(files: list[MappedModel], server: ServerInfo | None, host: Server
         key = os.path.normcase(os.path.abspath(server.model_path))
         hit = next((f for f in files if os.path.normcase(os.path.abspath(f.path)) == key), None)
         if hit:
-            hit.sources.append("api")
+            hit.add_source("api")
         elif os.path.isfile(server.model_path):  # loaded without mmap or via the router: API-only evidence
             files.insert(0, make_model(server.model_path, os.path.getsize(server.model_path), 0,
                                        is_gguf(server.model_path), "api"))
@@ -310,12 +310,12 @@ def _merge_api(files: list[MappedModel], server: ServerInfo | None, host: Server
             names = set((f.store_name or "").split(", "))
             for om in front.models:
                 if om["name"] in names:
-                    f.sources.append("api")
+                    f.add_source("api")
                     matched.append(om)
     lms = host if host and host.kind == "lmstudio" else (server if server and server.kind == "lmstudio" else None)
     primary = [f for f in files if f.kind not in _SIDE_KINDS]
     if lms and len(lms.models) == 1 and len(primary) == 1:  # LM Studio keys don't map to paths; only pair 1:1
-        primary[0].sources.append("api")
+        primary[0].add_source("api")
         matched.append(lms.models[0])
     return matched
 
@@ -368,7 +368,7 @@ def build_view(d: ProcDetail, vram: float, shared: float, server: ServerInfo | N
         if cpu_w and main and cpu_w > main.token_embd_bytes * 1.5:
             v.notes.append(f"{gb(cpu_w)} of weights are on the CPU side (partial offload or CPU-mapped).")
         if total > acc:
-            v.segments.append(Segment("CUDA context, cuBLAS & other", total - acc, "runtime"))
+            v.segments.append(Segment("runtime and other overhead", total - acc, "runtime"))
     else:
         ngl = v.flags.get("ngl") if len(v.models) == 1 else None
         weights = sum(g.gpu_weight_bytes(ngl) for g in v.models if g.kind != "LoRA adapter")
@@ -390,11 +390,11 @@ def build_view(d: ProcDetail, vram: float, shared: float, server: ServerInfo | N
                                "so the real KV cache is smaller than this estimate.")
             rest -= kv
             if rest > 0:
-                v.segments.append(Segment("compute buffers + CUDA context", rest, "runtime"))
+                v.segments.append(Segment("compute buffers + runtime", rest, "runtime"))
         elif rest > 0 and no_kv:
-            v.segments.append(Segment("compute buffers + CUDA context", rest, "runtime"))
+            v.segments.append(Segment("compute buffers + runtime", rest, "runtime"))
         elif rest > 0:
-            v.segments.append(Segment("KV cache + compute + CUDA context", rest, "unknown"))
+            v.segments.append(Segment("KV cache + compute + runtime", rest, "unknown"))
 
     if not v.models and not v.log and total > 0:
         v.notes.append("No GGUF mapped. Model may be loaded with --no-mmap or via another format.")

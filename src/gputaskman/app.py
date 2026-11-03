@@ -17,10 +17,10 @@ from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Markdown, Select, Static
 from textual.worker import get_current_worker
 
-from .collector import Collector, ProcRow, Snapshot
+from .collector import BACKEND, Collector, ProcRow, Snapshot
 from .llm import gb
 from .nvml import NvDevice, format_metric
-from .report import WSL_EMPTY, has_engine_counters, has_wddm_counters, inferred_note, vram_label, wsl_note
+from .report import METAL_NOTE, WSL_EMPTY, has_engine_counters, has_wddm_counters, inferred_note, vram_label, wsl_note
 
 KIND_STYLE = {
     "LLM": "bold magenta", "decision": "bold orchid", "decision?": "orchid",
@@ -153,6 +153,9 @@ class HelpScreen(ModalScreen):
             yield Markdown(HELP_MD)
 
 
+METAL_CHARTS = ("GPU", "VRAM")
+
+
 class GpuTaskManager(App):
     TITLE = "gputaskman"
     CSS = """
@@ -230,7 +233,7 @@ class GpuTaskManager(App):
                 with Horizontal(id="chart-controls"):
                     yield Static("Charts", id="chart-label")
                     yield Select(
-                        [("All charts", -1), *((name, index) for index, name in enumerate(self.CHARTS))],
+                        [("All charts", -1), *((self.CHARTS[index], index) for index in self.available_charts)],
                         value=-1, allow_blank=False, compact=True, id="chart-mode",
                     )
                     yield Static("Click to choose · c cycles", id="chart-hint")
@@ -272,8 +275,9 @@ class GpuTaskManager(App):
             self._amd_chart_labels = amd
             selector = self.query_one("#chart-mode", Select)
             selected = selector.value
-            selector.set_options([("All charts", -1), *(("GFX clock" if amd and name == "SM clock" else name, index)
-                                                      for index, name in enumerate(self.CHARTS))])
+            selector.set_options([("All charts", -1), *(
+                ("GFX clock" if amd and self.CHARTS[index] == "SM clock" else self.CHARTS[index], index)
+                for index in self.available_charts)])  # macOS offers only the charts IOKit has data for
             selector.value = selected
         if nv:
             self.hist_util.append(nv.util_gpu)
@@ -302,9 +306,12 @@ class GpuTaskManager(App):
     def render_device(self, s: Snapshot) -> Group:
         nv = s.nv
         name = s.adapter.name if s.adapter else (nv.name if nv else "GPU")
-        info = (f"   driver {s.driver}" if s.driver else "") + (f"  CUDA {s.cuda}" if s.cuda else "")
-        head = Text.assemble((name, "bold"), info + "  ",
-                             (nv.driver_model if nv else "", "bold yellow"), f"  {nv.pci_bus if nv else ''}")
+        if s.backend == "metal":
+            head = Text.assemble((name, "bold"), f"   {s.driver}  ", ("Metal", "bold yellow"), "  unified memory")
+        else:
+            info = (f"   driver {s.driver}" if s.driver else "") + (f"  CUDA {s.cuda}" if s.cuda else "")
+            head = Text.assemble((name, "bold"), info + "  ",
+                                 (nv.driver_model if nv else "", "bold yellow"), f"  {nv.pci_bus if nv else ''}")
         if self.paused:
             head.append("   [PAUSED]", style="bold red")
 
@@ -320,7 +327,7 @@ class GpuTaskManager(App):
         other = max(s.vram_used - attributed * scale, 0) if s.vram_used is not None else 0
         parts.append((other, "grey35"))
         width = max(min(self.size.width - 40, 90), 20)
-        vram = Text("VRAM ")
+        vram = Text("GPU mem " if s.backend == "metal" else "VRAM ")
         vram.append_text(stacked_bar(parts, s.vram_total, width))
         used_label = gb(s.vram_used) if s.vram_used is not None else "N/A"
         vram.append(f" {used_label} / {gb(s.vram_total)}", style="bold")
@@ -339,9 +346,14 @@ class GpuTaskManager(App):
             legend.append("   [bar normalized; labels are raw]", style="grey62")
         if s.backend == "wsl":
             legend.append("\n     " + wsl_note(s), style="grey62")
+        if s.backend == "metal":
+            legend.append("\n     " + METAL_NOTE, style="grey62")
 
         lines = [head, vram, legend]
-        if nv:
+        if nv and s.backend == "metal":
+            lines.append(Text(f"GPU {format_metric(nv.util_gpu, unit='%')}",
+                              style=f"bold {self.CHART_COLORS['GPU']}"))
+        elif nv:
             rx = nv.pcie_rx_kbs / 1024 if nv.pcie_rx_kbs is not None else None
             tx = nv.pcie_tx_kbs / 1024 if nv.pcie_tx_kbs is not None else None
             pstate = f"P{nv.pstate}" if nv.pstate is not None else "P N/A"
@@ -396,7 +408,7 @@ class GpuTaskManager(App):
         widget = self.query_one("#charts", Static)
         # Reserve the border, padding, and scrollbar even before child resize events arrive.
         width = max(1, self.size.width - 6)
-        indices = list(range(len(self.CHARTS))) if self.chart_idx == -1 else [self.chart_idx]
+        indices = list(self.available_charts) if self.chart_idx == -1 else [self.chart_idx]
         columns = min(len(indices), 3, max(1, (width + 2) // 46))
         cell_width = max(1, (width - 2 * (columns - 1)) // columns)
         grid = Table.grid(padding=(0, 2), pad_edge=False, expand=True)
@@ -419,6 +431,7 @@ class GpuTaskManager(App):
         _, power_scale, _, _ = self.chart_series(self.CHARTS.index("Power"), self.snap.nv)
         _, clock_scale, _, _ = self.chart_series(self.CHARTS.index("SM clock"), self.snap.nv)
         self.query_one("#chart-note", Static).update(
+            "Recent samples · blank = no reading" if self.snap.backend == "metal" else
             f"Recent samples · blank = no reading · power 0–{power_scale:.0f} W · "
             f"{'GFX' if getattr(self, '_amd_chart_labels', False) else 'SM'} clock 0–{clock_scale:.0f} MHz"
         )
@@ -458,6 +471,7 @@ class GpuTaskManager(App):
             e = r.gpu.engines
             wddm = has_wddm_counters(s, r)
             engines = has_engine_counters(s, r)
+            split = engines and s.backend != "metal"  # Metal reports one GPU time, no per-engine split
             spill = Text(gb(r.gpu.shared) if wddm and r.gpu.shared >= 1 << 20 else "", justify="right",
                          style="bold red" if r.gpu.shared >= 256 << 20 and r.kind in ("LLM", "AI") else "yellow")
             paged = Text(gb(r.gpu.paged_out) if wddm and r.gpu.paged_out >= 1 << 20 else "", justify="right", style="grey62")
@@ -472,9 +486,9 @@ class GpuTaskManager(App):
                 Text(" ".join(r.detail.runtimes[:3]), style="grey70"),
                 Text(vram_label(r.gpu), justify="right", style="bold" if r.gpu.attributed else "grey62"), spill, paged,
                 pct(r.gpu.gpu_pct if engines else None),
-                pct(e.get("3d", 0) + e.get("compute", 0) if engines else None),
-                pct(e.get("copy", 0) if engines else None),
-                pct(e.get("decode", 0) + e.get("encode", 0) if engines else None),
+                pct(e.get("3d", 0) + e.get("compute", 0) if split else None),
+                pct(e.get("copy", 0) if split else None),
+                pct(e.get("decode", 0) + e.get("encode", 0) if split else None),
                 Text(r.inside, style="magenta" if r.llm else "grey62", overflow="ellipsis", no_wrap=True),
                 key=r.key,
             )
@@ -515,6 +529,10 @@ class GpuTaskManager(App):
                 out.append(Text(inferred_note(r.gpu), style="grey62"))
             elif s.wsl_split:
                 out.append(Text(f"No per-process VRAM: {s.wsl_split}.", style="grey62"))
+            elif s.backend == "metal":
+                out.append(Text("GPU memory n/a: footprint can't read other users' processes without root "
+                                "(or hasn't measured this one yet). GPU% comes from Metal's per-process GPU time.",
+                                style="grey62"))
         if wddm and r.gpu.paged_out >= 64 << 20:
             out.append(Text(f"{gb(r.gpu.paged_out)} of {gb(r.gpu.committed)} committed is not accounted for by local/non-local "
                             "usage. Estimated non-residency, not proof of eviction or disk paging.",
@@ -603,8 +621,17 @@ class GpuTaskManager(App):
         if self.snap:
             self.render_table(self.snap)
 
+    @property
+    def available_charts(self) -> list[int]:
+        """Chart indices this backend has data for: IOKit (macOS) has no clocks, power, temperature or codecs."""
+        if BACKEND == "metal":
+            return [i for i, name in enumerate(self.CHARTS) if name in METAL_CHARTS]
+        return list(range(len(self.CHARTS)))
+
     def action_cycle_chart(self) -> None:
-        self.query_one("#chart-mode", Select).value = (self.chart_idx + 2) % (len(self.CHARTS) + 1) - 1
+        order = [-1, *self.available_charts]
+        nxt = order[(order.index(self.chart_idx) + 1) % len(order)] if self.chart_idx in order else -1
+        self.query_one("#chart-mode", Select).value = nxt
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "chart-mode" and isinstance(event.value, int):

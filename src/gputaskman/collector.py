@@ -24,6 +24,11 @@ if sys.platform == "win32":
     from .pdh import GpuCounters
 
     BACKEND = "wddm"
+elif sys.platform == "darwin":
+    from .macos import MacCounters as GpuCounters
+    from .macos import enumerate_adapters, macos_version
+
+    BACKEND = "metal"
 else:
     from .linux import LinuxCounters as GpuCounters
     from .linux import enumerate_adapters, is_wsl
@@ -106,7 +111,7 @@ class Snapshot:
     vram_used: int | None  # WDDM adapter-wide dedicated usage
     shared_used: int | None
     procs: list[ProcRow] = field(default_factory=list)
-    backend: str = "wddm"  # wddm (Windows) | nvml (native Linux) | wsl (device-wide only)
+    backend: str = "wddm"  # wddm (Windows) | nvml (native Linux) | wsl (device-wide only) | metal (macOS)
     host_status: str = ""  # WSL only: Windows host counters via interop -- ok | starting | off (...) | ...
     wsl_split: str = ""  # WSL only: why Linux rows have no (inferred) VRAM, when they don't
 
@@ -165,6 +170,7 @@ def select_nv_device(adapter: Adapter | None, devices: list[NvDevice], gpu_index
 
 class Collector:
     DEEP_TOP_N = 25  # memory-map candidates: the top N VRAM users plus anything busy
+    _mac_driver = ""  # "macOS 26.3.1" on the metal backend, read once at startup
     SCAN_BUDGET = 0.15  # seconds of memory-map scanning per sample; leftovers wait for the next sample
 
     def __init__(self, gpu_index: int = 0, scan_budget: float | None = SCAN_BUDGET, host: bool = True) -> None:
@@ -174,6 +180,7 @@ class Collector:
         self.nvml = Nvml()
         self.amdsmi = AmdSmi(self.adapter, self.adapters)
         self.adl = Adl(self.adapter, self.adapters)
+        self._mac_driver = f"macOS {macos_version()}".strip() if BACKEND == "metal" else ""
         self.inspector = ProcInspector()
         self.prober = ServerProber()
         self.scan_budget = scan_budget  # None = scan every candidate now (one-shot output)
@@ -213,15 +220,19 @@ class Collector:
         luid = self.adapter.luid if self.adapter else (next(iter(per_luid), 0))
         procs = per_luid.get(luid, {})
         a = adapters.get(luid)
-        nvs = self.nvml.sample() if self.nvml.ok else []
-        nv = select_nv_device(self.adapter, nvs, self.gpu_index, self.adapters)
-        if self.adapter and self.adapter.vendor_id == 0x1002:
-            nv = self.adl.sample() or self.amdsmi.sample()
+        if BACKEND == "metal":
+            nv = self.counters.device  # IOKit's device stats in the shape the header renders (no NVML on macOS)
+        else:
+            nvs = self.nvml.sample() if self.nvml.ok else []
+            nv = select_nv_device(self.adapter, nvs, self.gpu_index, self.adapters)
+            if self.adapter and self.adapter.vendor_id == 0x1002:
+                nv = self.adl.sample() or self.amdsmi.sample()
         total = (nv.mem_total if nv else 0) or (self.adapter.dedicated_vram if self.adapter else 0)
 
         snap = Snapshot(
             taken=time.time(), adapter=self.adapter, adapters=self.adapters, nv=nv,
-            driver=(self.amdsmi.driver if nv and nv.source == "AMD SMI" else self.nvml.driver if nv and nv.source == "NVML" else ""),
+            driver=self._mac_driver or (self.amdsmi.driver if nv and nv.source == "AMD SMI"
+                                        else self.nvml.driver if nv and nv.source == "NVML" else ""),
             cuda=self.nvml.cuda_version if nv and nv.source == "NVML" else "", vram_total=total,
             vram_used=int(a.dedicated) if a and a.dedicated is not None else None,
             shared_used=int(a.shared) if a and a.shared is not None else None, backend=BACKEND,

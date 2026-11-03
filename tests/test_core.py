@@ -687,8 +687,7 @@ class IdentityTests(unittest.TestCase):
             path = str(Path(directory) / "model.gguf")
             Path(path).write_bytes(b"not a GGUF")
             detail = ProcDetail(6, "llama-server.exe", cmdline=["server", "--model", path, "--mmproj", path])
-            with patch("gputaskman.procinfo.psutil.Process") as process:
-                process.return_value.memory_maps.return_value = []
+            with patch("gputaskman.procinfo._memory_maps", return_value=[]):
                 ProcInspector().scan(detail)
         self.assertEqual(len(detail.models), 1)
         self.assertEqual(detail.models[0].sources, ["cmdline"])
@@ -813,6 +812,12 @@ class ChartTests(unittest.TestCase):
 
 
 class UiTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        # These snapshots are NVIDIA/WDDM ones: render them with that backend's charts on every OS (macOS too).
+        backend = patch("gputaskman.app.BACKEND", "wddm")
+        backend.start()
+        self.addCleanup(backend.stop)
+
     def chart_text(self, app):
         widget = app.query_one("#charts", Static)
         output = io.StringIO()

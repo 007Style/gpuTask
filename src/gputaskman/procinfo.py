@@ -14,21 +14,23 @@ import psutil
 from .gguf import is_gguf, read_gguf
 from .stores import store_name
 
-# (tag, library patterns: Windows DLLs and Linux shared objects with the version suffix removed, see
-# _lib_name). Order = display priority (most specific first).
+# (tag, library patterns: Windows DLLs, Linux shared objects with the version suffix removed, and macOS
+# dylibs, see _lib_name). Order = display priority (most specific first).
 RUNTIMES: list[tuple[str, tuple[str, ...]]] = [
-    ("llama.cpp", ("llama.dll", "libllama*.dll", "llama-*.dll", "llm_engine*", "libllama*.so")),
-    ("whisper.cpp", ("whisper*.dll", "libwhisper*.so")),
-    ("ggml", ("ggml*.dll", "libggml*.so")),
-    ("PyTorch", ("torch_cuda*.dll", "torch_cpu.dll", "libtorch_cuda*.so", "libtorch_cpu.so")),
+    ("llama.cpp", ("llama.dll", "libllama*.dll", "llama-*.dll", "llm_engine*", "libllama*.so", "libllama*.dylib")),
+    ("whisper.cpp", ("whisper*.dll", "libwhisper*.so", "libwhisper*.dylib")),
+    ("ggml", ("ggml*.dll", "libggml*.so", "libggml*.dylib")),
+    ("PyTorch", ("torch_cuda*.dll", "torch_cpu.dll", "libtorch_cuda*.so", "libtorch_cpu.so", "libtorch_cpu.dylib")),
+    ("MLX", ("libmlx*.dylib",)),
     ("TensorRT", ("nvinfer*.dll", "libnvinfer*.so")),
-    ("ONNX RT", ("onnxruntime*.dll", "libonnxruntime*.so")),
+    ("ONNX RT", ("onnxruntime*.dll", "libonnxruntime*.so", "libonnxruntime*.dylib")),
     ("DirectML", ("directml.dll",)),
     ("HIP", ("amdhip64.dll", "amdhip64_*.dll", "libamdhip64.so")),
     ("cuDNN", ("cudnn*.dll", "libcudnn*.so")),
     ("CUDA", ("nvcuda.dll", "nvcuda64.dll", "cudart64_*.dll", "cublas64_*.dll",
               "libcuda.so", "libcudart.so", "libcublas.so")),
-    ("Vulkan", ("vulkan-1.dll", "libvulkan.so")),
+    ("Metal", ("agxmetal*",)),  # the Apple GPU's Metal driver bundle, mapped by every Metal process
+    ("Vulkan", ("vulkan-1.dll", "libvulkan.so", "libmoltenvk.dylib")),
     ("D3D12", ("d3d12core.dll", "libd3d12core.so")),
     ("OpenGL", ("opengl32.dll", "libgl.so", "libglx*.so", "libegl*.so")),
     ("D3D11", ("d3d11.dll",)),
@@ -36,18 +38,31 @@ RUNTIMES: list[tuple[str, tuple[str, ...]]] = [
     ("NVDEC", ("nvcuvid.dll", "nvcuvid64.dll", "libnvcuvid.so")),
 ]
 _SO = re.compile(r"^(.+\.so)(?:\.[0-9][0-9a-z.]*)?$")
-AI_RUNTIMES = {"llama.cpp", "whisper.cpp", "ggml", "PyTorch", "TensorRT", "ONNX RT", "DirectML", "cuDNN"}
+AI_RUNTIMES = {"llama.cpp", "whisper.cpp", "ggml", "PyTorch", "MLX", "TensorRT", "ONNX RT", "DirectML", "cuDNN"}
 _RUNTIME_RX = [(tag, re.compile("|".join(fnmatch.translate(p) for p in pats))) for tag, pats in RUNTIMES]
 MODEL_EXTS = {".gguf", ".ggml", ".safetensors", ".onnx", ".pt", ".pth", ".bin", ".engine", ".plan", ".tflite", ".ckpt"}
 AMBIGUOUS_EXTS = {".bin", ".pt", ".pth", ".ckpt"}  # also used for caches/tiles, so require size or a model store
 _NOT_MODELS = {".dll", ".exe", ".sys", ".mui", ".ttf", ".ttc", ".otf", ".dat", ".db", ".nls", ".pak", ".mun"}
 BROWSERS = {"msedge.exe", "chrome.exe", "firefox.exe", "msedgewebview2.exe", "brave.exe", "opera.exe", "arc.exe", "vivaldi.exe",
-            "chrome", "chromium", "chromium-browser", "firefox", "firefox-bin", "brave", "msedge", "opera", "vivaldi-bin"}
+            "chrome", "chromium", "chromium-browser", "firefox", "firefox-bin", "brave", "msedge", "opera", "vivaldi-bin",
+            # macOS: browsers draw through a GPU helper process
+            "google chrome helper (gpu)", "microsoft edge helper (gpu)", "brave browser helper (gpu)",
+            "arc helper (gpu)", "chromium helper (gpu)", "com.apple.webkit.gpu", "safari", "firefox gpu helper"}
 # Linux display servers / compositors: they own the desktop back buffers, like dwm.exe on Windows.
 COMPOSITORS = {"dwm.exe", "xorg", "xwayland", "gnome-shell", "kwin_wayland", "kwin_x11", "sway", "hyprland",
-               "mutter", "weston", "wayfire", "labwc", "niri", "cosmic-comp", "picom", "compiz"}
+               "mutter", "weston", "wayfire", "labwc", "niri", "cosmic-comp", "picom", "compiz", "windowserver"}
 # Paths in /proc/<pid>/maps that are not regular files: never stat or open them.
 _SPECIAL_PREFIXES = ("[", "/dev/", "/proc/", "/sys/", "/memfd:", "/SYSV", "anon_inode:")
+# macOS: other apps' sandbox containers are privacy-protected, and open() on them blocks waiting for a consent
+# prompt (seen with mediaanalysisd's caches over SSH). System files are never models: skip both unopened.
+_MAC_SKIP_PREFIXES = ("/System/", "/usr/lib/", "/usr/share/", "/private/var/db/", "/Library/Apple/")
+_MAC_SKIP_PARTS = ("/Library/Containers/", "/Library/Group Containers/")
+
+
+def _skip_path(path: str) -> bool:
+    if path.startswith(_SPECIAL_PREFIXES) or path.endswith(" (deleted)"):
+        return True
+    return sys.platform == "darwin" and (path.startswith(_MAC_SKIP_PREFIXES) or any(p in path for p in _MAC_SKIP_PARTS))
 LLM_NAMES = ("llama-", "llama.", "ollama", "lm studio", "lmstudio", "llmster", "koboldcpp", "jan", "gpt4all", "llamafile")
 # GGUF file kind -> process kind, in display priority order
 MODEL_KINDS = {"LLM": "LLM", "decision model": "decision", "embedding model": "embedding",
@@ -123,7 +138,7 @@ def _lib_name(base: str) -> str | None:
     """Lower-cased library file name with any Linux version suffix removed ('libcudart.so.12.4' ->
     'libcudart.so'), or None when this is not a library."""
     ext = os.path.splitext(base)[1]
-    if ext in (".dll", ".node"):
+    if ext in (".dll", ".node", ".dylib") or base.startswith("agxmetal"):
         return base
     m = _SO.match(base)
     return m[1] if m else None
@@ -204,13 +219,15 @@ def _is_system_path(exe: str) -> bool:
     if sys.platform == "win32":
         return exe.startswith(os.path.normcase(os.environ.get("SystemRoot", r"C:\Windows")))
     # /usr/bin/python3 is shared by every Python app: walking /usr/bin finds nothing about the process.
-    return exe.startswith(_LINUX_SYSTEM_DIRS)
+    return exe.startswith(_LINUX_SYSTEM_DIRS) or (sys.platform == "darwin" and exe.startswith("/System/"))
 
 
 def _data_dirs() -> list[str]:
     if sys.platform == "win32":
         return [d for d in (os.environ.get("APPDATA"), os.environ.get("LOCALAPPDATA")) if d]
     home = os.path.expanduser("~")
+    if sys.platform == "darwin":
+        return [os.path.join(home, "Library", "Application Support")]
     return [os.environ.get("XDG_DATA_HOME") or os.path.join(home, ".local", "share"),
             os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")]
 
@@ -349,7 +366,7 @@ class ProcInspector:
         """Memory maps -> loaded DLLs (runtimes) and mapped model files. Never uses open_files(): ~1-2 s/process."""
         d.maps_time, d.scan_mem = time.time(), mem
         try:
-            maps = psutil.Process(d.pid).memory_maps(grouped=True)
+            maps = _memory_maps(d.pid)
         except (psutil.Error, OSError):
             d.access_denied = True
             return
@@ -357,11 +374,14 @@ class ProcInspector:
         models: dict[str, MappedModel] = {}
         for m in maps:
             path = m.path
-            if path.startswith(_SPECIAL_PREFIXES) or path.endswith(" (deleted)"):
-                continue
             base = os.path.basename(path).lower()
-            ext = os.path.splitext(base)[1]
             lib = _lib_name(base)
+            if lib and base.startswith("agxmetal"):
+                dlls.add(lib)  # the Metal driver lives under /System: record it before skipping system paths
+                continue
+            if _skip_path(path):
+                continue
+            ext = os.path.splitext(base)[1]
             if lib:
                 dlls.add(lib)
                 continue
@@ -393,6 +413,13 @@ class ProcInspector:
                 del self._cache[pid]
 
 
+def _memory_maps(pid: int) -> list:
+    if sys.platform == "darwin":  # psutil has no memory_maps() on macOS
+        from .macos import memory_maps
+        return memory_maps(pid)
+    return psutil.Process(pid).memory_maps(grouped=True)
+
+
 def classify(d: ProcDetail, engines: dict[str, float]) -> str:
     n = d.name.lower()
     if d.pid == 4 and sys.platform == "win32":  # "System"; PID 4 is an ordinary process on Linux
@@ -422,4 +449,6 @@ def classify(d: ProcDetail, engines: dict[str, float]) -> str:
         return "compute"
     if ("D3D12" in d.runtimes or "Vulkan" in d.runtimes) and engines.get("3d", 0) > 10:
         return "3D/game"
+    if "Metal" in d.runtimes and engines.get("gpu", 0) > 10 and n not in COMPOSITORS:
+        return "3D/game"  # macOS: Metal reports one GPU time, no 3D/compute split
     return "app"

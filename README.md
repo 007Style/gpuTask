@@ -2,7 +2,8 @@
 
 **An `htop` for what's inside your GPU, not just how full it is.**
 
-Windows + NVIDIA/AMD, with NVIDIA support on Linux and WSL (see [Linux and WSL](#linux-and-wsl)). A terminal UI
+Windows + NVIDIA/AMD, with NVIDIA support on Linux and WSL (see [Linux and WSL](#linux-and-wsl)) and
+macOS on Apple Silicon (see [macOS](#macos-apple-silicon)). A terminal UI
 that connects per-process GPU memory and engine activity with loaded runtimes, model files, and
 LLM buffer breakdowns.
 
@@ -203,6 +204,42 @@ In one live check, a 2 GB and a 5 GB PyTorch allocation were matched to the righ
 That is one machine and driver, not a guarantee. A process that started long before it first used
 the GPU can break the start-order guess, and processes started in the same refresh are ordered by
 guess unless their sizes match.
+
+## macOS (Apple Silicon)
+
+Run from a clone (`uv run gputaskman`); there is no portable macOS download yet. Apple GPUs share
+one pool of memory with the CPU, so there is no VRAM to split and no spill/commit counters. What
+macOS exposes without root:
+
+| Column | Source | Who |
+|---|---|---|
+| GPU memory (header) | IOAccelerator `PerformanceStatistics`: `Alloc system memory` (all GPU allocations) out of physical RAM | device |
+| GPU% (header) | `Device Utilization %` | device |
+| GPU% | Each Metal client (`AGXDeviceUserClient`) names its creator PID and keeps a cumulative `accumulatedGPUTime`; the rate between samples, per client (a closed client never hides the others' work) | every process |
+| VRAM | `footprint`: the process's memory macOS charges to graphics (the `(graphics)` categories: Metal buffers, textures) | your own processes |
+| Runtime, model files | Mapped files from `proc_pidinfo` region walks (psutil has no memory maps on macOS): `libggml*.dylib`, `libllama*.dylib`, `libmlx*.dylib`, `libtorch_cpu.dylib`, the Metal driver bundle | your own processes |
+
+Other users' processes (WindowServer, system daemons) show GPU% with memory `n/a`: `footprint` needs
+root for them. Idle ones are left out of the table, except WindowServer. Run with `sudo` to measure
+every process's memory. `footprint` takes ~70 ms per process, so it runs in a background thread:
+busy processes and new ones every pass (~2 s), idle ones every 30 s. A new process shows `n/a` for a
+second or two until its first measurement; a single failed measurement keeps the last size, and three
+in a row back off for a minute. Measurements are tied to the process's start time, so a reused PID
+never shows the previous process's numbers.
+
+Metal reports one GPU time per process, with no 3D/compute/copy/video split, so those columns show
+`n/a`; a Metal process above 10% GPU is classified `3D/game` unless something more specific applies
+(AI runtime, browser, compositor). Spill, paged, clocks, power, and temperature are not available, so
+the chart picker offers only GPU and GPU memory. Handy's log is read from
+`~/Library/Logs/com.pais.handy/handy.log`.
+
+Live check on an M4 Mac mini (macOS 26.3.1): a PyTorch MPS job with a 2 GiB buffer and a matmul loop
+showed `Python  AI  PyTorch+Metal  3.06 GB  99%`, with device utilization at 99% and allocated GPU
+memory rising by the same amount.
+
+Scans skip other apps' sandbox containers (`~/Library/Containers`, `~/Library/Group Containers`) and
+system files without opening them: opening a file in a protected container blocks while macOS waits
+for a privacy consent prompt.
 
 ## What you get
 
@@ -464,6 +501,9 @@ Identification is designed to stay cheap. Measured on one Windows machine:
 | GGUF header, model-store manifests | ms, cached | Once per file / every 60 s |
 | Local API probes | ms, local only | llama-server `/v1/models` only when its model path changes |
 | `psutil.open_files()` | 0.6-2.5 s per process | Never |
+| macOS: `ioreg` device stats + Metal clients | ~10 ms | Every refresh |
+| macOS: memory-map scan (`proc_pidinfo` region walk) | ~4 ms per process | Same policy as the memory-map scan above |
+| macOS: `footprint` GPU memory | ~70 ms per process, background thread | Busy and new processes every ~2 s, idle ones every 30 s (54 runs in 40 s with 27 GPU processes, M4 Mac mini) |
 
 With two llama-servers running, a steady refresh costs roughly 15-30 ms of CPU (about 340 ms before
 process details were cached).
@@ -538,7 +578,7 @@ uv run --locked python -m unittest discover -s tests -v
 uv build
 ```
 
-CI runs hardware-independent checks on Windows and Ubuntu, Python 3.11 and 3.13. Live GPU behavior
+CI runs hardware-independent checks on Windows, Ubuntu and macOS, Python 3.11 and 3.13. Live GPU behavior
 still needs real hardware; the CI does not pretend to validate that. The WSL matching tests replay
 context sequences measured on a real WSL2 machine.
 
@@ -588,6 +628,7 @@ downloads are bundled in this repository.
 | `pdh.py` / `dxgi.py` | Windows counters and adapter enumeration |
 | `linux.py` | Linux backend: NVML adapters and per-process usage, container PID matching, WSL detection, `/dev/dxg` holders |
 | `wslhost.py` | WSL: interop check, Windows host counter stream, adapter pairing, context matching |
+| `macos.py` | macOS backend: IOKit device stats and per-process GPU time, `footprint` GPU memory poller, libproc memory maps |
 | `nvml.py` | NVIDIA device readings |
 | `adl.py`, `amdsmi.py` | Optional AMD device readings |
 | `procinfo.py` | Runtime, mapped-file, and process discovery |
@@ -604,6 +645,8 @@ downloads are bundled in this repository.
 - Explicit provenance and availability for every counter and estimate.
 - Reliable multi-GPU matching and per-device model placement.
 - Bare-metal Linux validation on hardware; AMD and Intel GPUs on Linux through DRM fdinfo.
+- macOS: a portable build, Ollama/llama.cpp/MLX validation, and compressed GPU memory (footprint's
+  `swapped`) as the paged column.
 - WSL: per-process GPU load for Linux rows, and Ollama's systemd journal as a log source.
 - Live throughput deltas, LM Studio validation, and per-model context accounting.
 - Opt-in ETW file-open tracing to name models loaded by read-and-close runtimes (any whisper or ONNX

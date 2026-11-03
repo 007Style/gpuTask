@@ -45,8 +45,8 @@ def main() -> None:
     if not math.isfinite(args.interval) or args.interval <= 0:
         ap.error("--interval must be a finite number greater than zero")
 
-    if sys.platform != "win32" and not sys.platform.startswith("linux"):
-        sys.exit("gputaskman supports Windows (WDDM) and Linux/WSL (NVML) only.")
+    if sys.platform not in ("win32", "darwin") and not sys.platform.startswith("linux"):
+        sys.exit("gputaskman supports Windows (WDDM), Linux/WSL (NVML) and macOS (Apple Silicon) only.")
 
     if args.list_gpus:
         from .collector import enumerate_adapters, ordered_adapters
@@ -74,6 +74,8 @@ def main() -> None:
         try:
             if c.host is not None:
                 c.host.wait(15.0)  # WSL: the first Windows counter sample takes several seconds
+            if hasattr(c.counters, "warm_up"):
+                c.counters.warm_up(15.0)  # macOS: per-process GPU memory comes from a background footprint pass
             time.sleep(1.0)  # engine utilization is a rate; needs two samples
             print(dump(c.sample(), args.json))
         finally:

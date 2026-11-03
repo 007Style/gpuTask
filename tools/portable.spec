@@ -10,7 +10,7 @@ analysis = Analysis(
 )
 
 # These belong to the operating system or the installed NVIDIA driver, not the portable app.
-driver_libs = ("nvml.dll", "nvcuda.dll", "atiadlxx.dll", "dxgi.dll", "pdh.dll", "libnvidia-ml.so", "libcuda.so", "libdxcore.so")
+driver_libs = ("nvml.dll", "nvcuda.dll", "atiadlxx.dll", "amd_smi.dll", "libamd_smi.so", "dxgi.dll", "pdh.dll", "libnvidia-ml.so", "libcuda.so", "libdxcore.so")
 
 
 def is_driver_lib(name):

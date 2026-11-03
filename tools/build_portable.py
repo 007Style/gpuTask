@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MACHINES = {"x64": 0x8664, "arm64": 0xAA64}  # PE machine
 ELF_MACHINES = {"x64": 0x3E, "arm64": 0xB7}  # ELF e_machine
 # Provided by Windows or the installed GPU driver, never by the portable app.
-FORBIDDEN = ("nvml.dll", "nvcuda.dll", "atiadlxx.dll", "dxgi.dll", "pdh.dll", "libnvidia-ml.so", "libcuda.so", "libdxcore.so")
+FORBIDDEN = ("nvml.dll", "nvcuda.dll", "atiadlxx.dll", "amd_smi.dll", "libamd_smi.so", "dxgi.dll", "pdh.dll", "libnvidia-ml.so", "libcuda.so", "libdxcore.so")
 PLATFORMS = {"win-amd64": ("windows", "x64"), "win-arm64": ("windows", "arm64"),
              "linux-x86_64": ("linux", "x64"), "linux-aarch64": ("linux", "arm64")}
 

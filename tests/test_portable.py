@@ -79,9 +79,11 @@ class PortableTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             self.write_executable(root / "gputaskman.exe", 0xAA64)
-            (root / "NVML.dll").write_bytes(b"driver")
-            with self.assertRaisesRegex(ValueError, "must not be distributed"):
-                create_archive(root, root / "output", "0.1.0", "arm64")
+            for dll in ("NVML.dll", "atiadlxx.dll", "amd_smi.dll"):
+                (root / dll).write_bytes(b"driver")
+                with self.assertRaisesRegex(ValueError, "must not be distributed"):
+                    create_archive(root, root / "output", "0.1.0", "arm64")
+                os.remove(root / dll)
 
 
 class LinuxPortableTests(unittest.TestCase):
@@ -134,7 +136,7 @@ class LinuxPortableTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             self.write_elf(root / "gputaskman", 0x3E)
-            for lib in ("libnvidia-ml.so.1", "libcuda.so.1"):
+            for lib in ("libnvidia-ml.so.1", "libcuda.so.1", "libamd_smi.so.0"):
                 (root / lib).write_bytes(b"driver")
                 with self.assertRaisesRegex(ValueError, "must not be distributed"):
                     create_linux_archive(root, root / "output", "0.1.0", "x64")

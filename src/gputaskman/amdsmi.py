@@ -68,7 +68,7 @@ class AmdSmi:
             temp = self._call("amdsmi_get_temp_metric", self.handle,
                               self.api.AmdSmiTemperatureType.EDGE, self.api.AmdSmiTemperatureMetric.CURRENT)
             value = _number(temp)
-            d.temp = value / 1000 if value is not None else None
+            d.temp = value  # AMD SMI reports degrees Celsius
         except AttributeError:
             pass
         return d

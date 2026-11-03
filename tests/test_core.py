@@ -155,11 +155,11 @@ class DeviceSelectionTests(unittest.TestCase):
             amdsmi_get_power_info=lambda h: {"socket_power": 42, "power_limit": "N/A"},
             AmdSmiTemperatureType=SimpleNamespace(EDGE=1),
             AmdSmiTemperatureMetric=SimpleNamespace(CURRENT=2),
-            amdsmi_get_temp_metric=lambda *args: 47500,
+            amdsmi_get_temp_metric=lambda *args: 47,  # AMD SMI reports degrees Celsius
         )
         provider = AmdSmi(amd, [amd], api)
         sample = provider.sample()
-        self.assertEqual((sample.source, sample.util_gpu, sample.temp, sample.power_w), ("AMD SMI", 0, 47.5, 42))
+        self.assertEqual((sample.source, sample.util_gpu, sample.temp, sample.power_w), ("AMD SMI", 0, 47, 42))
         self.assertIsNone(sample.power_limit_w)
         self.assertIsNone(sample.util_mem)
         provider.close()

@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import fnmatch
 import os
+import re
 import time
 from dataclasses import dataclass, field
 
 import psutil
 
-from .gguf import is_gguf
+from .gguf import is_gguf, read_gguf
+from .stores import store_name
 
 # (tag, dll patterns). Order = display priority (most specific first).
 RUNTIMES: list[tuple[str, tuple[str, ...]]] = [
@@ -30,10 +32,20 @@ RUNTIMES: list[tuple[str, tuple[str, ...]]] = [
     ("NVDEC", ("nvcuvid.dll", "nvcuvid64.dll")),
 ]
 AI_RUNTIMES = {"llama.cpp", "whisper.cpp", "ggml", "PyTorch", "TensorRT", "ONNX RT", "DirectML", "cuDNN"}
+_RUNTIME_RX = [(tag, re.compile("|".join(fnmatch.translate(p) for p in pats))) for tag, pats in RUNTIMES]
 MODEL_EXTS = {".gguf", ".ggml", ".safetensors", ".onnx", ".pt", ".pth", ".bin", ".engine", ".plan", ".tflite", ".ckpt"}
+AMBIGUOUS_EXTS = {".bin", ".pt", ".pth", ".ckpt"}  # also used for caches/tiles, so require size or a model store
 _NOT_MODELS = {".dll", ".exe", ".sys", ".mui", ".ttf", ".ttc", ".otf", ".dat", ".db", ".nls", ".pak", ".mun"}
 BROWSERS = {"msedge.exe", "chrome.exe", "firefox.exe", "msedgewebview2.exe", "brave.exe", "opera.exe", "arc.exe", "vivaldi.exe"}
-LLM_NAMES = ("llama-", "ollama", "lm studio", "lmstudio", "llmster", "koboldcpp", "jan", "gpt4all", "llamafile")
+LLM_NAMES = ("llama-", "llama.", "ollama", "lm studio", "lmstudio", "llmster", "koboldcpp", "jan", "gpt4all", "llamafile")
+# GGUF file kind -> process kind, in display priority order
+MODEL_KINDS = {"LLM": "LLM", "decision model": "decision", "embedding model": "embedding",
+               "reranker": "embedding", "speech model": "speech"}
+AI_KINDS = {"LLM", "decision", "embedding", "speech", "AI"}
+MiB = 1 << 20
+INSTALLED_TTL = 300.0
+_SKIP_DIRS = {"ebwebview", "cache", "code cache", "gpucache", "node_modules", "logs", "crashpad", "locales", "__pycache__"}
+_installed: dict[str, tuple[float, list[MappedModel]]] = {}
 
 
 @dataclass
@@ -42,7 +54,19 @@ class MappedModel:
     size: int
     resident: int  # bytes of the file currently in this process's RAM working set
     gguf: bool
-    source: str = "mapped"  # "mapped" (memory-mapped) or "cmdline" (passed as an argument)
+    sources: list[str] = field(default_factory=lambda: ["mapped"])  # mapped | cmdline | api | installed
+    store_name: str | None = None  # e.g. "qwen3:14b" from an Ollama manifest
+    kind: str = ""  # GGUF kind: LLM, decision model, embedding model, ...
+
+    @property
+    def evidence(self) -> str:
+        s = set(self.sources)
+        how = "+".join(x for x in ("api", "mapped", "cmdline") if x in s)
+        if len(s) >= 2 and s & {"api", "mapped"}:
+            return f"confirmed ({how})"
+        if not how and "installed" in s:
+            return "installed, not proven loaded"
+        return {"mapped": "in use (mapped)", "cmdline": "launch arg", "api": "reported (api)"}.get(how, how)
 
 
 @dataclass
@@ -54,9 +78,12 @@ class ProcDetail:
     create_time: float = 0.0
     runtimes: list[str] = field(default_factory=list)
     models: list[MappedModel] = field(default_factory=list)
+    candidates: list[MappedModel] = field(default_factory=list)  # installed with the app, not proven loaded
     ports: list[int] = field(default_factory=list)
+    parents: list[int] | None = None  # parent PIDs, looked up once (each lookup enumerates all processes)
     access_denied: bool = False
     maps_time: float = 0.0  # when memory maps were last scanned
+    scan_mem: float = 0.0  # process GPU memory (dedicated + shared) at that scan
 
     @property
     def is_ai(self) -> bool:
@@ -64,11 +91,7 @@ class ProcDetail:
 
 
 def _match_runtimes(dll_names: set[str]) -> list[str]:
-    found = []
-    for tag, patterns in RUNTIMES:
-        if any(fnmatch.fnmatch(d, p) for d in dll_names for p in patterns):
-            found.append(tag)
-    return found
+    return [tag for tag, rx in _RUNTIME_RX if any(rx.match(d) for d in dll_names)]
 
 
 def _models_from_cmdline(cmd: list[str]) -> list[str]:
@@ -84,10 +107,100 @@ def _models_from_cmdline(cmd: list[str]) -> list[str]:
     return paths
 
 
-class ProcInspector:
-    """Caches per-process details; memory-map scans are throttled because they can be slow."""
+def _is_model_file(ext: str, size: int, gg: bool, store: str | None) -> bool:
+    if gg:
+        return True
+    if ext not in MODEL_EXTS:
+        return False
+    if ext in AMBIGUOUS_EXTS:
+        return size >= 64 * MiB or store is not None
+    return size >= 4 * MiB
 
-    MAPS_INTERVAL = 15.0
+
+def make_model(path: str, size: int, resident: int, gg: bool, source: str, store: str | None = None) -> MappedModel:
+    g = read_gguf(path) if gg else None
+    kind = g.kind if g is not None and not g.error else ""
+    return MappedModel(path, size, resident, gg, [source], store if store is not None else store_name(path), kind)
+
+
+def _walk(root: str, depth: int, out: list[tuple[str, int]], budget: list[int]) -> None:
+    try:
+        it = os.scandir(root)
+    except OSError:
+        return
+    with it:
+        for e in it:
+            budget[0] -= 1
+            if budget[0] < 0:
+                return
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    if depth > 0 and e.name.lower() not in _SKIP_DIRS:
+                        _walk(e.path, depth - 1, out, budget)
+                    continue
+                ext = os.path.splitext(e.name)[1].lower()
+                if ext in MODEL_EXTS:
+                    size = e.stat().st_size
+                    if _is_model_file(ext, size, False, None):
+                        out.append((e.path, size))
+            except OSError:
+                continue
+
+
+def installed_models(exe: str, now: float | None = None) -> list[MappedModel]:
+    """Model files in an app's install and data folders. Fallback for runtimes that read a model into RAM and
+    close the file (ONNX Runtime, whisper.cpp), which leaves no OS evidence of which model is loaded.
+    Bounded walk (depth 4, 3000 entries) cached per exe for 5 minutes."""
+    if not exe:
+        return []
+    now = now or time.time()
+    key = os.path.normcase(exe)
+    hit = _installed.get(key)
+    if hit and now - hit[0] < INSTALLED_TTL:
+        return hit[1]
+    stem = os.path.splitext(os.path.basename(key))[0]
+    roots = []
+    if not key.startswith(os.path.normcase(os.environ.get("SystemRoot", r"C:\Windows"))):
+        roots.append(os.path.dirname(exe))
+    if len(stem) >= 4:
+        for base in filter(None, (os.environ.get("APPDATA"), os.environ.get("LOCALAPPDATA"))):
+            try:
+                roots += [e.path for e in os.scandir(base) if stem in e.name.lower() and e.is_dir()]
+            except OSError:
+                pass
+    files: list[tuple[str, int]] = []
+    budget = [3000]
+    for root in {os.path.normcase(r): r for r in roots}.values():
+        _walk(root, 4, files, budget)
+    by_dir: dict[str, list[tuple[str, int]]] = {}
+    for path, size in files:
+        by_dir.setdefault(os.path.dirname(path), []).append((path, size))
+    found = []
+    for folder, group in by_dir.items():
+        if len(group) == 1:  # one file: name it by the file
+            path, size = group[0]
+            found.append(make_model(path, size, 0, path.lower().endswith(".gguf") and is_gguf(path), "installed"))
+        else:  # several files (encoder + decoder, shards): name it by the folder
+            found.append(MappedModel(folder, sum(s for _, s in group), 0, False, ["installed"], store_name(group[0][0])))
+    found = sorted(found, key=lambda m: -m.size)[:6]
+    _installed[key] = (now, found)
+    return found
+
+
+def _create_time(pid: int) -> float:
+    try:
+        return psutil.Process(pid).create_time()
+    except (psutil.Error, OSError):
+        return 0.0
+
+
+class ProcInspector:
+    """Caches per-process details. Memory-map scans are the only costly step (1-50 ms each), so they run
+    for new processes, when a process's GPU memory changes noticeably, and on a slow backstop."""
+
+    SCAN_MIN_GAP = 5.0  # never rescan one process more often than this
+    SCAN_BACKSTOP = 120.0  # rescan even without a memory change
+    SCAN_DELTA = 64 * MiB  # or 10% of the process's GPU memory, whichever is larger
     PORTS_INTERVAL = 5.0
 
     def __init__(self) -> None:
@@ -108,39 +221,61 @@ class ProcInspector:
         self._ports = {pid: sorted(p) for pid, p in ports.items()}
         self._ports_time = time.time()
 
-    def get(self, pid: int, deep: bool) -> ProcDetail:
-        """deep=True scans memory maps (DLLs + mapped model files)."""
+    def get(self, pid: int) -> ProcDetail:
+        """Cheap details: name, exe, command line, listening ports. Built once per process: psutil.Process()
+        enumerates every process for protected PIDs (System, csrss, dwm), ~40 ms each. Accessible processes
+        are re-checked for PID reuse each call (~0.1 ms); protected ones leave through prune()."""
         self._refresh_ports()
         d = self._cache.get(pid)
-        try:
-            p = psutil.Process(pid)
-            ct = p.create_time()
-        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-            p, ct = None, 0.0
-        if d is None or d.create_time != ct:
-            d = ProcDetail(pid=pid, create_time=ct)
-            if pid == 0:
-                d.name = "System Idle"
-            elif p is not None:
-                try:
-                    d.name = p.name()
-                except (psutil.Error, OSError):
-                    pass
-                try:
-                    d.exe = p.exe()
-                    d.cmdline = p.cmdline()
-                except (psutil.Error, OSError):
-                    d.access_denied = True
-            self._cache[pid] = d
+        if d is not None and d.create_time and _create_time(pid) != d.create_time:
+            d = None  # PID reused (e.g. while the TUI was paused)
+        if d is None:
+            d = self._cache[pid] = self._new(pid)
         d.ports = self._ports.get(pid, [])
-        if deep and p is not None and not d.access_denied and time.time() - d.maps_time > self.MAPS_INTERVAL:
-            self._scan_maps(p, d)
         return d
 
-    def _scan_maps(self, p: psutil.Process, d: ProcDetail) -> None:
-        d.maps_time = time.time()
+    def ports(self, pid: int) -> list[int]:
+        self._refresh_ports()
+        return self._ports.get(pid, [])
+
+    @staticmethod
+    def _new(pid: int) -> ProcDetail:
+        d = ProcDetail(pid=pid)
+        if pid == 0:
+            d.name = "System Idle"
+            return d
         try:
-            maps = p.memory_maps(grouped=True)
+            p = psutil.Process(pid)
+        except (psutil.Error, OSError):
+            d.access_denied = True
+            return d
+        try:
+            d.name = p.name()
+        except (psutil.Error, OSError):
+            pass
+        try:
+            d.exe = p.exe()
+            d.cmdline = p.cmdline()
+            d.create_time = p.create_time()
+        except (psutil.Error, OSError):
+            d.access_denied = True
+        return d
+
+    def needs_scan(self, d: ProcDetail, mem: float, now: float | None = None) -> bool:
+        if d.access_denied or d.pid == 0:
+            return False
+        if not d.maps_time:
+            return True
+        age = (now or time.time()) - d.maps_time
+        if age < self.SCAN_MIN_GAP:
+            return False
+        return age > self.SCAN_BACKSTOP or abs(mem - d.scan_mem) > max(self.SCAN_DELTA, 0.1 * d.scan_mem)
+
+    def scan(self, d: ProcDetail, mem: float = 0.0) -> None:
+        """Memory maps -> loaded DLLs (runtimes) and mapped model files. Never uses open_files(): ~1-2 s/process."""
+        d.maps_time, d.scan_mem = time.time(), mem
+        try:
+            maps = psutil.Process(d.pid).memory_maps(grouped=True)
         except (psutil.Error, OSError):
             d.access_denied = True
             return
@@ -159,16 +294,21 @@ class ProcInspector:
                 size = os.path.getsize(path)
             except OSError:
                 continue
-            gg = is_gguf(path) if (ext in (".gguf", "") or size > 64 << 20) else False
-            if ext in MODEL_EXTS or gg:
-                if size < (4 << 20) and not gg:
-                    continue
-                models[path.lower()] = MappedModel(path=path, size=size, resident=m.rss, gguf=gg)
+            gg = is_gguf(path) if (ext in (".gguf", "") or size > 64 * MiB) else False
+            if not (gg or ext in MODEL_EXTS):
+                continue
+            store = store_name(path)
+            if _is_model_file(ext, size, gg, store):
+                models[path.lower()] = make_model(path, size, m.rss, gg, "mapped", store)
         for path in _models_from_cmdline(d.cmdline):
-            if path.lower() not in models:
-                models[path.lower()] = MappedModel(path, os.path.getsize(path), 0, is_gguf(path), source="cmdline")
+            if path.lower() in models:
+                models[path.lower()].sources.append("cmdline")
+            else:
+                models[path.lower()] = make_model(path, os.path.getsize(path), 0, is_gguf(path), "cmdline")
         d.runtimes = _match_runtimes(dlls)
         d.models = sorted(models.values(), key=lambda m: -m.size)
+        ai = any(r in AI_RUNTIMES for r in d.runtimes)
+        d.candidates = installed_models(d.exe) if ai and not d.models else []
 
     def prune(self, live_pids: set[int]) -> None:
         for pid in list(self._cache):
@@ -184,7 +324,11 @@ def classify(d: ProcDetail, engines: dict[str, float]) -> str:
         return "compositor"
     if n in ("csrss.exe", "winlogon.exe", "lsass.exe", "svchost.exe"):
         return "system"
-    if any(m.gguf for m in d.models) or "llama.cpp" in d.runtimes or n.startswith(LLM_NAMES):
+    kinds = {MODEL_KINDS[m.kind] for m in d.models if m.kind in MODEL_KINDS}
+    for k in ("LLM", "decision", "embedding", "speech"):
+        if k in kinds:
+            return k
+    if "llama.cpp" in d.runtimes or n.startswith(LLM_NAMES):
         return "LLM"
     video = engines.get("decode", 0) + engines.get("encode", 0) > 1
     if d.is_ai and not video:

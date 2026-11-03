@@ -27,7 +27,7 @@ def main() -> None:
         from .collector import Collector
         from .report import dump
 
-        c = Collector(args.gpu)
+        c = Collector(args.gpu, scan_budget=None)  # one-shot: identify everything in this sample
         try:
             time.sleep(1.0)  # engine utilization is a rate; needs two samples
             print(dump(c.sample(), args.json))

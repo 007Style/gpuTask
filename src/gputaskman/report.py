@@ -21,12 +21,17 @@ def to_dict(s: Snapshot) -> dict:
             "gpu_pct": round(p.gpu.gpu_pct, 1), "engines": {k: round(v, 1) for k, v in p.gpu.engines.items() if v},
             "ports": p.detail.ports, "inside": p.inside,
             "model_files": [dataclasses.asdict(m) for m in p.detail.models],
+            "installed_models": [dataclasses.asdict(m) for m in p.detail.candidates],
         }
         if p.llm:
             item["llm"] = {
-                "models": [{"path": g.path, "name": g.name, "arch": g.arch, "kind": g.kind, "params": g.n_params,
+                "models": [{"path": g.path, "name": g.name, "label": p.llm.label(i), "arch": g.arch, "kind": g.kind,
+                            "decision_type": g.decision_type, "params": g.n_params,
                             "quant": g.quant, "layers": g.n_layers, "ctx_train": g.ctx_train,
-                            "gpu_weight_bytes": g.gpu_weight_bytes()} for g in p.llm.models],
+                            "gpu_weight_bytes": g.gpu_weight_bytes(),
+                            "sources": p.llm.files[i].sources if i < len(p.llm.files) else [],
+                            "store_name": p.llm.files[i].store_name if i < len(p.llm.files) else None}
+                           for i, g in enumerate(p.llm.models)],
                 "segments": [dataclasses.asdict(x) for x in p.llm.segments],
                 "kv_bytes_per_token": p.llm.kv_per_token, "n_ctx": p.llm.n_ctx, "flags": p.llm.flags,
                 "server": dataclasses.asdict(p.llm.server) if p.llm.server else None,
@@ -61,9 +66,11 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
             continue
         out.append("")
         out.append(f"== {p.name} ({p.pid})  VRAM {gb(p.gpu.dedicated)}")
-        for g in p.llm.models:
-            out.append(f"   {g.kind}: {g.name}  [{g.arch}, {g.params_label} params, {g.quant}, {g.n_layers} layers, "
-                       f"ctx_train {g.ctx_train}]  {os.path.basename(g.path)}")
+        for i, g in enumerate(p.llm.models):
+            kind = g.kind + (f" ({g.decision_type})" if g.decision_type else "")
+            ev = p.llm.files[i].evidence if i < len(p.llm.files) else ""
+            out.append(f"   {kind}: {p.llm.label(i)}  [{g.arch}, {g.params_label} params, {g.quant}, {g.n_layers} layers, "
+                       f"ctx_train {g.ctx_train}]  {os.path.basename(g.path)}  evidence: {ev}")
         for seg in p.llm.segments:
             out.append(f"   {gb(seg.bytes):>9}  {seg.label}{'' if seg.exact else ''}")
         if p.llm.server:

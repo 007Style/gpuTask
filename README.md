@@ -57,8 +57,9 @@ compatible dependencies; the uv route uses the checked-in lockfile.
 - **Device view:** VRAM usage, GPU activity, memory activity, PCIe traffic, temperature, power and clocks.
 - **Process view:** local GPU memory, GPU-accessible system RAM, estimated non-resident commit,
   engine activity, and detected runtimes such as CUDA, Vulkan, Direct3D, ggml and ONNX Runtime.
-- **LLM inspector:** model name, architecture, quantization, layer count, weights, estimated KV cost,
-  and buffer sizes from compatible load logs.
+- **Model inspector:** which model each process holds (LLM, decision, embedding, or speech), how
+  it was identified, architecture, quantization, layer count, weights, estimated KV cost, and
+  buffer sizes from compatible load logs.
 - **Live server hints:** context size, busy slots, throughput when available, and friendly Ollama
   or LM Studio model names.
 - **Scriptable output:** one-shot text and JSON, using the same collector as the TUI.
@@ -160,14 +161,49 @@ those bytes out of VRAM. The value is also less reliable when fallback counters 
 Memory labels currently use `GB` / `MB` for binary units (GiB / MiB). The top-level `MemBW`
 reading is NVML's memory-activity percentage, **not measured bandwidth in GB/s**.
 
-## LLM support
+## LLM and model support
 
 | Runtime | Current support |
 |---|---|
-| llama.cpp / llama-server | GGUF discovery, CLI settings, buffer logs, local API state; exercised live |
-| Ollama | Bundled llama-server runners, mapped GGUF blobs, parent `/api/ps`, compatible `server.log`; exercised live |
-| LM Studio | Process/file discovery and `/api/v0/models` probing; not yet validated end to end |
-| Other AI runtimes | DLL and candidate model-file detection only; no general tensor inventory |
+| llama.cpp / llama-server | GGUF discovery, CLI settings, buffer logs, `/props` + `/v1/models` state; exercised live |
+| Ollama | Bundled runners, mapped GGUF blobs named from Ollama manifests (`qwen3:14b`), parent `/api/ps`, compatible `server.log`; exercised live |
+| LM Studio | Mapped files named from its models folder, `/api/v1/models` (falls back to `/api/v0/models`); tested with fixture responses, not yet end to end |
+| Hugging Face cache | `models--org--repo` paths are named `org/repo` |
+| Other AI runtimes | DLL detection, plus model files installed with the app (marked *not proven loaded*) |
+
+### How models are identified
+
+Every model row shows its **evidence**, strongest first:
+
+| Evidence | Meaning |
+|---|---|
+| `api` | The runtime's local API reports the model as loaded |
+| `mapped` | Windows shows the file memory-mapped into the process right now |
+| `cmdline` | The file was a launch argument (`-m model.gguf`) |
+| `installed` | Found in the app's install or data folder; nothing proves it is loaded |
+
+Two sources including `api` or `mapped` show as **confirmed**. Model-store folders only supply a
+friendly name. The model *kind* comes from GGUF header keys, not filenames: `decision.type` marks a
+decision model (for example [Laya](https://huggingface.co/ggml-org/Laya-GGUF)), `pooling_type`
+an embedding model or reranker, `stt.*` a speech model, and a causal model with layers and a
+trained context an LLM. llama-server's `/v1/models` `output_modalities` (`text`, `decisions`)
+confirms it. Non-causal encoders such as Laya allocate no KV cache, so none is estimated.
+
+Some runtimes (ONNX Runtime, whisper.cpp) read a model into memory and close the file. Windows then
+has no record of which file is loaded, so the app's installed models are listed as candidates only.
+
+Identification is designed to stay cheap. Measured on one Windows machine:
+
+| Probe | Cost | Used |
+|---|---|---|
+| Process list, command line, listening ports | under 1 ms | Once per process / every 5 s |
+| Memory-map scan (DLLs + mapped files) | 1-50 ms per process | New processes, a 64 MiB / 10% memory change, or every 2 min; at most 150 ms per refresh |
+| GGUF header, model-store manifests | ms, cached | Once per file / every 60 s |
+| Local API probes | ms, local only | llama-server `/v1/models` only when its model path changes |
+| `psutil.open_files()` | 0.6-2.5 s per process | Never |
+
+With two llama-servers running, a steady refresh costs roughly 15-30 ms of CPU (about 340 ms before
+process details were cached).
 
 For log-reported buffer sizes, start your own llama-server with logging enabled:
 
@@ -181,9 +217,9 @@ llama.cpp build. Prefer an absolute log path if the server and monitor use diffe
 working directories.
 
 The collector probes existing local listening ports with GET requests to `/props`, `/slots`,
-`/metrics`, `/api/ps`, and `/api/v0/models`. Endpoints may be absent, disabled, or authenticated;
-other evidence is still useful. It does not launch `ollama`, `lms`, or an inference request.
-Throughput may update only after a request completes.
+`/metrics`, `/v1/models`, `/api/ps`, `/api/v1/models`, and `/api/v0/models`. Endpoints may be
+absent, disabled, or authenticated; other evidence is still useful. It does not launch `ollama`,
+`lms`, or an inference request. Throughput may update only after a request completes.
 
 Ollama's local `server.log` is considered when one Ollama runner is detected. Log formats,
 rotation, and stale load blocks can affect attribution, so compare the reported model and
@@ -250,15 +286,15 @@ downloads are bundled in this repository.
 | `pdh.py` / `dxgi.py` | Windows counters and adapter enumeration |
 | `nvml.py` | NVIDIA device readings |
 | `procinfo.py` | Runtime, mapped-file, and process discovery |
-| `gguf.py` | Model metadata and size estimates |
+| `stores.py` | Friendly names from Ollama, LM Studio, and Hugging Face model stores |
+| `gguf.py` | Model metadata, kind, and size estimates |
 | `llm.py` | Buffer logs, local server probing, and breakdowns |
 | `collector.py` | Shared snapshot collection |
 | `app.py` / `report.py` / `cli.py` | TUI, text/JSON, and command-line entry points |
 
 ## Next
 
-- Decision models and non-LLM workloads: identify reliable model metadata and distinguish
-  classification, embedding, speech, and other inference workloads without guessing from a DLL.
+- Model identity for non-GGUF runtimes (ONNX Runtime, PyTorch, TensorRT) beyond installed candidates.
 - Explicit provenance and availability for every counter and estimate.
 - Reliable multi-GPU matching and per-device model placement.
 - Live throughput deltas, LM Studio validation, and per-model context accounting.

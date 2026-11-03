@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,10 +13,12 @@ from gputaskman.app import GpuTaskManager
 from gputaskman.cli import main
 from gputaskman.collector import ProcRow, Snapshot
 from gputaskman.gguf import GgufInfo, read_gguf
-from gputaskman.llm import LlmView, ServerInfo, is_gpu_device, parse_flags, parse_load_log
+from gputaskman.llm import (LlmView, ServerInfo, build_view, is_gpu_device, llama_server_models, lmstudio_models,
+                            parse_flags, parse_load_log, probe_server)
 from gputaskman.pdh import GpuCounters, ProcGpu
-from gputaskman.procinfo import ProcDetail
+from gputaskman.procinfo import MappedModel, ProcDetail, ProcInspector, _is_model_file, classify, installed_models
 from gputaskman.report import to_dict, to_text
+from gputaskman.stores import store_name
 from tools.capture_screenshots import for_publication
 
 GiB = 1 << 30
@@ -156,6 +159,151 @@ class ModelTests(unittest.TestCase):
                 "CUDA0": {"weights": 100 * MiB, "kv": 30 * MiB, "compute": 5 * MiB},
             })
             self.assertIsNone(parse_load_log(str(path), not_before=path.stat().st_mtime + 10))
+
+
+def gguf(arch: str, **meta) -> GgufInfo:
+    md = {"general.architecture": arch}
+    md.update({k if k.startswith(("general.", "stt.")) else f"{arch}.{k}": v for k, v in meta.items()})
+    return GgufInfo(path=f"{arch}.gguf", file_size=1000, version=3, metadata=md, layer_bytes={0: 400},
+                    tensor_bytes=400)
+
+
+LAYA = dict(block_count=30, context_length=8192, **{"decision.type": "laya", "attention.causal": False})
+
+
+class IdentityTests(unittest.TestCase):
+    def test_gguf_kinds_come_from_header_keys(self):
+        cases = {
+            "LLM": gguf("qwen3", block_count=28, context_length=40960),
+            "decision model": gguf("modern-bert", **LAYA),
+            "embedding model": gguf("bert", pooling_type=1),
+            "reranker": gguf("bert", pooling_type=4),
+            "speech model": gguf("parakeet", **{"stt.variant": "tdt"}),
+            "vision projector": gguf("clip"),
+            "model": gguf("modern-bert", block_count=30, context_length=8192, **{"attention.causal": False}),
+        }
+        for kind, info in cases.items():
+            with self.subTest(kind=kind):
+                self.assertEqual(info.kind, kind)
+        self.assertEqual(cases["decision model"].decision_type, "laya")
+
+    def test_store_names(self):
+        digest = "ab" * 32
+        with tempfile.TemporaryDirectory() as root:
+            for tag_dir, tag in (("registry.ollama.ai/library/qwen3", "14b"), ("hf.co/org/thing", "latest")):
+                folder = Path(root, "manifests", *tag_dir.split("/"))
+                folder.mkdir(parents=True)
+                (folder / tag).write_text(json.dumps({"layers": [{"digest": f"sha256:{digest}"}]}), encoding="utf-8")
+            self.assertEqual(store_name(str(Path(root, "blobs", f"sha256-{digest}"))), "hf.co/org/thing:latest, qwen3:14b")
+            self.assertIsNone(store_name(str(Path(root, "blobs", "sha256-" + "cd" * 32))))
+            lms = Path(root, "lms")
+            path = lms / "lmstudio-community" / "Qwen3-GGUF" / "Qwen3-Q4_K_M.gguf"
+            self.assertEqual(store_name(str(path), [os.path.normcase(str(lms))]), "lmstudio-community/Qwen3-GGUF")
+            self.assertIsNone(store_name(str(Path(root, "elsewhere", "a", "b.gguf")), [os.path.normcase(str(lms))]))
+        hf = r"C:\x\hub\models--ggml-org--Laya-GGUF\snapshots\0123\Laya-Q8_0.gguf"
+        self.assertEqual(store_name(hf, []), "ggml-org/Laya-GGUF")
+
+    def test_runtime_api_normalization(self):
+        v1 = {"models": [
+            {"type": "decision", "key": "laya", "decision_type": "laya", "quantization": {"name": "Q8_0"},
+             "size_bytes": 449, "loaded_instances": [{"id": "laya", "config": {"context_length": 8192}}]},
+            {"type": "llm", "key": "idle", "loaded_instances": []},
+        ]}
+        self.assertEqual(lmstudio_models(v1, None), [{"name": "laya", "type": "decision (laya)", "quant": "Q8_0",
+                                                      "ctx": 8192, "size": 449, "size_vram": None, "path": None}])
+        v0 = {"data": [{"id": "a", "type": "llm", "state": "loaded", "quantization": "Q4_K_M", "loaded_context_length": 4096},
+                       {"id": "b", "state": "not-loaded"}]}
+        self.assertEqual([(m["name"], m["ctx"]) for m in lmstudio_models(None, v0)], [("a", 4096)])
+        self.assertIsNone(lmstudio_models(None, None))
+        llama = {"data": [{"id": r"C:\m\Laya-Q8_0.gguf", "architecture": {"output_modalities": ["decisions"]},
+                           "meta": {"ftype": "Q8_0", "n_ctx": 8192, "size": 447}}]}
+        self.assertEqual(llama_server_models(llama, r"C:\m\Laya-Q8_0.gguf")[0]["type"], "decision")
+
+    def test_lmstudio_falls_back_to_v0_when_v1_is_an_error(self):
+        replies = {"/api/v1/models": {"error": "Unexpected endpoint or method. (GET /api/v1/models)"},
+                   "/api/v0/models": {"data": [{"id": "qwen", "state": "loaded", "max_context_length": 8192}]}}
+        with patch("gputaskman.llm._get", side_effect=lambda url: next(
+                (v for k, v in replies.items() if url.endswith(k)), None)):
+            s = probe_server(1234)
+        self.assertEqual((s.kind, s.models[0]["name"]), ("lmstudio", "qwen"))
+
+    def test_reused_pid_gets_fresh_details(self):
+        inspector = ProcInspector()
+        inspector._ports_time = float("inf")  # no port scan in this test
+        inspector._cache[42] = ProcDetail(42, "llama-server.exe", cmdline=["-m", "old.gguf"], create_time=100.0)
+        with patch("gputaskman.procinfo._create_time", return_value=100.0):
+            self.assertEqual(inspector.get(42).name, "llama-server.exe")
+        fresh = ProcDetail(42, "msedge.exe", create_time=200.0)
+        with patch("gputaskman.procinfo._create_time", return_value=200.0), \
+                patch.object(ProcInspector, "_new", return_value=fresh):
+            self.assertIs(inspector.get(42), fresh)
+
+    def test_ambiguous_extensions_need_size_or_store(self):
+        self.assertFalse(_is_model_file(".bin", 10 * MiB, False, None))  # e.g. a Start menu tile cache
+        self.assertTrue(_is_model_file(".bin", 10 * MiB, False, "org/repo"))
+        self.assertTrue(_is_model_file(".bin", 100 * MiB, False, None))
+        self.assertTrue(_is_model_file(".safetensors", 10 * MiB, False, None))
+        self.assertTrue(_is_model_file("", 1, True, None))
+        self.assertFalse(_is_model_file(".txt", GiB, False, None))
+
+    def test_scans_follow_memory_changes(self):
+        inspector, now = ProcInspector(), 1000.0
+        self.assertTrue(inspector.needs_scan(ProcDetail(1), GiB, now))
+        self.assertFalse(inspector.needs_scan(ProcDetail(1, maps_time=now - 1, scan_mem=GiB), 4 * GiB, now))
+        self.assertFalse(inspector.needs_scan(ProcDetail(1, maps_time=now - 10, scan_mem=GiB), GiB + 50 * MiB, now))
+        self.assertTrue(inspector.needs_scan(ProcDetail(1, maps_time=now - 10, scan_mem=GiB), 2 * GiB, now))
+        self.assertTrue(inspector.needs_scan(ProcDetail(1, maps_time=now - 200, scan_mem=GiB), GiB, now))
+        self.assertFalse(inspector.needs_scan(ProcDetail(1, access_denied=True), GiB, now))
+
+    def test_decision_model_has_no_kv_cache_and_api_evidence(self):
+        laya = gguf("modern-bert", **LAYA)
+        d = ProcDetail(5, "llama-server.exe", models=[MappedModel("laya.gguf", 1000, 0, True, kind="decision model")])
+        self.assertEqual(classify(d, {}), "decision")
+        server = ServerInfo("llama-server", "http://127.0.0.1:1", n_ctx=8192, model_path="laya.gguf")
+        with patch("gputaskman.llm.read_gguf", return_value=laya):
+            v = build_view(d, 1000, 0, server)
+        self.assertEqual(v.files[0].evidence, "confirmed (api+mapped)")
+        self.assertEqual(d.models[0].sources, ["mapped"])  # cached detail is not mutated
+        self.assertIsNone(v.kv_per_token)
+        self.assertEqual([s.label for s in v.segments], ["weights", "compute buffers + CUDA context"])
+        self.assertTrue(any("laya decision model" in n for n in v.notes))
+
+    def test_installed_models_are_candidates_only(self):
+        with tempfile.TemporaryDirectory() as root:
+            app = Path(root, "Speechy")
+            (app / "models" / "parakeet").mkdir(parents=True)
+            (app / "cache").mkdir()
+            exe = app / "speechy.exe"
+            exe.write_bytes(b"")
+            for path, size in (("models/whisper-large.bin", 70 * MiB), ("models/parakeet/encoder.onnx", 8 * MiB),
+                               ("models/parakeet/decoder.onnx", 5 * MiB), ("models/tiles.bin", 5 * MiB),
+                               ("cache/big.onnx", 9 * MiB)):
+                with open(app / path, "wb") as f:
+                    f.truncate(size)
+            with patch.dict(os.environ, {"APPDATA": root, "LOCALAPPDATA": root, "SystemRoot": r"C:\Windows"}):
+                found = installed_models(str(exe), now=1.0)
+            self.assertEqual([(os.path.basename(m.path), m.size) for m in found],
+                             [("whisper-large.bin", 70 * MiB), ("parakeet", 13 * MiB)])
+            self.assertEqual(found[0].evidence, "installed, not proven loaded")
+            self.assertIs(installed_models(str(exe), now=2.0), found)  # cached
+            d = ProcDetail(7, "speechy.exe", runtimes=["ONNX RT"], candidates=found)
+            self.assertEqual(classify(d, {}), "AI")  # candidates never decide the kind
+            self.assertTrue(ProcRow(7, "speechy.exe", "AI", ProcGpu(), d).inside.startswith("installed (unproven): "))
+
+    def test_ollama_runner_shows_only_its_model(self):
+        qwen = gguf("qwen3", block_count=1, context_length=4096)
+        d = ProcDetail(6, "llama-server.exe", models=[MappedModel("blob", 1000, 0, True, store_name="qwen3:14b", kind="LLM")])
+        host = ServerInfo("ollama", "http://127.0.0.1:11434", models=[
+            {"name": "qwen3:14b", "size": GiB, "size_vram": GiB, "ctx": 4096},
+            {"name": "other:1b", "size": GiB, "size_vram": 0, "ctx": 2048}])
+        with patch("gputaskman.llm.read_gguf", return_value=qwen):
+            v = build_view(d, GiB, 0, host)
+        self.assertEqual(v.label(0), "qwen3:14b")
+        self.assertIn("api", v.files[0].sources)
+        self.assertEqual(v.n_ctx, 4096)
+        ollama = [n for n in v.notes if n.startswith("Ollama")]
+        self.assertEqual(len(ollama), 1)
+        self.assertIn("qwen3:14b", ollama[0])
 
 
 class UiTests(unittest.IsolatedAsyncioTestCase):

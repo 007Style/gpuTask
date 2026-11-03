@@ -21,7 +21,8 @@ from .collector import Collector, ProcRow, Snapshot
 from .llm import gb
 
 KIND_STYLE = {
-    "LLM": "bold magenta", "AI": "medium_purple1", "compute": "orange3", "3D/game": "green3",
+    "LLM": "bold magenta", "decision": "bold orchid", "embedding": "plum2", "speech": "light_sky_blue1",
+    "AI": "medium_purple1", "compute": "orange3", "3D/game": "green3",
     "video": "yellow", "browser": "dodger_blue2", "app": "cyan", "compositor": "grey50",
     "kernel": "grey50", "system": "grey50",
 }
@@ -55,8 +56,13 @@ HELP_MD = """\
 | **Per-process** VRAM, spill to RAM, per-engine load | Windows WDDM counters (dxgkrnl) | every API incl. **CUDA** |
 | **Which runtime** (CUDA, Vulkan, D3D12, ggml, ONNX, PyTorch...) | DLLs mapped in the process | everything |
 | **Which model file** | memory-mapped files + command line | llama.cpp, LM Studio, Ollama, llama-cpp-python |
+| **Model name & kind** (LLM, decision, embedding, speech) | GGUF header, Ollama/LM Studio/Hugging Face stores, local server APIs | GGUF family |
 | **Weights / KV cache / compute** split | GGUF header math, llama.cpp/Ollama logs, local server APIs | GGUF/llama.cpp family |
 | Per-texture / per-buffer names | needs a debugger (PIX, Nsight) attached to the app | games, 3D apps |
+
+**Evidence** shows how a model was identified: `api` (the runtime says it is loaded), `mapped`
+(Windows shows the file mapped into the process right now), `cmdline` (a launch argument only).
+Two sources, including `api` or `mapped`, is shown as *confirmed*.
 
 **Why does nvidia-smi say N/A?** GeForce cards on Windows run in *WDDM* mode: Windows, not the
 NVIDIA driver, owns video memory, so NVML can't attribute it to processes. The Windows counters can.
@@ -323,12 +329,15 @@ class GpuTaskManager(App):
             out.append(legend)
             if v.models:
                 mt = Table(box=None, padding=(0, 1), show_edge=False, header_style="bold grey70")
-                for col in ("", "model", "arch", "params", "quant", "layers", "train ctx", "on GPU (est)", "file"):
+                for col in ("", "model", "arch", "params", "quant", "layers", "train ctx", "on GPU (est)", "evidence", "file"):
                     mt.add_column(col)
-                for g in v.models:
-                    mt.add_row(Text(g.kind, style="magenta"), g.name, g.arch, g.params_label, g.quant,
+                for i, g in enumerate(v.models):
+                    f = v.files[i] if i < len(v.files) else None
+                    kind = g.kind + (f" ({g.decision_type})" if g.decision_type else "")
+                    mt.add_row(Text(kind, style="magenta"), v.label(i), g.arch, g.params_label, g.quant,
                                str(g.n_layers or ""), f"{g.ctx_train:,}" if g.ctx_train else "",
-                               gb(g.gpu_weight_bytes()), Text(os.path.basename(g.path), style="grey50", overflow="ellipsis"))
+                               gb(g.gpu_weight_bytes()), Text(f.evidence if f else "", style="green"),
+                               Text(os.path.basename(g.path), style="grey50", overflow="ellipsis"))
                 out.append(mt)
             for f in v.other_files:
                 out.append(Text(f"file: {f.path}  ({gb(f.size)})", style="grey62"))
@@ -345,14 +354,19 @@ class GpuTaskManager(App):
                     st.append(f"  prompt {sv.prompt_tok_s:.0f} tok/s")
                 for m in sv.models[:4]:
                     if sv.kind == "lmstudio":
-                        st.append(f"\n  loaded: {m.get('id')} {m.get('quantization', '')} ctx {m.get('loaded_context_length') or m.get('max_context_length', '?')}")
+                        st.append(f"\n  loaded: {m['name']} {m.get('type') or ''} {m.get('quant') or ''} ctx {m.get('ctx') or '?'}")
                 out.append(st)
             for n in v.notes:
                 out.append(Text("• " + n, style="bold red" if n.startswith("!") else "grey70"))
         else:
             out.append(Text(EXPLAIN.get(r.kind, ""), style="grey70"))
             for m in r.detail.models:
-                out.append(Text(f"file: {m.path}  ({gb(m.size)}, {m.source})", style="magenta"))
+                out.append(Text(f"file: {m.store_name or m.path}  ({gb(m.size)}, {m.evidence})", style="magenta"))
+            if r.detail.candidates:
+                out.append(Text("This runtime read its model into memory and closed the file, so Windows cannot show "
+                                "which one is loaded. Model files installed with this app:", style="grey70"))
+                for m in r.detail.candidates:
+                    out.append(Text(f"  {m.store_name or m.path}  ({gb(m.size)})", style="grey62"))
         if r.detail.ports:
             out.append(Text("listening: " + ", ".join(map(str, r.detail.ports[:8])), style="grey50"))
         if r.detail.cmdline:

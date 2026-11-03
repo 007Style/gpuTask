@@ -19,13 +19,19 @@ def for_publication(snapshot: Snapshot) -> Snapshot:
     for row in snapshot.procs:
         row.detail.cmdline = []
         row.detail.exe = ""
-        for model in row.detail.models:
+        for model in row.detail.models + row.detail.candidates:
             model.path = os.path.basename(model.path)
         if row.llm:
             for model in row.llm.models:
                 model.path = os.path.basename(model.path)
-            for model in row.llm.other_files:
+            for model in row.llm.files + row.llm.other_files:
                 model.path = os.path.basename(model.path)
+            if row.llm.server and row.llm.server.model_path:
+                row.llm.server.model_path = os.path.basename(row.llm.server.model_path)
+            for server in (row.llm.server, row.llm.host):
+                for m in server.models if server else []:
+                    if m.get("path"):
+                        m["path"] = os.path.basename(m["path"])
             if row.llm.log_source:
                 row.llm.log_source = os.path.basename(row.llm.log_source)
     return snapshot

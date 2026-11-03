@@ -50,14 +50,30 @@ class GgufInfo:
 
     @property
     def kind(self) -> str:
+        """What the file is, from header keys only (most specific first)."""
         t = self.metadata.get("general.type", "model")
         if self.arch == "clip" or t == "mmproj":
             return "vision projector"
         if t == "adapter":
             return "LoRA adapter"
-        if self.metadata.get("bert.pooling_type") is not None or self.meta("pooling_type") is not None:
-            return "embedding model"
+        if self.decision_type:
+            return "decision model"
+        pooling = self.meta("pooling_type")
+        if pooling is not None:
+            return "reranker" if pooling == 4 else "embedding model"  # 4 = LLAMA_POOLING_TYPE_RANK
+        if any(k.startswith("stt.") for k in self.metadata):
+            return "speech model"
+        if self.n_layers and self.ctx_train and self.causal:
+            return "LLM"
         return "model"
+
+    @property
+    def decision_type(self) -> str | None:
+        return self.meta("decision.type")
+
+    @property
+    def causal(self) -> bool:
+        return self.meta("attention.causal", True) is not False
 
     @property
     def name(self) -> str:

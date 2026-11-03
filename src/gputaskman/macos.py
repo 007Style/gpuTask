@@ -11,7 +11,7 @@ spill/commit counters. What macOS does expose without root:
   buffers and textures) -- the "(graphics)" categories. Other users' processes (WindowServer, daemons) need
   root, so their GPU memory is unknown, never zero.
 
-Measured on an M4 Mac mini (macOS 26.3): a PyTorch MPS job with a 2 GiB buffer showed 2.06 GiB of graphics
+Measured on an M4 Mac mini (macOS 26.3): a PyTorch MPS job with a 2 GiB buffer showed 2.01 GiB (2062 MiB) of graphics
 footprint, GPU time matched Device Utilization (98% vs 99%), and Alloc system memory rose by the same amount.
 """
 

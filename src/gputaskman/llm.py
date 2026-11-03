@@ -398,8 +398,8 @@ def build_view(d: ProcDetail, vram: float, shared: float, server: ServerInfo | N
         if rest is None:
             if kv:
                 v.segments.append(Segment(f"KV cache ({v.n_ctx:,} ctx, {v.kv_type}) est.", kv, "kv"))
-            v.notes.append("This process's VRAM total is unknown (WSL charges it to the VM on the Windows host); "
-                           "segments are estimates from the model file and launch flags.")
+            v.notes.append("This process's VRAM total is unknown (WSL charges it to the VM on the Windows host, "
+                           "or the driver hides per-process memory); segments are estimates from the model file and launch flags.")
         elif kv and kv <= rest:
             swa = main.sliding_window if main else None
             v.segments.append(Segment(f"KV cache ({v.n_ctx:,} ctx, {v.kv_type}) est.{' max' if swa else ''}", kv, "kv"))

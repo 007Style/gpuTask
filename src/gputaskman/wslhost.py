@@ -32,6 +32,7 @@ _POWERSHELL_FALLBACK = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershel
 # Counter paths are English (PdhAddEnglishCounter), so this works on localized Windows too.
 _SCRIPT = r"""
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false  # not the OEM code page
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
@@ -213,7 +214,7 @@ class HostStream:
             encoded = base64.b64encode(_SCRIPT.encode("utf-16-le")).decode("ascii")
             self._proc = popen([exe, "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                               text=True, bufsize=1)
+                               text=True, encoding="utf-8", errors="replace", bufsize=1)
         except (OSError, ValueError) as error:
             self.status = f"unavailable ({error})"
             self._ready.set()
@@ -221,15 +222,23 @@ class HostStream:
         threading.Thread(target=self._read, name="wsl-host-counters", daemon=True).start()
 
     def _read(self) -> None:
-        for line in self._proc.stdout:
-            sample = parse_line(line)
-            if sample is not None and (sample.procs or sample.adapters):
-                self._latest = sample
-                self.status = "ok"
-                self._ready.set()
-        if self.status != "off":
-            self.status = "unavailable (counter stream ended)"
-        self._ready.set()
+        try:
+            for line in self._proc.stdout:
+                try:
+                    sample = parse_line(line)
+                except Exception:  # one malformed line must not end the stream
+                    continue
+                if sample is not None and (sample.procs or sample.adapters):
+                    self._latest = sample
+                    self.status = "ok"
+                    self._ready.set()
+        except Exception:
+            pass
+        finally:
+            # always report the end, so the collector restarts the stream instead of waiting forever
+            if self.status != "off":
+                self.status = "unavailable (counter stream ended)"
+            self._ready.set()
 
     def wait(self, timeout: float) -> bool:
         return self._ready.wait(timeout)
@@ -284,6 +293,7 @@ class _Entry:
     value: float
     label: object = None  # holder pid | FOREIGN | ("gone", pid): its holder exited, waiting to vanish
     sure: bool = False  # established by an event or elimination, never by a guess
+    same: bool = False  # this sample only: all candidates are the same size, so the bytes are right either way
 
 
 class ContextTracker:
@@ -411,10 +421,12 @@ class ContextTracker:
         for pid in start:
             if pid not in self.seen:
                 self.seen[pid] = now
+                self.gone.pop(pid, None)  # reused PID: not the process that exited
                 if first:
                     self.initial.add(pid)
         for pid in [p for p in self.seen if p not in start]:
             del self.seen[pid]
+            self.initial.discard(pid)  # a reused PID is a new process, not one that was running at startup
             self.gone[pid] = now
         for e in cur:
             if e.label in self.gone and not isinstance(e.label, tuple):
@@ -464,13 +476,17 @@ class ContextTracker:
             if len(free) < len(unsure):
                 reason = (f"{len(unsure)} Linux GPU process(es) without a VM context to match "
                           "(one may not have created its GPU context yet)")
-            elif len(free) == len(unsure) == 1:
+            # A process seen moments ago may not have created its context yet; the one free context could
+            # then be a foreign one (WSLg, another distro), so wait for its own context instead of eliminating.
+            recent = any(p not in self.initial and now - self.seen[p] <= self.PENDING for p in unsure)
+            if len(free) == len(unsure) == 1 and not recent:
                 free[0].label, free[0].sure = unsure[0], True
             else:
-                same = len(free) == len(unsure) and all(abs(e.value - free[0].value) <= self._tol(free[0].value)
-                                                         for e in free)
+                same = (len(free) == len(unsure) > 1 and not recent
+                        and all(abs(e.value - free[0].value) <= self._tol(free[0].value) for e in free))
                 for pid, e in zip(unsure, free):  # newest process <-> newest context; leftovers are foreign
-                    e.label, e.sure = pid, same
+                    # Equal sizes make the shown bytes right, not the owner: never carried as evidence.
+                    e.label, e.same = pid, same
 
         self.entries = cur
         foreign = [e.value for e in cur if e.label == FOREIGN and e.sure]
@@ -478,6 +494,6 @@ class ContextTracker:
             changed = sorted(foreign) != sorted(self.cached_foreign)
             self.cached_foreign = foreign
             self._save(force=changed and not start)
-        out = {e.label: ContextGuess(e.value, "consistent" if e.sure else "order")
+        out = {e.label: ContextGuess(e.value, "consistent" if e.sure or e.same else "order")
                for e in cur if e.label in start}
         return out, reason

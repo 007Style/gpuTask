@@ -103,9 +103,10 @@ class PdhImportTests(unittest.TestCase):
 class LinuxCountersTests(unittest.TestCase):
     def setUp(self):
         # Same PID namespace (bare metal): NVML's PIDs are local processes holding an NVIDIA device.
-        holders = patch.object(linux, "nvidia_holders", return_value={100, 101, 200, 300, 555})
-        holders.start()
-        self.addCleanup(holders.stop)
+        for p in (patch.object(linux, "nvidia_holders", return_value={100, 101, 200, 300, 555}),
+                  patch.object(linux, "in_child_pid_namespace", return_value=False)):
+            p.start()
+            self.addCleanup(p.stop)
 
     def counters(self, fake, wsl):
         with patch.object(linux, "N", fake), patch.object(linux, "is_wsl", return_value=wsl):
@@ -161,6 +162,32 @@ class LinuxCountersTests(unittest.TestCase):
         self.assertEqual([(a.luid, a.name, a.dedicated_vram) for a in adapters],
                          [(KEY, "NVIDIA GeForce RTX 3090 Ti", 24 * GiB)])
 
+    def test_a_failing_gpu_is_skipped_not_fatal(self):
+        fake = FakeNvml()
+        fake.nvmlDeviceGetCount = lambda: 2
+        real = fake.nvmlDeviceGetHandleByIndex
+        def handle(i):
+            if i == 0:
+                raise RuntimeError("NVML_ERROR_GPU_IS_LOST")
+            return real(0)
+        fake.nvmlDeviceGetHandleByIndex = handle
+        with patch.object(linux, "N", fake):
+            self.assertEqual(len(linux.enumerate_adapters()), 1)
+        fake.nvmlDeviceGetCount = lambda: (_ for _ in ()).throw(RuntimeError("NVML_ERROR_UNKNOWN"))
+        with patch.object(linux, "N", fake):
+            self.assertEqual(linux.enumerate_adapters(), [])
+
+    def test_other_users_processes_stay_local_on_bare_metal(self):
+        # Without root, another user's /proc/<pid>/fd is unreadable, so it isn't an NVIDIA holder.
+        fake = FakeNvml(compute=[proc(6000, 20 * GiB)])
+        c = self.counters(fake, wsl=False)
+        with patch.object(linux, "N", fake), patch.object(linux, "nvidia_holders", return_value={100}), \
+                patch.object(linux, "has_cuda", return_value=True):
+            procs, _ = c.sample()
+        self.assertEqual((procs[KEY][6000].dedicated, procs[KEY][6000].inferred_by), (20 * GiB, ""))
+        self.assertNotIn(100, procs[KEY])
+        self.assertEqual(c.outside, {})
+
 
 class ContainerTests(unittest.TestCase):
     """Measured on a Vast.ai Docker container: NVML lists host PIDs (2029701...) while the processes are
@@ -168,8 +195,11 @@ class ContainerTests(unittest.TestCase):
 
     def sample(self, c, fake, holders, cuda):
         with patch.object(linux, "N", fake), patch.object(linux, "nvidia_holders", return_value=set(holders)), \
-                patch.object(linux, "has_cuda", side_effect=lambda pid: pid in cuda):
+                patch.object(linux, "has_cuda", side_effect=lambda pid: pid in cuda), \
+                patch.object(linux, "in_child_pid_namespace", return_value=self.child):
             return c.sample()[0][KEY]
+
+    child = True
 
     def test_host_pids_are_matched_to_container_pids_by_creation_order(self):
         fake = FakeNvml(compute=[proc(2029701, GiB), proc(2029747, 2 * GiB)],
@@ -199,9 +229,31 @@ class ContainerTests(unittest.TestCase):
         fake = FakeNvml(compute=[proc(547, GiB)])
         with patch.object(linux, "N", fake), patch.object(linux, "is_wsl", return_value=False):
             c = linux.LinuxCounters()
+        self.child = False
         per = self.sample(c, fake, holders={547}, cuda={547})
         self.assertEqual((per[547].dedicated, per[547].inferred_by), (GiB, ""))
         self.assertEqual(c.outside, {})
+
+    def test_a_host_pid_equal_to_a_local_pid_is_still_a_host_pid(self):
+        # Host PIDs 100 and 200 are container PIDs 10 and 100: local PID 100 is not host PID 100.
+        fake = FakeNvml(compute=[proc(100, GiB), proc(200, 4 * GiB)])
+        with patch.object(linux, "N", fake), patch.object(linux, "is_wsl", return_value=False):
+            c = linux.LinuxCounters()
+        per = self.sample(c, fake, holders={10, 100}, cuda={10, 100})
+        self.assertEqual({pid: (g.dedicated, g.inferred_by) for pid, g in per.items()},
+                         {10: (GiB, "consistent"), 100: (4 * GiB, "consistent")})
+
+    def test_namespace_detection(self):
+        linux.in_child_pid_namespace.cache_clear()
+        self.addCleanup(linux.in_child_pid_namespace.cache_clear)
+        with patch.object(linux.os, "readlink", return_value="pid:[4026531836]"):
+            self.assertFalse(linux.in_child_pid_namespace())
+        linux.in_child_pid_namespace.cache_clear()
+        with patch.object(linux.os, "readlink", return_value="pid:[4026532481]"):
+            self.assertTrue(linux.in_child_pid_namespace())
+        linux.in_child_pid_namespace.cache_clear()
+        with patch.object(linux.os, "readlink", side_effect=OSError):
+            self.assertIsNone(linux.in_child_pid_namespace())
 
     def test_outside_rows_never_borrow_a_local_identity(self):
         from gputaskman.collector import ProcRow as Row

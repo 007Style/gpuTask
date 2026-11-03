@@ -146,16 +146,6 @@ class HelpScreen(ModalScreen):
     HelpScreen > VerticalScroll { width: 140; max-width: 95%; height: 85%; border: thick $accent; background: $surface; padding: 1 2; }
     """
 
-    @property
-    def selected_pid(self) -> int | None:
-        """PID of the selected local (non-host) process."""
-        key = self.selected_key
-        return int(key) if key and not key.startswith("w") else None
-
-    @selected_pid.setter
-    def selected_pid(self, pid: int | None) -> None:
-        self.selected_key = None if pid is None else str(pid)
-
     def compose(self) -> ComposeResult:
         with VerticalScroll():
             yield Markdown(HELP_MD)
@@ -223,9 +213,9 @@ class GpuTaskManager(App):
 
     @property
     def selected_pid(self) -> int | None:
-        """PID of the selected local (non-host) process."""
+        """PID of the selected local process; None for Windows (W:) and outside (H:) rows."""
         key = self.selected_key
-        return int(key) if key and not key.startswith("w") else None
+        return int(key) if key and key.isdigit() else None
 
     @selected_pid.setter
     def selected_pid(self, pid: int | None) -> None:
@@ -478,7 +468,7 @@ class GpuTaskManager(App):
         panel.border_title = f"{r.name} ({where}{r.pid}) - {r.kind}"
         out: list = []
         e = r.gpu.engines
-        wddm = s.backend == "wddm" or r.host  # spill and commit counters only exist in WDDM
+        wddm = s.backend == "wddm" or r.origin == "windows"  # spill and commit counters only exist in WDDM
         engines = " ".join(f"{k} {v:.0f}%" for k, v in e.items() if v >= 0.5) or "idle"
         hdr = Text.assemble(("VRAM ", "bold"), (vram_label(r.gpu), "bold"), "   spill(RAM) ",
                             (gb(r.gpu.shared) if wddm else "n/a", "bold red" if r.gpu.shared > 256 << 20 else ""),

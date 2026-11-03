@@ -99,6 +99,27 @@ class InteropTests(unittest.TestCase):
         self.assertIsNotNone(h.latest())
         self.assertEqual(calls[0][:4], ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand"])
 
+    def test_a_bad_byte_ends_the_stream_visibly_so_it_restarts(self):
+        class BadStdout:
+            def __iter__(self):
+                yield SAMPLE + "\n"
+                raise UnicodeDecodeError("utf-8", b"\x82", 0, 1, "invalid start byte")
+
+        class FakeProc:
+            def __init__(self, args, **kw):
+                self.encoding = kw.get("encoding")
+                self.stdout = BadStdout()
+
+            def poll(self):
+                return 0
+
+        h = HostStream(exe="powershell.exe", popen=FakeProc)
+        deadline = time.time() + 2
+        while not h.ended and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(h.ended)
+        self.assertEqual(h._proc.encoding, "utf-8")
+
     def test_missing_powershell_is_reported(self):
         with patch("gputaskman.wslhost.powershell_path", return_value=None):
             h = HostStream()
@@ -146,6 +167,28 @@ class TrackerTests(unittest.TestCase):
                    {"A": (1.19, "*"), "F1": (0.4, "*"), "B": (3.05, "*")})
         h.remove(("A", 950))  # the oldest job exits; the others keep their contexts
         self.check(self.step(t, [3.05, 0.4, 0.0, 0.0], h), {"F1": (0.4, "*"), "B": (3.05, "*")})
+
+    def test_equal_sizes_are_right_now_but_never_evidence_later(self):
+        t = self.make()
+        h = [("S", 900), ("A", 13), ("B", 14)]
+        self.check(self.step(t, [0.0, 0.2, 0.2], h), {"B": (0.2, "*"), "A": (0.2, "*")})
+        # one of them loads a model: which one is unknown, so neither keeps the "*"
+        self.check(self.step(t, [0.0, 4.0, 0.2], h), {"B": (4.0, "?"), "A": (0.2, "?")})
+
+    def test_new_process_waits_for_its_own_context_instead_of_eliminating(self):
+        t = self.make()
+        h = [("S", 900)]
+        self.check(self.step(t, [0.0, 0.15], h), {})  # 0.15: WSLg, not yet known as foreign
+        h.append(("A", 1001))
+        self.check(self.step(t, [0.0, 0.15], h), {"A": (0.15, "?")})  # A's context isn't there yet
+        self.check(self.step(t, [6.0, 0.0, 0.15], h), {"A": (6.0, "*")})
+
+    def test_a_reused_pid_is_a_new_process(self):
+        t = self.make()
+        self.check(self.step(t, [0.0, 1.0], [("S", 900), ("P", 10)]), {"P": (1.0, "*")})
+        self.check(self.step(t, [0.0], [("S", 900)]), {})
+        self.check(self.step(t, [2.0, 0.0], [("S", 900), ("P", 2000)]), {"P": (2.0, "*")})
+        self.check(self.step(t, [2.0, 0.0], [("S", 900), ("P", 2000)]), {"P": (2.0, "*")})
 
     def test_already_running_processes_are_guesses_until_evidence(self):
         t = self.make()
@@ -238,6 +281,7 @@ class HostRowTests(unittest.TestCase):
         c._host_restarted = time.time()
         c.tracker = ContextTracker(path=os.path.join(self.tmp.name, "ctx.json"), boot_id="boot", self_pid=os.getpid())
         c._own_start = time.time()
+        c._inferred = {}
         return c
 
     def setUp(self):

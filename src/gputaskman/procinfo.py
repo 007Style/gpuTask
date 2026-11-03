@@ -225,7 +225,7 @@ def installed_models(exe: str, now: float | None = None) -> list[MappedModel]:
     hit = _installed.get(key)
     if hit and now - hit[0] < INSTALLED_TTL:
         return hit[1]
-    stem = os.path.splitext(os.path.basename(key))[0]
+    stem = os.path.splitext(os.path.basename(key))[0].lower()  # normcase only lowercases on Windows
     roots = []
     if not _is_system_path(key):
         roots.append(os.path.dirname(exe))

@@ -171,6 +171,7 @@ class Collector:
         self._host_luid: int | None = None  # host adapter for this GPU, matched once and kept
         self.tracker = ContextTracker(self_pid=os.getpid()) if self.host is not None else None
         self._own_start = time.time()  # our NVML context is created now, not when the process started
+        self._inferred: dict[int, float] = {}  # WSL: last inferred VRAM per Linux PID
         self._host_restarted = time.time()
 
     def _parent_ports(self, pid: int, depth: int = 2) -> list[int]:
@@ -212,7 +213,8 @@ class Collector:
         ollama_runners = []
         for pid, g in live:  # largest VRAM first, so the budget goes to what matters
             d = self.inspector.get(pid)
-            mem = g.dedicated + g.shared
+            # WSL: Linux rows carry no counter of their own; the last inferred size triggers rescans instead
+            mem = g.dedicated + g.shared or self._inferred.get(pid, 0.0)
             if (pid in deep_pids and (deadline is None or time.perf_counter() < deadline)
                     and self.inspector.needs_scan(d, mem)):
                 self.inspector.scan(d, mem)
@@ -300,6 +302,7 @@ class Collector:
         holders = [(r.pid, r.detail.create_time) for r in linux] + [(os.getpid(), self._own_start)]
         guesses, reason = self.tracker.update(luid, contexts, holders)
         snap.wsl_split = reason
+        self._inferred = {pid: g.bytes for pid, g in guesses.items()}
         for r in linux:
             g = guesses.get(r.pid)
             if g is not None:

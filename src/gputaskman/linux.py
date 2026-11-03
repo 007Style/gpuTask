@@ -49,9 +49,17 @@ def _bus_id(handle) -> str:
 
 
 def _nvml_devices() -> list[tuple[int, object]]:
+    """(adapter key, handle) per GPU NVML can open; a lost or failing GPU is skipped, not fatal."""
     out = []
-    for i in range(N.nvmlDeviceGetCount()):
-        h = N.nvmlDeviceGetHandleByIndex(i)
+    try:
+        count = N.nvmlDeviceGetCount()
+    except Exception:
+        return out
+    for i in range(count):
+        try:
+            h = N.nvmlDeviceGetHandleByIndex(i)
+        except Exception:
+            continue
         try:
             key = pci_key(_bus_id(h))
         except Exception:
@@ -84,6 +92,21 @@ def enumerate_adapters() -> list[Adapter]:
         except Exception:
             pass
     return out
+
+
+PROC_PID_INIT_INO = 0xEFFFFFFC  # the kernel's fixed inode number for the initial (host) PID namespace
+
+
+@lru_cache(maxsize=1)
+def in_child_pid_namespace() -> bool | None:
+    """True inside a container with its own PID namespace, where NVML reports host PIDs. False in the host
+    namespace (bare metal, or a container run with --pid=host), where NVML's PIDs are this /proc's PIDs.
+    None when it can't be told."""
+    try:
+        link = os.readlink("/proc/self/ns/pid")  # "pid:[4026531836]"
+        return int(link.split("[", 1)[1].rstrip("]")) != PROC_PID_INIT_INO
+    except (OSError, IndexError, ValueError):
+        return None
 
 
 def dxg_pids(exclude: set[int] | None = None) -> set[int]:
@@ -267,31 +290,37 @@ class LinuxCounters:
         return procs, adapters
 
     def _resolve_namespaces(self, procs: dict[int, dict[int, ProcGpu]]) -> None:
-        """Re-key NVML's PIDs to local ones. Same namespace (bare metal, or a container sharing the host
-        PID namespace): the PID exists here and holds an NVIDIA device. Otherwise (a container):
-        match by creation order with PidMatcher."""
+        """Re-key NVML's PIDs to local ones. In the host PID namespace (bare metal, --pid=host) they already
+        are local, including other users' processes whose /proc/<pid>/fd this monitor can't read. In a
+        container's own namespace every NVML PID is a host PID, even one that happens to equal a local
+        PID, so all of them are matched by creation order with PidMatcher."""
         self.outside = {}
         nv_pids = {pid for per in procs.values() for pid in per}
-        if not nv_pids:
+        child = in_child_pid_namespace()
+        if child is None:  # unknown: PIDs that don't exist here can't be local
+            unresolved = sorted(pid for pid in nv_pids if not os.path.exists(f"/proc/{pid}"))
+        else:
+            unresolved = sorted(nv_pids) if child else []
+        if not unresolved:
             self._matcher.update([], [])
             return
         holders = nvidia_holders()
-        unresolved = sorted(pid for pid in nv_pids if pid not in holders)
-        if not unresolved:
-            return
         me = os.getpid()
-        local = sorted(p for p in holders - nv_pids if p != me and has_cuda(p))
+        local = sorted(p for p in holders - (nv_pids - set(unresolved)) if p != me and has_cuda(p))
         compute = [pid for pid in unresolved if pid in self._compute_pids]  # CUDA, so local libcuda users
         matched, _ = self._matcher.update(compute, local)
+        unresolved = set(unresolved)
         for key, per in procs.items():
+            moved: dict[int, ProcGpu] = {}  # kept apart: a local PID may equal a host PID not yet moved
             for pid in [p for p in per if p in unresolved]:
                 g = per.pop(pid)
                 if pid in matched:
                     lpid, confidence = matched[pid]
                     g.inferred_by = confidence
-                    per[lpid] = g
+                    moved[lpid] = g
                 else:
                     self.outside.setdefault(key, {})[pid] = g
+            per.update(moved)
 
     def close(self) -> None:
         if self.ok:

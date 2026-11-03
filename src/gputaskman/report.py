@@ -17,9 +17,12 @@ def to_dict(s: Snapshot) -> dict:
     for p in s.procs:
         item = {
             "pid": p.pid, "name": p.name, "kind": p.kind, "runtimes": p.detail.runtimes,
-            "vram_bytes": int(p.gpu.dedicated), "shared_bytes": int(p.gpu.shared),
-            "committed_bytes": int(p.gpu.committed), "paged_out_bytes": int(p.gpu.paged_out),
-            "gpu_pct": round(p.gpu.gpu_pct, 1), "engines": {k: round(v, 1) for k, v in p.gpu.engines.items() if v},
+            "vram_bytes": int(p.gpu.dedicated) if "dedicated" in p.gpu.available else None,
+            "shared_bytes": int(p.gpu.shared) if "shared" in p.gpu.available else None,
+            "committed_bytes": int(p.gpu.committed) if "committed" in p.gpu.available else None,
+            "paged_out_bytes": int(p.gpu.paged_out) if p.gpu.paged_available else None,
+            "gpu_pct": round(p.gpu.gpu_pct, 1) if "engine" in p.gpu.available else None,
+            "engines": {k: round(v, 1) for k, v in p.gpu.engines.items() if v} if "engine" in p.gpu.available else None,
             "ports": p.detail.ports, "inside": p.inside,
             "model_files": [dataclasses.asdict(m) for m in p.detail.models],
             "installed_models": [dataclasses.asdict(m) for m in p.detail.candidates],
@@ -45,6 +48,7 @@ def to_dict(s: Snapshot) -> dict:
         procs.append(item)
     return {
         "taken": s.taken, "gpu": s.adapter.name if s.adapter else None, "driver": s.driver, "cuda": s.cuda,
+        "adapter": dataclasses.asdict(s.adapter) if s.adapter else None,
         "vram_total": s.vram_total, "vram_used": s.vram_used, "shared_used": s.shared_used,
         "attributed": s.attributed, "device": nv, "processes": procs,
     }
@@ -54,26 +58,37 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
     out = []
     nv = s.nv
     name = s.adapter.name if s.adapter else "GPU"
-    out.append(f"{name}  driver {s.driver}  CUDA {s.cuda}  {nv.driver_model if nv else ''}")
-    out.append(f"VRAM {gb(s.vram_used)} / {gb(s.vram_total)}   shared (in system RAM) {gb(s.shared_used)}")
+    info = f"  driver {s.driver}" if s.driver else ""
+    if s.cuda:
+        info += f"  CUDA {s.cuda}"
+    out.append(f"{name}{info}  {nv.driver_model if nv else ''}")
+    used = gb(s.vram_used) if s.vram_used is not None else "N/A"
+    shared = gb(s.shared_used) if s.shared_used is not None else "N/A"
+    out.append(f"VRAM {used} / {gb(s.vram_total)}   shared (in system RAM) {shared}")
     if nv:
         rx = nv.pcie_rx_kbs / 1024 if nv.pcie_rx_kbs is not None else None
         tx = nv.pcie_tx_kbs / 1024 if nv.pcie_tx_kbs is not None else None
         pstate = f"P{nv.pstate}" if nv.pstate is not None else "P N/A"
-        out.append(f"GPU {format_metric(nv.util_gpu, unit='%')}  mem-bandwidth {format_metric(nv.util_mem, unit='%')}  "
+        label = "AMD gfx" if nv.source.startswith("AMD ") else "GPU"
+        clock = (f"gfx {format_metric(nv.gfx_clock)}" if nv.source.startswith("AMD ") else
+                 f"SM {format_metric(nv.sm_clock)}")
+        power_kind = f" ({nv.power_kind})" if nv.power_kind else ""
+        out.append(f"{label} {format_metric(nv.util_gpu, unit='%')}  mem-bandwidth {format_metric(nv.util_mem, unit='%')}  "
                    f"{format_metric(nv.temp, unit='C')}  {format_metric(nv.power_w, '.0f')}/"
-                   f"{format_metric(nv.power_limit_w, '.0f')} W  {pstate}  "
-                   f"SM {format_metric(nv.sm_clock)} MHz  "
+                   f"{format_metric(nv.power_limit_w, '.0f')} W{power_kind}  {pstate}  "
+                   f"{clock} MHz  "
                    f"video {format_metric(nv.video_clock)} MHz  "
                    f"PCIe rx {format_metric(rx, '.0f')} MB/s "
                    f"tx {format_metric(tx, '.0f')} MB/s")
     out.append("")
     out.append(f"{'PID':>7}  {'PROCESS':<24} {'KIND':<10} {'RUNTIME':<24} {'VRAM':>9} {'SPILL':>8} {'PAGED':>8} {'GPU%':>5}  INSIDE")
     for p in s.procs[:limit]:
-        spill = gb(p.gpu.shared) if p.gpu.shared >= 1 << 20 else ""
-        paged = gb(p.gpu.paged_out) if p.gpu.paged_out >= 1 << 20 else ""
-        out.append(f"{p.pid:>7}  {p.name[:24]:<24} {p.kind:<10} {p.runtime[:24]:<24} {gb(p.gpu.dedicated):>9} {spill:>8} "
-                   f"{paged:>8} {p.gpu.gpu_pct:>5.0f}  {p.inside}")
+        spill = "N/A" if "shared" not in p.gpu.available else gb(p.gpu.shared) if p.gpu.shared >= 1 << 20 else ""
+        paged = "N/A" if not p.gpu.paged_available else gb(p.gpu.paged_out) if p.gpu.paged_out >= 1 << 20 else ""
+        vram = gb(p.gpu.dedicated) if "dedicated" in p.gpu.available else "N/A"
+        gpu_pct = f"{p.gpu.gpu_pct:.0f}" if "engine" in p.gpu.available else "N/A"
+        out.append(f"{p.pid:>7}  {p.name[:24]:<24} {p.kind:<10} {p.runtime[:24]:<24} {vram:>9} {spill:>8} "
+                   f"{paged:>8} {gpu_pct:>5}  {p.inside}")
     for p in s.procs:
         if p.handy:
             out.append("")

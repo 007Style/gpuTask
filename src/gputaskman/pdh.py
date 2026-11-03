@@ -63,10 +63,17 @@ class ProcGpu:
     shared: float = 0.0  # bytes resident in shared (system RAM) GPU memory -- "spill" ("Non Local Usage")
     committed: float = 0.0  # all GPU memory this process allocated, resident or not ("Total Committed")
     engines: dict[str, float] = field(default_factory=lambda: defaultdict(float))  # engtype -> util %
+    available: set[str] = field(default_factory=lambda: {"dedicated", "shared", "committed", "engine"})
+
+    @property
+    def paged_available(self) -> bool:
+        return {"dedicated", "shared", "committed"} <= self.available
 
     @property
     def paged_out(self) -> float:
         """Commit minus local/non-local usage: a non-residency estimate, not an eviction trace."""
+        if not self.paged_available:
+            return 0.0  # internal sentinel; callers must check paged_available before display
         return max(self.committed - self.dedicated - self.shared, 0.0)
 
     @property
@@ -77,8 +84,8 @@ class ProcGpu:
 
 @dataclass
 class AdapterGpu:
-    dedicated: float = 0.0
-    shared: float = 0.0
+    dedicated: float | None = None
+    shared: float | None = None
 
 
 class GpuCounters:
@@ -136,13 +143,14 @@ class GpuCounters:
 
     def sample(self) -> tuple[dict[int, dict[int, ProcGpu]], dict[int, AdapterGpu]]:
         """Returns ({luid: {pid: ProcGpu}}, {luid: AdapterGpu})."""
-        _pdh.PdhCollectQueryData(self._query)
+        if _pdh.PdhCollectQueryData(self._query) != 0:
+            return {}, {}
         procs: dict[int, dict[int, ProcGpu]] = defaultdict(dict)
 
         def proc(luid: int, pid: int) -> ProcGpu:
             p = procs[luid].get(pid)
             if p is None:
-                p = procs[luid][pid] = ProcGpu()
+                p = procs[luid][pid] = ProcGpu(available=set())
             return p
 
         for attr in ("dedicated", "shared", "committed"):
@@ -151,10 +159,13 @@ class GpuCounters:
                 if m:
                     p = proc(luid_key(m[2], m[3]), int(m[1]))
                     setattr(p, attr, getattr(p, attr) + val)
+                    p.available.add(attr)
         for name, val in self._read("engine"):
             m = _ENGINE_RE.match(name)
             if m:
-                proc(luid_key(m[2], m[3]), int(m[1])).engines[_norm_engine(m[6])] += val
+                p = proc(luid_key(m[2], m[3]), int(m[1]))
+                p.engines[_norm_engine(m[6])] += val
+                p.available.add("engine")
 
         adapters: dict[int, AdapterGpu] = defaultdict(AdapterGpu)
         for attr, key in (("dedicated", "a_dedicated"), ("shared", "a_shared")):
@@ -162,7 +173,7 @@ class GpuCounters:
                 m = _ADAPTER_RE.match(name)
                 if m:
                     a = adapters[luid_key(m[1], m[2])]
-                    setattr(a, attr, getattr(a, attr) + val)
+                    setattr(a, attr, (getattr(a, attr) or 0.0) + val)
         return procs, adapters
 
     def close(self) -> None:

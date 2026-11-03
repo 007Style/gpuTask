@@ -52,7 +52,7 @@ def check_executable(path: Path, arch: str) -> None:
 def create_archive(bundle: Path, output: Path, version: str, arch: str) -> Path:
     validate_version(version)
     check_executable(bundle / "gputaskman.exe", arch)
-    forbidden = {"nvml.dll", "nvcuda.dll", "dxgi.dll", "pdh.dll"}
+    forbidden = {"nvml.dll", "nvcuda.dll", "atiadlxx.dll", "dxgi.dll", "pdh.dll"}
     # Editable-install origins contain build-machine paths and are not needed at runtime.
     files = sorted(
         path for path in bundle.rglob("*")
@@ -107,7 +107,7 @@ def add_notices(bundle: Path) -> None:
         "PyInstaller bootloader: see licenses\\pyinstaller (including its exception).\n"
         "NVIDIA Python bindings: see licenses\\nvidia-ml-py.\n"
         "Runtime package metadata and license texts are included in _internal\\*.dist-info.\n"
-        "NVIDIA and Windows DLLs are provided by the installed driver and operating system.\n",
+        "GPU driver and Windows DLLs are provided by the installed driver and operating system.\n",
         encoding="utf-8",
     )
 
@@ -139,7 +139,7 @@ def build(output: Path, arch: str, tag: str | None = None) -> Path:
             "  .\\gputaskman.exe --once\n"
             "  .\\gputaskman.exe --json\n\n"
             "Press q to quit the interactive display.\n"
-            "Requires Windows and an NVIDIA GPU with a current WDDM driver.\n"
+            "Requires Windows and an NVIDIA or AMD GPU with a current WDDM driver.\n"
             "No Python, uv, CUDA Toolkit, models, or administrator session is required.\n"
             "This build is unsigned. No drivers or inference servers are bundled.\n"
             "Snapshots can contain local paths and model names; redact before sharing.\n\n"

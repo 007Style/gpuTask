@@ -8,12 +8,15 @@ from dataclasses import dataclass, field
 
 import psutil
 
+from .amdsmi import AmdSmi, _bdf
+from .adl import Adl
 from .dxgi import VENDOR_NVIDIA, Adapter, enumerate_adapters
 from .handy import HandyEvidence, inspect_handy
 from .llm import LlmView, ServerProber, build_view, gb, ollama_log_path
 from .nvml import Nvml, NvDevice
 from .pdh import GpuCounters, ProcGpu
 from .procinfo import AI_KINDS, ProcDetail, ProcInspector, classify
+from .telemetry import DeviceTelemetry
 
 MiB = 1 << 20
 
@@ -69,23 +72,23 @@ class Snapshot:
     taken: float
     adapter: Adapter | None
     adapters: list[Adapter]
-    nv: NvDevice | None
+    nv: DeviceTelemetry | None  # legacy name; may contain telemetry from either provider
     driver: str
     cuda: str
     vram_total: int
-    vram_used: int  # WDDM adapter-wide dedicated usage (ground truth)
-    shared_used: int
+    vram_used: int | None  # WDDM adapter-wide dedicated usage
+    shared_used: int | None
     procs: list[ProcRow] = field(default_factory=list)
 
     @property
-    def attributed(self) -> int:
+    def attributed(self) -> int | None:
+        if any("dedicated" not in p.gpu.available for p in self.procs):
+            return None
         return int(sum(p.gpu.dedicated for p in self.procs))
 
 
 def select_adapter(adapters: list[Adapter], gpu_index: int) -> Adapter | None:
-    hardware = [a for a in adapters if not a.software]
-    choices = [a for a in hardware if a.vendor_id == VENDOR_NVIDIA] or hardware
-    choices.sort(key=lambda a: -a.dedicated_vram)
+    choices = ordered_adapters(adapters)
     if gpu_index < 0:
         raise ValueError("--gpu must be a non-negative index")
     if gpu_index >= len(choices):
@@ -95,15 +98,26 @@ def select_adapter(adapters: list[Adapter], gpu_index: int) -> Adapter | None:
     return choices[gpu_index]
 
 
-def select_nv_device(adapter: Adapter | None, devices: list[NvDevice], gpu_index: int) -> NvDevice | None:
+def ordered_adapters(adapters: list[Adapter]) -> list[Adapter]:
+    """List all hardware adapters; retain NVIDIA-first ordering for existing users."""
+    return sorted((a for a in adapters if not a.software),
+                  key=lambda a: (a.vendor_id != VENDOR_NVIDIA, -a.dedicated_vram, a.luid))
+
+
+def select_nv_device(adapter: Adapter | None, devices: list[NvDevice], gpu_index: int,
+                     adapters: list[Adapter] | None = None) -> NvDevice | None:
     if adapter:
         if adapter.vendor_id != VENDOR_NVIDIA:
             return None
-        matches = [d for d in devices if d.name.casefold() == adapter.name.casefold()]
+        if adapter.pci_address is None:
+            return None
+        if adapters is not None and sum(a.pci_address == adapter.pci_address for a in adapters) != 1:
+            return None
+        matches = [d for d in devices if _bdf(d.pci_bus) == adapter.pci_address and d.driver_model != "MCDM"]
         if len(matches) == 1:
             return matches[0]
-    fallback = devices[gpu_index] if gpu_index < len(devices) else None
-    return None if adapter and fallback and fallback.driver_model == "MCDM" else fallback
+        return None
+    return devices[gpu_index] if gpu_index < len(devices) else None
 
 
 class Collector:
@@ -115,6 +129,8 @@ class Collector:
         self.adapter = select_adapter(self.adapters, gpu_index)
         self.counters = GpuCounters()
         self.nvml = Nvml()
+        self.amdsmi = AmdSmi(self.adapter, self.adapters)
+        self.adl = Adl(self.adapter, self.adapters)
         self.inspector = ProcInspector()
         self.prober = ServerProber()
         self.scan_budget = scan_budget  # None = scan every candidate now (one-shot output)
@@ -133,7 +149,7 @@ class Collector:
                     d.parents.append(p.pid)
             except (psutil.Error, OSError):
                 pass
-        return [port for ppid in d.parents for port in self.inspector.ports(ppid)]
+        return [port for ppid in d.parents for port in self.inspector.exclusive_ports(ppid)]
 
     def sample(self) -> Snapshot:
         per_luid, adapters = self.counters.sample()
@@ -141,14 +157,17 @@ class Collector:
         procs = per_luid.get(luid, {})
         a = adapters.get(luid)
         nvs = self.nvml.sample() if self.nvml.ok else []
-        nv = select_nv_device(self.adapter, nvs, self.gpu_index)
+        nv = select_nv_device(self.adapter, nvs, self.gpu_index, self.adapters)
+        if self.adapter and self.adapter.vendor_id == 0x1002:
+            nv = self.adl.sample() or self.amdsmi.sample()
         total = (nv.mem_total if nv else 0) or (self.adapter.dedicated_vram if self.adapter else 0)
 
         snap = Snapshot(
             taken=time.time(), adapter=self.adapter, adapters=self.adapters, nv=nv,
-            driver=self.nvml.driver, cuda=self.nvml.cuda_version, vram_total=total,
-            vram_used=int(a.dedicated) if a else (nv.mem_used if nv else 0),
-            shared_used=int(a.shared) if a else 0,
+            driver=(self.amdsmi.driver if nv and nv.source == "AMD SMI" else self.nvml.driver if nv and nv.source == "NVML" else ""),
+            cuda=self.nvml.cuda_version if nv and nv.source == "NVML" else "", vram_total=total,
+            vram_used=int(a.dedicated) if a and a.dedicated is not None else None,
+            shared_used=int(a.shared) if a and a.shared is not None else None,
         )
 
         live = [(pid, g) for pid, g in procs.items()
@@ -173,9 +192,10 @@ class Collector:
         for row in snap.procs:
             if os.path.basename(row.detail.exe).lower() == "handy.exe":
                 row.handy = inspect_handy(row.detail.create_time)
-            if row.detail.is_diffusion or row.kind not in AI_KINDS or not (row.detail.models or row.kind == "LLM"):
+            if (row.detail.is_diffusion or row.kind not in AI_KINDS or not (row.detail.models or row.kind == "LLM")
+                    or not {"dedicated", "shared"} <= row.gpu.available):
                 continue
-            own = self.prober.get(row.detail.ports)
+            own = self.prober.get(self.inspector.exclusive_ports(row.pid))
             host = self.prober.get(self._parent_ports(row.pid))  # Ollama / LM Studio front-end process
             log = ollama_log_path() if row in ollama_runners and len(ollama_runners) == 1 else None
             row.llm = build_view(row.detail, row.gpu.dedicated, row.gpu.shared, own or host, log,
@@ -187,3 +207,5 @@ class Collector:
     def close(self) -> None:
         self.counters.close()
         self.nvml.close()
+        self.amdsmi.close()
+        self.adl.close()

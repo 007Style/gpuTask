@@ -24,6 +24,7 @@ RUNTIMES: list[tuple[str, tuple[str, ...]]] = [
     ("TensorRT", ("nvinfer*.dll", "libnvinfer*.so")),
     ("ONNX RT", ("onnxruntime*.dll", "libonnxruntime*.so")),
     ("DirectML", ("directml.dll",)),
+    ("HIP", ("amdhip64.dll", "amdhip64_*.dll", "libamdhip64.so")),
     ("cuDNN", ("cudnn*.dll", "libcudnn*.so")),
     ("CUDA", ("nvcuda.dll", "nvcuda64.dll", "cudart64_*.dll", "cublas64_*.dll",
               "libcuda.so", "libcudart.so", "libcublas.so")),
@@ -305,6 +306,12 @@ class ProcInspector:
         self._refresh_ports()
         return self._ports.get(pid, [])
 
+    def exclusive_ports(self, pid: int) -> list[int]:
+        """Only probe ports with one known listener; localhost may route shared ports to another PID."""
+        self._refresh_ports()
+        others = {port for other, ports in self._ports.items() if other != pid for port in ports}
+        return [port for port in self._ports.get(pid, []) if port not in others]
+
     @staticmethod
     def _new(pid: int) -> ProcDetail:
         d = ProcDetail(pid=pid)
@@ -411,7 +418,7 @@ def classify(d: ProcDetail, engines: dict[str, float]) -> str:
         return "browser"
     if video or "NVENC" in d.runtimes:
         return "video"
-    if "CUDA" in d.runtimes:
+    if "CUDA" in d.runtimes or "HIP" in d.runtimes:
         return "compute"
     if ("D3D12" in d.runtimes or "Vulkan" in d.runtimes) and engines.get("3d", 0) > 10:
         return "3D/game"

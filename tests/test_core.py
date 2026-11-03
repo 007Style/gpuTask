@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import io
 import json
 import os
@@ -16,6 +17,8 @@ from rich.console import Console
 from rich.table import Table
 from textual.widgets import Footer, Select, Static
 
+from gputaskman.amdsmi import AmdSmi
+from gputaskman.adl import Adl, _Metrics
 from gputaskman.app import GpuTaskManager, spark, stacked_bar
 from gputaskman.cli import main
 from gputaskman.collector import ProcRow, Snapshot, select_adapter, select_nv_device
@@ -26,7 +29,7 @@ from gputaskman.llm import (LlmView, ServerInfo, build_view, is_gpu_device, llam
                             parse_flags, parse_load_log, probe_server)
 from gputaskman.nvml import NvDevice, Nvml
 from gputaskman.pdh import GpuCounters, ProcGpu
-from gputaskman.procinfo import (AI_KINDS, MappedModel, ProcDetail, ProcInspector, _is_model_file,
+from gputaskman.procinfo import (AI_KINDS, MappedModel, ProcDetail, ProcInspector, _is_model_file, _match_runtimes,
                                 _models_from_cmdline, classify, installed_models, make_model)
 from gputaskman.report import to_dict, to_text
 from gputaskman.stores import store_name
@@ -105,6 +108,94 @@ class CliTests(unittest.TestCase):
 
 
 class DeviceSelectionTests(unittest.TestCase):
+    def test_adl_empty_or_failed_sample_allows_fallback(self):
+        provider = Adl.__new__(Adl)
+        provider.context, provider.index = ctypes.c_void_p(1), 4
+        provider.dll = SimpleNamespace(ADL2_New_QueryPMLogData_Get=lambda *args: 0,
+                                       ADL2_Main_Control_Destroy=lambda context: None)
+        self.assertIsNone(provider.sample())
+        provider.dll.ADL2_New_QueryPMLogData_Get = lambda *args: -1
+        self.assertIsNone(provider.sample())
+        provider.close()
+        provider.close()
+        self.assertIsNone(provider.sample())
+
+    def test_shared_listen_port_is_not_used_for_server_attribution(self):
+        inspector = ProcInspector()
+        inspector._ports = {1: [9090, 9091], 2: [9090]}
+        with patch.object(inspector, "_refresh_ports"):
+            self.assertEqual(inspector.exclusive_ports(1), [9091])
+            self.assertEqual(inspector.exclusive_ports(2), [])
+
+    def test_adl_uses_only_supported_sensors_and_reports_board_power(self):
+        def read(_context, _index, pointer):
+            sensors = ctypes.cast(pointer, ctypes.POINTER(_Metrics)).contents.sensors
+            for index, value in ((1, 2500), (8, 55), (19, 0), (73, 120)):
+                sensors[index].supported, sensors[index].value = 1, value
+            return 0
+
+        provider = Adl.__new__(Adl)
+        provider.context, provider.index = ctypes.c_void_p(1), 4
+        provider.dll = SimpleNamespace(ADL2_New_QueryPMLogData_Get=read)
+        sample = provider.sample()
+        self.assertEqual((sample.gfx_clock, sample.temp, sample.util_gpu), (2500, 55, 0))
+        self.assertEqual((sample.power_w, sample.power_kind), (120, "board"))
+        self.assertIsNone(sample.mem_clock)
+        self.assertIsNone(sample.util_mem)
+
+    def test_amdsmi_matches_pci_and_handles_partial_metrics(self):
+        amd = Adapter(1, "AMD", 0x1002, 16 * GiB, 0, False, (10, 0, 0))
+        closed = []
+        api = SimpleNamespace(
+            amdsmi_init=lambda: None, amdsmi_shut_down=lambda: closed.append(True),
+            amdsmi_get_processor_handles=lambda: ["other", "target"],
+            amdsmi_get_gpu_device_bdf=lambda h: "0000:0a:00.0" if h == "target" else "0000:0b:00.0",
+            amdsmi_get_gpu_driver_info=lambda h: {"driver_version": "test"},
+            amdsmi_get_gpu_activity=lambda h: {"gfx_activity": 0},
+            amdsmi_get_power_info=lambda h: {"socket_power": 42, "power_limit": "N/A"},
+            AmdSmiTemperatureType=SimpleNamespace(EDGE=1),
+            AmdSmiTemperatureMetric=SimpleNamespace(CURRENT=2),
+            amdsmi_get_temp_metric=lambda *args: 47,  # AMD SMI reports degrees Celsius
+        )
+        provider = AmdSmi(amd, [amd], api)
+        sample = provider.sample()
+        self.assertEqual((sample.source, sample.util_gpu, sample.temp, sample.power_w), ("AMD SMI", 0, 47, 42))
+        self.assertIsNone(sample.power_limit_w)
+        self.assertIsNone(sample.util_mem)
+        provider.close()
+        provider.close()
+        self.assertEqual(closed, [True])
+        self.assertIsNone(provider.sample())
+
+    def test_amdsmi_rejects_ambiguous_and_nonzero_domain(self):
+        amd = Adapter(1, "AMD", 0x1002, 16 * GiB, 0, False, (10, 0, 0))
+        other = Adapter(2, "AMD", 0x1002, 16 * GiB, 0, False, (10, 0, 0))
+        api = SimpleNamespace(amdsmi_init=lambda: None, amdsmi_shut_down=lambda: None,
+                              amdsmi_get_processor_handles=lambda: [1],
+                              amdsmi_get_gpu_device_bdf=lambda h: "0001:0a:00.0")
+        self.assertIsNone(AmdSmi(amd, [amd, other], api).sample())
+        provider = AmdSmi(amd, [amd], api)
+        self.assertIsNone(provider.sample())
+        provider.close()
+
+    def test_mixed_vendor_adapters_are_selectable(self):
+        amd = Adapter(2, "AMD GPU", 0x1002, 24 * GiB, 0, False)
+        nvidia = Adapter(1, "NVIDIA GPU", 0x10DE, 8 * GiB, 0, False)
+        self.assertIs(select_adapter([amd, nvidia], 0), nvidia)
+        self.assertIs(select_adapter([amd, nvidia], 1), amd)
+
+    def test_amd_snapshot_does_not_show_cuda_header(self):
+        s = snapshot()
+        s.adapter = Adapter(2, "AMD GPU", 0x1002, 24 * GiB, 0, False)
+        self.assertNotIn("CUDA", to_text(s).splitlines()[0])
+        self.assertEqual(to_dict(s)["adapter"]["vendor_id"], 0x1002)
+
+    def test_hip_runtime_is_compute_evidence(self):
+        self.assertEqual(classify(ProcDetail(1, "worker.exe", runtimes=["HIP"]), {}), "compute")
+        for dll in ("amdhip64.dll", "amdhip64_6.dll"):
+            self.assertIn("HIP", _match_runtimes({dll}))
+        self.assertNotIn("HIP", _match_runtimes({"amd_comgr_2.dll"}))
+
     def test_adapter_indices_do_not_clamp_to_another_gpu(self):
         gpu = Adapter(1, "NVIDIA GPU", 0x10DE, 16 * GiB, 0, False)
         software = Adapter(2, "Software", 0x1414, 0, 0, True)
@@ -115,18 +206,64 @@ class DeviceSelectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "out of range"):
             select_adapter([], 1)
 
-    def test_nvml_matches_unique_adapter_name_before_index(self):
-        gpu = Adapter(1, "NVIDIA RTX Spark", 0x10DE, 64 * GiB, 0, False)
+    @patch("gputaskman.collector.sys.platform", "win32")
+    def test_nvml_matches_pci_address_not_name_or_index(self):
+        gpu = Adapter(1, "NVIDIA RTX Spark", 0x10DE, 64 * GiB, 0, False, (10, 0, 0))
         npu = NvDevice(index=0, name="NVIDIA NPU", driver_model="MCDM")
-        nv_gpu = NvDevice(index=1, name="NVIDIA RTX SPARK", driver_model="WDDM")
+        nv_gpu = NvDevice(index=1, name="NVIDIA RTX SPARK", pci_bus="00000000:0A:00.0", driver_model="WDDM")
         self.assertIs(select_nv_device(gpu, [npu, nv_gpu], 0), nv_gpu)
         self.assertIs(select_nv_device(None, [npu, nv_gpu], 0), npu)
         self.assertIsNone(select_nv_device(gpu, [npu], 0))
+        self.assertIsNone(select_nv_device(gpu, [nv_gpu, nv_gpu], 0))
         intel = Adapter(2, "Intel GPU", 0x8086, 8 * GiB, 0, False)
         self.assertIsNone(select_nv_device(intel, [nv_gpu], 0))
 
 
 class MemoryTests(unittest.TestCase):
+    def test_failed_collection_does_not_reuse_previous_counters(self):
+        counters = GpuCounters.__new__(GpuCounters)
+        counters._query = None
+        with patch("gputaskman.pdh._pdh", SimpleNamespace(PdhCollectQueryData=lambda query: 1)), \
+                patch.object(counters, "_read") as read:
+            self.assertEqual(counters.sample(), ({}, {}))
+            read.assert_not_called()
+
+    def test_counter_samples_track_each_process_field(self):
+        counters = GpuCounters.__new__(GpuCounters)
+        counters._query = None
+        data = {"dedicated": [("pid_42_luid_0x0_0x1_phys_0", 0.0)],
+                "engine": [("pid_42_luid_0x0_0x1_phys_0_eng_0_engtype_Compute", 10.0)]}
+        with patch.object(counters, "_read", side_effect=lambda key: data.get(key, [])), \
+                patch("gputaskman.pdh._pdh", SimpleNamespace(PdhCollectQueryData=lambda query: 0)):
+            processes, _ = counters.sample()
+        gpu = processes[1][42]
+        self.assertEqual(gpu.available, {"dedicated", "engine"})
+        self.assertEqual(gpu.dedicated, 0)
+        self.assertEqual(gpu.gpu_pct, 10)
+        self.assertFalse(gpu.paged_available)
+
+    def test_missing_process_counters_are_not_reported_as_zero(self):
+        s = snapshot()
+        s.procs[0].gpu.available = {"dedicated"}
+        row = to_dict(s)["processes"][0]
+        self.assertEqual(row["vram_bytes"], 8 * GiB)
+        for name in ("shared_bytes", "committed_bytes", "paged_out_bytes", "gpu_pct", "engines"):
+            self.assertIsNone(row[name])
+        self.assertIn("N/A", to_text(s))
+        s.procs[0].gpu.available.clear()
+        self.assertIsNone(to_dict(s)["attributed"])
+
+    def test_missing_adapter_memory_is_not_reported_as_zero(self):
+        s = snapshot()
+        s.vram_used = None
+        s.shared_used = None
+        self.assertIsNone(to_dict(s)["vram_used"])
+        self.assertIsNone(to_dict(s)["shared_used"])
+        self.assertIn("VRAM N/A", to_text(s))
+        self.assertIn("shared (in system RAM) N/A", to_text(s))
+        output = io.StringIO()
+        Console(file=output, width=120).print(GpuTaskManager().render_device(s))
+        self.assertIn("N/A", output.getvalue())
     def test_best_vram_keeps_measured_and_inferred_zero_distinct_from_unknown(self):
         gpu = ProcGpu(dedicated=0, inferred=8 * GiB)
         self.assertEqual(gpu.shown_vram, 0)
@@ -723,6 +860,20 @@ class UiTests(unittest.IsolatedAsyncioTestCase):
                 hdr = app.query_one("#inspector", Static).content.renderables[0].plain
                 self.assertIn("compute 65%", hdr)
                 self.assertIn("spill(RAM) n/a", hdr)
+
+    async def test_unknown_process_memory_preserves_unattributed_adapter_usage(self):
+        s = snapshot()
+        s.procs[0].gpu.dedicated = 2 * GiB
+        unknown = ProcGpu(attributed=False, engines={"3d": 20})
+        unknown.available.clear()
+        s.procs.append(ProcRow(30, "unknown", "app", unknown, ProcDetail(30, "unknown")))
+        with patch.object(GpuTaskManager, "poll"), patch("gputaskman.app.stacked_bar", wraps=stacked_bar) as bar:
+            app = GpuTaskManager()
+            async with app.run_test(size=(180, 42)) as pilot:
+                app.apply(s)
+                await pilot.pause()
+                self.assertIsNone(s.attributed)
+                self.assertTrue(any((6 * GiB, "grey35") in call.args[0] for call in bar.call_args_list))
 
     async def test_eighth_chart_records_sm_clock_with_scale_and_missing_readings(self):
         with patch.object(GpuTaskManager, "poll"):

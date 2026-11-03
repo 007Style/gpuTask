@@ -46,8 +46,8 @@ EXPLAIN = {
                "Deeper: edge://gpu, or DevTools > Performance with the GPU track.",
     "3D/game": "Textures, meshes, render targets and descriptor heaps. Windows only sees opaque allocations; "
                "per-resource names need a graphics debugger (PIX on Windows, NVIDIA Nsight Graphics).",
-    "video": "Decoded/encoded video frames and codec surfaces (NVDEC/NVENC).",
-    "compute": "CUDA allocations are opaque to the OS. For more detail trace cudaMalloc with Nsight Systems.",
+    "video": "Decoded/encoded video frames and codec surfaces (NVIDIA NVDEC/ENC)",
+    "compute": "Compute allocations are opaque to the OS. Runtime-specific profilers can provide more detail (CUDA: cudaMalloc with Nsight Systems).",
     "diffusion": "Model components are identified from launch arguments; GPU allocations cannot be split by component.",
     "AI": "ML runtime allocations (tensors, workspaces). PyTorch: torch.cuda.memory_summary(); "
           "ONNX Runtime/DirectML pools are opaque from outside.",
@@ -59,9 +59,9 @@ HELP_MD = """\
 
 | Layer | Source | Works for |
 |---|---|---|
-| **Device** totals, load, bandwidth, PCIe, power | NVML (`nvml.dll`) | NVIDIA |
-| **Per-process** VRAM, spill to RAM, per-engine load | Windows WDDM counters (dxgkrnl) | every API incl. **CUDA** |
-| **Which runtime** (CUDA, Vulkan, D3D12, ggml, ONNX, PyTorch...) | DLLs mapped in the process | everything |
+| **Device** telemetry | NVML, AMD ADL, or optional AMD SMI | availability varies by GPU and driver |
+| **Per-process** VRAM, spill to RAM, per-engine load | Windows WDDM counters (dxgkrnl) | workloads visible to WDDM |
+| **Which runtime** (CUDA, HIP, Vulkan, D3D12, ggml, ONNX, PyTorch...) | DLLs mapped in the process | everything |
 | **Which model file** | memory-mapped files + command line | llama.cpp, stable-diffusion.cpp, LM Studio, Ollama |
 | **Model name & kind** (LLM, decision, embedding, speech) | GGUF header, Ollama/LM Studio/Hugging Face stores, local server APIs | GGUF family |
 | **Weights / KV cache / compute** split | GGUF header math, llama.cpp/Ollama logs, local server APIs | GGUF/llama.cpp family |
@@ -105,7 +105,8 @@ non-resident committed memory, not a measured eviction count or proof of pagefil
 not necessarily current residency. A game's textures cannot be enumerated here.
 
 **GPU%** = busiest engine (like Task Manager). On GeForce/WDDM, CUDA kernels are usually reported
-on the **3D** engine.
+on the **3D** engine. AMD device GPU charts show graphics-engine activity, which is not
+necessarily equivalent to NVML GPU utilization. Vulkan does not expose another process's HIP internals.
 
 Keys: `↑/↓` select · `s` sort · `c` chart · `a` show all · `p` pause · `?` this help · `q` quit
 
@@ -266,9 +267,17 @@ class GpuTaskManager(App):
     def apply(self, snap: Snapshot) -> None:
         self.snap = snap
         nv = snap.nv
+        amd = bool(snap.adapter and snap.adapter.vendor_id == 0x1002)
+        if getattr(self, "_amd_chart_labels", None) != amd:
+            self._amd_chart_labels = amd
+            selector = self.query_one("#chart-mode", Select)
+            selected = selector.value
+            selector.set_options([("All charts", -1), *(("GFX clock" if amd and name == "SM clock" else name, index)
+                                                      for index, name in enumerate(self.CHARTS))])
+            selector.value = selected
         if nv:
             self.hist_util.append(nv.util_gpu)
-            self.hist_clock.append(nv.sm_clock)
+            self.hist_clock.append(nv.gfx_clock if amd else nv.sm_clock)
             self.hist_bw.append(nv.util_mem)
             self.hist_temp.append(nv.temp)
             self.hist_power.append(nv.power_w)
@@ -278,7 +287,8 @@ class GpuTaskManager(App):
             for history in (self.hist_util, self.hist_clock, self.hist_bw, self.hist_temp,
                             self.hist_power, self.hist_enc, self.hist_dec):
                 history.append(None)
-        self.hist_vram.append(100 * snap.vram_used / snap.vram_total if snap.vram_total else None)
+        self.hist_vram.append(100 * snap.vram_used / snap.vram_total
+                              if snap.vram_total and snap.vram_used is not None else None)
         if not self._auto_selected:
             llm = next((r for r in sorted(snap.procs, key=self.SORTS[0][1]) if r.llm), None)
             if llm:
@@ -292,7 +302,8 @@ class GpuTaskManager(App):
     def render_device(self, s: Snapshot) -> Group:
         nv = s.nv
         name = s.adapter.name if s.adapter else (nv.name if nv else "GPU")
-        head = Text.assemble((name, "bold"), f"   driver {s.driver}  CUDA {s.cuda}  ",
+        info = (f"   driver {s.driver}" if s.driver else "") + (f"  CUDA {s.cuda}" if s.cuda else "")
+        head = Text.assemble((name, "bold"), info + "  ",
                              (nv.driver_model if nv else "", "bold yellow"), f"  {nv.pci_bus if nv else ''}")
         if self.paused:
             head.append("   [PAUSED]", style="bold red")
@@ -303,15 +314,16 @@ class GpuTaskManager(App):
             if r.gpu.attributed:  # unknown shares stay in "unattributed" instead of showing as 0
                 by_kind[r.kind] = by_kind.get(r.kind, 0) + r.gpu.dedicated
         attributed = sum(by_kind.values())
-        scale = min(1.0, s.vram_used / attributed) if attributed else 1.0
+        scale = min(1.0, s.vram_used / attributed) if attributed and s.vram_used is not None else 1.0
         order = sorted(by_kind.items(), key=lambda kv: -kv[1])
-        parts = [(v * scale, KIND_STYLE.get(k, "white")) for k, v in order]
-        other = max(s.vram_used - attributed * scale, 0)
+        parts = [(v * scale, KIND_STYLE.get(k, "white")) for k, v in order] if s.vram_used is not None else []
+        other = max(s.vram_used - attributed * scale, 0) if s.vram_used is not None else 0
         parts.append((other, "grey35"))
         width = max(min(self.size.width - 40, 90), 20)
         vram = Text("VRAM ")
         vram.append_text(stacked_bar(parts, s.vram_total, width))
-        vram.append(f" {gb(s.vram_used)} / {gb(s.vram_total)}", style="bold")
+        used_label = gb(s.vram_used) if s.vram_used is not None else "N/A"
+        vram.append(f" {used_label} / {gb(s.vram_total)}", style="bold")
         legend = Text("     ")
         for k, v in order[:7]:
             legend.append("■ ", style=KIND_STYLE.get(k, "white"))
@@ -319,8 +331,9 @@ class GpuTaskManager(App):
         if other > 32 << 20:
             legend.append("■ ", style="grey35")
             legend.append(f"unattributed {gb(other)}  ")
-        legend.append(f"free {gb(max(s.vram_total - s.vram_used, 0))}", style="grey62")
-        if s.shared_used > 64 << 20:
+        if s.vram_used is not None:
+            legend.append(f"free {gb(max(s.vram_total - s.vram_used, 0))}", style="grey62")
+        if s.shared_used is not None and s.shared_used > 64 << 20:
             legend.append(f"   shared(RAM) {gb(s.shared_used)}", style="yellow")
         if scale < 1.0:
             legend.append("   [bar normalized; labels are raw]", style="grey62")
@@ -333,18 +346,22 @@ class GpuTaskManager(App):
             tx = nv.pcie_tx_kbs / 1024 if nv.pcie_tx_kbs is not None else None
             pstate = f"P{nv.pstate}" if nv.pstate is not None else "P N/A"
             m = Text()
-            m.append(f"GPU {format_metric(nv.util_gpu, unit='%')}", style=f"bold {self.CHART_COLORS['GPU']}")
+            label = "AMD gfx" if nv.source.startswith("AMD ") else "GPU"
+            m.append(f"{label} {format_metric(nv.util_gpu, unit='%')}", style=f"bold {self.CHART_COLORS['GPU']}")
             m.append(f"  Mem activity {format_metric(nv.util_mem, unit='%')}", style=self.CHART_COLORS["Mem activity"])
             m.append(f"  PCIe↓{format_metric(rx, '.0f'):>5} ↑{format_metric(tx, '.0f'):>4} MB/s")
             if nv.enc or nv.dec:
                 m.append(f"  enc {format_metric(nv.enc, unit='%')} dec {format_metric(nv.dec, unit='%')}")
             lines.append(m)
+            clock_label = (f"gfx {format_metric(nv.gfx_clock)} MHz" if nv.source.startswith("AMD ") else
+                           f"SM {format_metric(nv.sm_clock)}/{format_metric(nv.sm_clock_max)} MHz")
+            power_kind = f" {nv.power_kind}" if nv.power_kind else ""
             st = Text(f"{format_metric(nv.temp, unit='°C')}  {format_metric(nv.power_w, '.0f')}/"
-                      f"{format_metric(nv.power_limit_w, '.0f')} W  {pstate}  "
-                      f"SM {format_metric(nv.sm_clock)}/{format_metric(nv.sm_clock_max)} MHz  "
+                      f"{format_metric(nv.power_limit_w, '.0f')} W{power_kind}  {pstate}  "
+                      f"{clock_label}  "
                       f"mem {format_metric(nv.mem_clock)} MHz  video {format_metric(nv.video_clock)} MHz  "
                       f"PCIe gen{format_metric(nv.pcie_gen)} x{format_metric(nv.pcie_width)}  "
-                      f"CC {nv.compute_cap or 'N/A'}", style="grey70")
+                      + (f"CC {nv.compute_cap or 'N/A'}" if nv.source == "NVML" else nv.source), style="grey70")
             if nv.throttle:
                 st.append("  throttle: " + ",".join(nv.throttle), style="yellow")
             lines.append(st)
@@ -389,7 +406,10 @@ class GpuTaskManager(App):
         for index in indices:
             values, scale, unit, style = self.chart_series(index, self.snap.nv)
             current = values[-1] if values else None
-            cell = Text(f"{self.CHARTS[index]:<12} ", style=style)
+            name = self.CHARTS[index]
+            if getattr(self, "_amd_chart_labels", False) and name == "SM clock":
+                name = "GFX clock"
+            cell = Text(f"{name:<12} ", style=style)
             cell.append(f"{format_metric(current, '.0f', unit):>8} ", style="bold")
             cell.append(spark(values, max(1, cell_width - 22), scale))
             cells.append(cell)
@@ -400,7 +420,7 @@ class GpuTaskManager(App):
         _, clock_scale, _, _ = self.chart_series(self.CHARTS.index("SM clock"), self.snap.nv)
         self.query_one("#chart-note", Static).update(
             f"Recent samples · blank = no reading · power 0–{power_scale:.0f} W · "
-            f"SM clock 0–{clock_scale:.0f} MHz"
+            f"{'GFX' if getattr(self, '_amd_chart_labels', False) else 'SM'} clock 0–{clock_scale:.0f} MHz"
         )
 
     def on_resize(self) -> None:
@@ -441,6 +461,10 @@ class GpuTaskManager(App):
             spill = Text(gb(r.gpu.shared) if wddm and r.gpu.shared >= 1 << 20 else "", justify="right",
                          style="bold red" if r.gpu.shared >= 256 << 20 and r.kind in ("LLM", "AI") else "yellow")
             paged = Text(gb(r.gpu.paged_out) if wddm and r.gpu.paged_out >= 1 << 20 else "", justify="right", style="grey62")
+            if wddm and "shared" not in r.gpu.available:
+                spill = Text("n/a", justify="right", style="grey62")
+            if wddm and not r.gpu.paged_available:
+                paged = Text("n/a", justify="right", style="grey62")
             t.add_row(
                 Text(r.pid_label, justify="right", style="grey62" if r.host else ""),
                 Text(r.name),
@@ -477,8 +501,8 @@ class GpuTaskManager(App):
         wddm = has_wddm_counters(s, r)
         engines = " ".join(f"{k} {v:.0f}%" for k, v in e.items() if v >= 0.5) or "idle"
         hdr = Text.assemble(("VRAM ", "bold"), (vram_label(r.gpu), "bold"), "   spill(RAM) ",
-                            (gb(r.gpu.shared) if wddm else "n/a", "bold red" if r.gpu.shared > 256 << 20 else ""),
-                            "   paged(est) ", gb(r.gpu.paged_out) if wddm else "n/a",
+                            (gb(r.gpu.shared) if wddm and "shared" in r.gpu.available else "n/a", "bold red" if r.gpu.shared > 256 << 20 else ""),
+                            "   paged(est) ", gb(r.gpu.paged_out) if wddm and r.gpu.paged_available else "n/a",
                             "   engines ", engines if has_engine_counters(s, r) else "n/a")
         if r.detail.runtimes:
             hdr.append("   runtime ", style="grey62")

@@ -2,42 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from .telemetry import DeviceTelemetry as NvDevice
 
 try:
     import pynvml as N
 except ImportError:  # pragma: no cover
     N = None
-
-
-@dataclass
-class NvDevice:
-    index: int
-    name: str = "?"
-    pci_bus: str = ""
-    driver_model: str = ""  # WDDM / TCC / MCDM
-    mem_total: int = 0
-    mem_used: int = 0
-    mem_reserved: int = 0
-    util_gpu: float | None = None  # % of time a kernel was running
-    util_mem: float | None = None  # % of time device memory was being read/written (bandwidth pressure)
-    enc: float | None = None
-    dec: float | None = None
-    temp: int | None = None
-    power_w: float | None = None
-    power_limit_w: float | None = None
-    fan: int | None = None
-    pstate: int | None = None
-    sm_clock: int | None = None
-    sm_clock_max: int | None = None
-    mem_clock: int | None = None
-    video_clock: int | None = None
-    pcie_rx_kbs: int | None = None  # host -> GPU
-    pcie_tx_kbs: int | None = None  # GPU -> host
-    pcie_gen: int | None = None
-    pcie_width: int | None = None
-    throttle: list[str] = field(default_factory=list)
-    compute_cap: str = ""
 
 
 def format_metric(value: float | int | None, spec: str = "", unit: str = "") -> str:

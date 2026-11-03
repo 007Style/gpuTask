@@ -21,8 +21,8 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 MACHINES = {"x64": 0x8664, "arm64": 0xAA64}  # PE machine
 ELF_MACHINES = {"x64": 0x3E, "arm64": 0xB7}  # ELF e_machine
-# Provided by Windows or the installed NVIDIA driver, never by the portable app.
-FORBIDDEN = ("nvml.dll", "nvcuda.dll", "dxgi.dll", "pdh.dll", "libnvidia-ml.so", "libcuda.so", "libdxcore.so")
+# Provided by Windows or the installed GPU driver, never by the portable app.
+FORBIDDEN = ("nvml.dll", "nvcuda.dll", "atiadlxx.dll", "amd_smi.dll", "libamd_smi.so", "dxgi.dll", "pdh.dll", "libnvidia-ml.so", "libcuda.so", "libdxcore.so")
 PLATFORMS = {"win-amd64": ("windows", "x64"), "win-arm64": ("windows", "arm64"),
              "linux-x86_64": ("linux", "x64"), "linux-aarch64": ("linux", "arm64")}
 
@@ -175,7 +175,7 @@ def add_notices(bundle: Path, system: str = "windows") -> None:
         f"PyInstaller bootloader: see licenses{sep}pyinstaller (including its exception).\n"
         f"NVIDIA Python bindings: see licenses{sep}nvidia-ml-py.\n"
         f"Runtime package metadata and license texts are included in _internal{sep}*.dist-info.\n"
-        "NVIDIA libraries are provided by the installed driver, system libraries by the operating system.\n",
+        "GPU libraries are provided by the installed driver, system libraries by the operating system.\n",
         encoding="utf-8",
     )
 
@@ -232,7 +232,7 @@ def build(output: Path, arch: str, tag: str | None = None) -> Path:
             "  .\\gputaskman.exe --once\n"
             "  .\\gputaskman.exe --json\n\n"
             "Press q to quit the interactive display.\n"
-            "Requires Windows and an NVIDIA GPU with a current WDDM driver.\n"
+            "Requires Windows and an NVIDIA or AMD GPU with a current WDDM driver.\n"
             "No Python, uv, CUDA Toolkit, models, or administrator session is required.\n"
             "This build is unsigned. No drivers or inference servers are bundled.\n"
             "Snapshots can contain local paths and model names; redact before sharing.\n\n"

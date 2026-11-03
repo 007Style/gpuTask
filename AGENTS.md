@@ -121,5 +121,6 @@ run builds artifacts without publishing.
 ## Known limits
 
 Validated live: Windows 11 with an RTX 4080 SUPER (WDDM, plus WSL2), a Linux container with an
-RTX 3060 Ti, and macOS 26.3.1 on an M4 Mac mini (Metal; own-user processes, not run as root). Not yet validated on hardware: bare-metal Linux, multi-GPU systems, and GPU-backed
-WinML on Copilot+ PCs. Planned work is listed under **Next** in the README.
+RTX 3060 Ti, and macOS 26.3.1 on an M4 Mac mini (Metal; own-user processes, not run as root).
+Not yet validated on hardware: bare-metal Linux, multi-GPU systems, and GPU-backed WinML on
+Copilot+ PCs. Planned work is listed under **Next** in the README.

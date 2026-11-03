@@ -35,7 +35,7 @@ def has_wddm_counters(s: Snapshot, row: ProcRow) -> bool:
 
 
 def has_engine_counters(s: Snapshot, row: ProcRow) -> bool:
-    return s.backend != "wsl" or row.origin == "windows"
+    return (s.backend != "wsl" or row.origin == "windows") and "engine" in row.gpu.available
 
 
 def vram_label(g: ProcGpu) -> str:
@@ -72,10 +72,10 @@ def to_dict(s: Snapshot) -> dict:
             "pid": p.pid, "host": p.origin if p.host else None, "name": p.name, "kind": p.kind, "runtimes": p.detail.runtimes,
             "vram_attributed": p.gpu.attributed, "vram_inferred_bytes": p.gpu.inferred,
             "vram_inferred_by": p.gpu.inferred_by or None,
-            "vram_bytes": int(p.gpu.dedicated) if p.gpu.attributed else None,
-            "shared_bytes": int(p.gpu.shared) if wddm else None,
-            "committed_bytes": int(p.gpu.committed) if wddm else None,
-            "paged_out_bytes": int(p.gpu.paged_out) if wddm else None,
+            "vram_bytes": int(p.gpu.dedicated) if p.gpu.attributed and "dedicated" in p.gpu.available else None,
+            "shared_bytes": int(p.gpu.shared) if wddm and "shared" in p.gpu.available else None,
+            "committed_bytes": int(p.gpu.committed) if wddm and "committed" in p.gpu.available else None,
+            "paged_out_bytes": int(p.gpu.paged_out) if wddm and p.gpu.paged_available else None,
             "gpu_pct": round(p.gpu.gpu_pct, 1) if engines else None,
             "engines": {k: round(v, 1) for k, v in p.gpu.engines.items() if v} if engines else None,
             "ports": p.detail.ports, "inside": p.inside,
@@ -103,6 +103,7 @@ def to_dict(s: Snapshot) -> dict:
         procs.append(item)
     return {
         "taken": s.taken, "gpu": s.adapter.name if s.adapter else None, "driver": s.driver, "cuda": s.cuda,
+        "adapter": dataclasses.asdict(s.adapter) if s.adapter else None,
         "vram_total": s.vram_total, "vram_used": s.vram_used, "shared_used": s.shared_used,
         "attributed": s.attributed, "backend": s.backend, "host_status": s.host_status or None,
         "wsl_split": s.wsl_split or None, "device": nv, "processes": procs,
@@ -114,25 +115,37 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
     nv = s.nv
     name = s.adapter.name if s.adapter else "GPU"
     if s.backend == "metal":
+        used = gb(s.vram_used) if s.vram_used is not None else "N/A"
         out.append(f"{name}  {s.driver}  Metal")
-        out.append(f"GPU memory {gb(s.vram_used)} allocated / {gb(s.vram_total)} unified")
+        out.append(f"GPU memory {used} allocated / {gb(s.vram_total)} unified")
         out.append(METAL_NOTE)
         if nv:
             out.append(f"GPU {format_metric(nv.util_gpu, unit='%')}")
     else:
-        out.append(f"{name}  driver {s.driver}  CUDA {s.cuda}  {nv.driver_model if nv else ''}")
-        shared = f"   shared (in system RAM) {gb(s.shared_used)}" if s.backend == "wddm" or s.host_data else ""
-        out.append(f"VRAM {gb(s.vram_used)} / {gb(s.vram_total)}{shared}")
+        info = f"  driver {s.driver}" if s.driver else ""
+        if s.cuda:
+            info += f"  CUDA {s.cuda}"
+        out.append(f"{name}{info}  {nv.driver_model if nv else ''}")
+        used = gb(s.vram_used) if s.vram_used is not None else "N/A"
+        shared = gb(s.shared_used) if s.shared_used is not None else "N/A"
+        memory = f"VRAM {used} / {gb(s.vram_total)}"
+        if s.backend == "wddm" or s.host_data:
+            memory += f"   shared (in system RAM) {shared}"
+        out.append(memory)
     if s.backend == "wsl":
         out.append(wsl_note(s))
     if nv and s.backend != "metal":
         rx = nv.pcie_rx_kbs / 1024 if nv.pcie_rx_kbs is not None else None
         tx = nv.pcie_tx_kbs / 1024 if nv.pcie_tx_kbs is not None else None
         pstate = f"P{nv.pstate}" if nv.pstate is not None else "P N/A"
-        out.append(f"GPU {format_metric(nv.util_gpu, unit='%')}  mem-bandwidth {format_metric(nv.util_mem, unit='%')}  "
+        label = "AMD gfx" if nv.source.startswith("AMD ") else "GPU"
+        clock = (f"gfx {format_metric(nv.gfx_clock)}" if nv.source.startswith("AMD ") else
+                 f"SM {format_metric(nv.sm_clock)}")
+        power_kind = f" ({nv.power_kind})" if nv.power_kind else ""
+        out.append(f"{label} {format_metric(nv.util_gpu, unit='%')}  mem-bandwidth {format_metric(nv.util_mem, unit='%')}  "
                    f"{format_metric(nv.temp, unit='C')}  {format_metric(nv.power_w, '.0f')}/"
-                   f"{format_metric(nv.power_limit_w, '.0f')} W  {pstate}  "
-                   f"SM {format_metric(nv.sm_clock)} MHz  "
+                   f"{format_metric(nv.power_limit_w, '.0f')} W{power_kind}  {pstate}  "
+                   f"{clock} MHz  "
                    f"video {format_metric(nv.video_clock)} MHz  "
                    f"PCIe rx {format_metric(rx, '.0f')} MB/s "
                    f"tx {format_metric(tx, '.0f')} MB/s")
@@ -144,6 +157,10 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
         wddm = has_wddm_counters(s, p)
         spill = gb(p.gpu.shared) if wddm and p.gpu.shared >= 1 << 20 else ""
         paged = gb(p.gpu.paged_out) if wddm and p.gpu.paged_out >= 1 << 20 else ""
+        if wddm and "shared" not in p.gpu.available:
+            spill = "N/A"
+        if wddm and not p.gpu.paged_available:
+            paged = "N/A"
         pid = p.pid_label
         pct = f"{p.gpu.gpu_pct:.0f}" if has_engine_counters(s, p) else "n/a"
         out.append(f"{pid:>{w}}  {p.name[:24]:<24} {p.kind:<10} {p.runtime[:24]:<24} {vram_label(p.gpu):>9} {spill:>8} "

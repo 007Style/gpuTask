@@ -169,7 +169,7 @@ def parse_line(line: str, now: float | None = None) -> HostSample | None:
             if m:
                 a = adapters[luid_key(m[1], m[2])]
                 attr = _ADAPTER_FIELDS[counter]
-                setattr(a, attr, getattr(a, attr) + value)
+                setattr(a, attr, (getattr(a, attr) or 0.0) + value)
     for pid, name in (data.get("n") or {}).items():
         try:
             sample.names[int(pid)] = str(name)
@@ -180,12 +180,15 @@ def parse_line(line: str, now: float | None = None) -> HostSample | None:
     return sample
 
 
-def match_adapter(sample: HostSample, device_used: float) -> int | None:
+def match_adapter(sample: HostSample, device_used: float | None) -> int | None:
     """WSL's adapter LUIDs differ from the host's, so pair the host adapter whose dedicated usage matches
     NVML's device-wide usage. Ambiguous or distant matches return None: no host data beats wrong data."""
     if not device_used or not sample.adapters:
         return None
-    ranked = sorted(sample.adapters.items(), key=lambda kv: abs(kv[1].dedicated - device_used))
+    ranked = sorted(((luid, a) for luid, a in sample.adapters.items() if a.dedicated is not None),
+                    key=lambda kv: abs(kv[1].dedicated - device_used))
+    if not ranked:
+        return None
     luid, best = ranked[0]
     tolerance = max(512 << 20, 0.15 * device_used)
     if abs(best.dedicated - device_used) > tolerance:

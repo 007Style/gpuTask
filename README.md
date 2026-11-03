@@ -2,8 +2,8 @@
 
 **An `htop` for what's inside your GPU, not just how full it is.**
 
-Windows + NVIDIA, with Linux and WSL support (see [Linux and WSL](#linux-and-wsl)) and macOS on Apple
-Silicon (see [macOS](#macos-apple-silicon)). A terminal UI
+Windows + NVIDIA/AMD, with NVIDIA support on Linux and WSL (see [Linux and WSL](#linux-and-wsl)) and
+macOS on Apple Silicon (see [macOS](#macos-apple-silicon)). A terminal UI
 that connects per-process GPU memory and engine activity with loaded runtimes, model files, and
 LLM buffer breakdowns.
 
@@ -38,17 +38,22 @@ or PowerShell in the extracted folder:
 .\gputaskman.exe --json
 ```
 
-No Python, uv, CUDA Toolkit, model download, or installation is needed. An NVIDIA GPU with a
-current Windows WDDM driver is still required. Builds are currently **unsigned**; code signing
+No Python, uv, CUDA Toolkit, model download, or installation is needed. A supported GPU with a
+current Windows WDDM driver is required. Builds are currently **unsigned**; code signing
 and an installer are not part of this initial distribution. Each ZIP includes licenses and a
 `.zip.sha256` companion file is published for integrity checks.
 
 ## Clone and run
 
-Use **64-bit Windows 10/11**, an **NVIDIA GPU with a current WDDM driver**, and a terminal
+Use **64-bit Windows 10/11**, an **NVIDIA or AMD GPU with a current WDDM driver**, and a terminal
 (Windows Terminal is recommended). Live workload checks have included an RTX 4080 SUPER and an
 RTX Spark N1X on Windows ARM64. CUDA workloads are supported on ARM64 with a compatible NVIDIA
 driver and ARM64 CUDA runtime.
+
+AMD live check: Radeon 860M Graphics on Windows 11 Enterprise build 26300, AMD driver 32.0.22050.1003.
+During desktop/browser activity, WDDM reported per-process VRAM and AMD ADL reported GPU utilization,
+clocks, and ASIC power; temperature, memory activity, and PCIe readings were unavailable. Vulkan/ROCm
+workloads were not tested on this machine.
 
 Install [Git for Windows](https://git-scm.com/downloads/win) and
 [uv](https://docs.astral.sh/uv/getting-started/installation/) if needed. With WinGet:
@@ -69,7 +74,7 @@ uv run --locked gputaskman
 **That's it.** uv obtains the pinned Python version if needed, creates `.venv`, and installs
 the locked dependencies. The first run needs internet access. There is no CUDA Toolkit,
 Visual Studio, administrator session, API key, or model download required to monitor the GPU.
-NVML ships with the NVIDIA driver.
+NVML ships with the NVIDIA driver; AMD ADL is supplied by supported AMD Windows drivers.
 
 Already have Python 3.11+ and prefer pip?
 
@@ -241,7 +246,7 @@ for a privacy consent prompt.
 - **Device view:** VRAM usage, GPU activity, memory activity, PCIe traffic, temperature, power,
   video-engine clock, and responsive history charts with an all-charts or single-metric view.
 - **Process view:** local GPU memory, GPU-accessible system RAM, estimated non-resident commit,
-  engine activity, and detected runtimes such as CUDA, Vulkan, Direct3D, ggml and ONNX Runtime.
+  engine activity, and detected runtimes such as CUDA, HIP, Vulkan, Direct3D, ggml and ONNX Runtime.
 - **Model inspector:** which model each process holds (LLM, decision, embedding, speech, or diffusion), how
   it was identified, architecture, quantization, layer count, weights, estimated KV cost, and
   buffer sizes from compatible load logs.
@@ -291,28 +296,45 @@ uv run --locked gputaskman --help
 | `q` | Quit |
 
 A wide terminal (roughly 140 columns or more) makes the full table easier to read.
-All eight history charts are shown by default: GPU, SM clock, VRAM, memory activity,
+All eight history charts are shown by default: GPU, SM clock (GFX clock on AMD), VRAM, memory activity,
 temperature, power, encoder, and decoder. They stack in narrow terminals and share rows as
 the window widens. Click the **Charts** dropdown to focus on one metric or return to **All charts**.
 A blank sample means no reading; zero is drawn at the baseline. Percentages use a 0–100%
-scale, temperature uses 0–120°C, and the power and SM clock scales are displayed below the charts.
+scale, temperature uses 0–120°C, and the power and clock scales are displayed below the charts.
 The dashboard and inspector scroll independently in short terminals so the process list stays usable.
 Model/runtime discovery is throttled, so newly loaded models may take about 15 seconds to appear.
 
-`--gpu N` selects a detected NVIDIA graphics adapter, ordered by dedicated memory; an out-of-range
+`--list-gpus` lists selectable hardware adapters with their vendor and LUID. `--gpu N` selects
+one of these adapters: NVIDIA adapters are listed first, followed by other vendors, with each
+group ordered by dedicated memory. An out-of-range
 index is rejected rather than silently selecting another device. Compute-only devices such as an
-NPU are not graphics adapters. **Single-NVIDIA-GPU systems are the validated configuration**.
-On multi-GPU systems, adapter names may be ambiguous, DXGI and NVML ordering may differ, and buffer
-logs can span devices; cross-device attribution is not yet reliable.
+NPU are not graphics adapters. AMD and NVIDIA hardware coverage is described below; configurations
+with multiple GPUs and mixed vendors need further validation.
+Device telemetry is matched to WDDM adapters by PCI location, not display name or enumeration order.
+If a unique match cannot be established, telemetry is unavailable; buffer logs can still span devices,
+so model-buffer attribution across GPUs is not yet reliable. This conservative matching also applies
+to NVIDIA and may suppress telemetry when Windows does not expose a usable PCI address.
+
+AMD adapters can be selected and use the existing Windows GPU process counters; HIP runtime DLLs
+are recognized as runtime evidence. On supported drivers, the AMD Display Library supplied by the
+Windows driver can provide graphics activity, clocks, edge temperature, board or ASIC power, fan
+and PCIe lane count. An optional AMD SMI Python installation is a fallback and may provide graphics
+activity, edge temperature and socket power. Both require a PCI match to the selected WDDM adapter.
+The SMI library and its native dependencies must be available to the Python environment; it is not
+bundled in the portable build. The RX 9060 XT HIP workload and ADL telemetry have been observed on
+this machine; AMD SMI telemetry and Vulkan workloads remain unvalidated.
+A loaded DLL does not prove GPU execution.
 
 Unavailable utilization, temperature, power, clock and PCIe readings are displayed as `N/A` in
 text and the TUI and as `null` in JSON. For example, a missing NVML power limit means that the
 driver did not expose that reading; it does not by itself indicate a hardware fault.
+Missing per-process memory or engine samples likewise show `N/A`/`null`; the paged estimate is
+unavailable when any of its input counters is missing.
 
 ## How can it know what's inside?
 
 It combines evidence rather than reading arbitrary GPU memory. Windows' graphics kernel supplies
-per-process memory and engine counters, while NVML supplies device metrics. Process DLLs suggest
+per-process memory and engine counters, while NVML or AMD ADL/SMI supplies device metrics. Process DLLs suggest
 the runtime, and mapped files or command-line arguments identify candidate models. GGUF metadata
 and tensor offsets let it estimate weights and KV-cache costs; compatible runtime logs and local
 server APIs add allocated buffer sizes and live state. That can explain a llama.cpp process well,
@@ -320,7 +342,7 @@ but a runtime DLL or filename alone does not prove which allocation contains whi
 
 | Question | Evidence | Confidence / limitation |
 |---|---|---|
-| How full and busy is the card? | WDDM adapter counters and NVML | Measured; driver support varies by metric |
+| How full and busy is the card? | WDDM adapter counters and NVML or AMD ADL/SMI | Measured; driver support varies by metric |
 | Which process uses GPU memory? | WDDM process counters; NVML on Linux | Measured accounting, not a resource ownership graph |
 | Which WSL process uses GPU memory? | Windows host counters for `vmwp.exe`, matched to Linux processes | Exact VM total; per-process owner inferred (`*`) or guessed (`?`) |
 | Which engines are active? | WDDM engine counters | CUDA can appear on the **3D** engine |
@@ -506,6 +528,7 @@ file paths, but model and process names still require review.
 | Symptom | What to check |
 |---|---|
 | `uv` or `git` is not recognized | Install the prerequisites, then open a new terminal |
+| Empty or incomplete GPU readings | Check the GPU driver and WDDM 2.0+ support in `dxdiag`; use a normal local desktop session |
 | "supports Windows and Linux/WSL only" | macOS is not supported |
 | WSL: `Windows host counters: off (WSL interop is disabled)` | Enable `[interop]` in `/etc/wsl.conf`, then `wsl --shutdown`; or accept device-wide numbers |
 | WSL: `starting` for a few seconds | The first Windows counter sample takes about 2.5 s |
@@ -513,7 +536,6 @@ file paths, but model and process names still require review.
 | WSL: Linux rows show `?` | Processes were running before gputaskman started; they become `*` with evidence (see the matching table) |
 | Linux: a GPU process is missing | Processes owned by other users need `sudo`; Docker and other WSL distros are not visible from this one |
 | Linux container: `H:<pid>` rows | GPU processes outside this container's PID namespace (host or other containers); NVML sees them, the container cannot name them |
-| Empty or incomplete GPU readings | Check the NVIDIA driver and WDDM 2.0+ support in `dxdiag`; use a normal local desktop session |
 | Missing DLLs or model details | Protected processes may deny inspection; basic counters can still work without elevation |
 | No exact LLM breakdown | Enable compatible buffer logging, or use the GGUF estimate; API/log access is optional |
 | The screen looks cramped | Widen the terminal or use `--once` / `--json` |
@@ -550,7 +572,7 @@ executable bit. The builder refuses to package NVIDIA driver libraries (`libnvid
 
 The builder verifies the interpreter and executable architectures, includes Textual resources
 and dependency licenses, and writes the complete portable ZIP and SHA-256 file to `dist`.
-It does not bundle Windows/NVIDIA DLLs, inference servers, or models. Keep uv for development;
+It does not bundle Windows or GPU driver DLLs, inference servers, or models. Keep uv for development;
 the executable ZIP is for running the monitor without a Python environment.
 
 The **Portable release** GitHub Actions workflow builds on `windows-2022` (x64), `windows-11-arm`
@@ -578,6 +600,7 @@ downloads are bundled in this repository.
 | `wslhost.py` | WSL: interop check, Windows host counter stream, adapter pairing, context matching |
 | `macos.py` | macOS backend: IOKit device stats and per-process GPU time, `footprint` GPU memory poller, libproc memory maps |
 | `nvml.py` | NVIDIA device readings |
+| `adl.py`, `amdsmi.py` | Optional AMD device readings |
 | `procinfo.py` | Runtime, mapped-file, and process discovery |
 | `stores.py` | Friendly names from Ollama, LM Studio, and Hugging Face model stores |
 | `gguf.py` | Model metadata, kind, and size estimates |

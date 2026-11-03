@@ -5,7 +5,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from gputaskman import linux
-from gputaskman.collector import ProcRow, Snapshot
+from gputaskman.collector import ProcRow, Snapshot, select_nv_device
+from gputaskman.dxgi import Adapter
+from gputaskman.nvml import NvDevice
 from gputaskman.gguf import GgufInfo
 from gputaskman.llm import LlmView, build_view
 from gputaskman.pdh import ProcGpu
@@ -67,6 +69,15 @@ KEY = linux.pci_key("00000000:01:00.0")
 
 
 class LinuxLibraryTests(unittest.TestCase):
+    @patch("gputaskman.collector.sys.platform", "linux")
+    def test_nvml_device_matches_linux_pci_key(self):
+        gpu = Adapter(KEY, "NVIDIA", 0x10DE, 24 * GiB, 0, False)
+        device = NvDevice(index=1, pci_bus="00000000:01:00.0")
+        other = NvDevice(index=0, pci_bus="00000000:02:00.0")
+        self.assertIs(select_nv_device(gpu, [other, device], 0), device)
+        self.assertIsNone(select_nv_device(gpu, [other], 0))
+        self.assertIsNone(select_nv_device(gpu, [device, device], 0))
+
     def test_versioned_shared_objects_are_libraries(self):
         self.assertEqual(_lib_name("libcudart.so.12"), "libcudart.so")
         self.assertEqual(_lib_name("libcuda.so.1.1"), "libcuda.so")

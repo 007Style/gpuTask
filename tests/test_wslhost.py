@@ -65,6 +65,10 @@ class MatchTests(unittest.TestCase):
     def test_matches_adapter_by_device_usage(self):
         self.assertEqual(match_adapter(self.sample(5.1 * GiB, 0), 5.3 * GiB), 1)
 
+    def test_ignores_adapters_without_dedicated_counters(self):
+        self.assertEqual(match_adapter(self.sample(None, 5 * GiB), 5 * GiB), 2)
+        self.assertIsNone(match_adapter(self.sample(None), 5 * GiB))
+
     def test_refuses_distant_or_ambiguous_matches(self):
         self.assertIsNone(match_adapter(self.sample(1 * GiB), 5 * GiB))
         self.assertIsNone(match_adapter(self.sample(5.0 * GiB, 5.1 * GiB), 5.05 * GiB))
@@ -379,7 +383,7 @@ class HostRowTests(unittest.TestCase):
         vm = rows["w24820"]
         self.assertEqual((vm.name, vm.kind, vm.gpu.dedicated), ("WSL VM (vmwp.exe)", "wsl-vm", 2.4 * GiB))
         self.assertEqual((rows["w2744"].name, rows["w2744"].kind), ("dwm.exe", "compositor"))
-        self.assertEqual(snap.shared_used, 0)
+        self.assertIsNone(snap.shared_used)  # sample has no adapter shared-memory counter
 
         text = to_text(snap)
         self.assertIn("W:24820", text)

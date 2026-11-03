@@ -13,6 +13,7 @@ def main() -> None:
     ap.add_argument("--once", action="store_true", help="print one snapshot and exit (no TUI)")
     ap.add_argument("--json", action="store_true", help="print one JSON snapshot and exit (implies --once)")
     ap.add_argument("--gpu", type=int, default=0, help="GPU index (default 0)")
+    ap.add_argument("--list-gpus", action="store_true", help="list selectable GPU adapters and exit")
     ap.add_argument("--no-host", action="store_true",
                     help="WSL: don't read Windows host GPU counters through interop (WSL VM total, Windows apps)")
     ap.add_argument("-i", "--interval", type=float, default=1.0, help="refresh seconds (default 1)")
@@ -24,6 +25,13 @@ def main() -> None:
 
     if sys.platform not in ("win32", "darwin") and not sys.platform.startswith("linux"):
         sys.exit("gputaskman supports Windows (WDDM), Linux/WSL (NVML) and macOS (Apple Silicon) only.")
+
+    if args.list_gpus:
+        from .collector import enumerate_adapters, ordered_adapters
+
+        for i, adapter in enumerate(ordered_adapters(enumerate_adapters())):
+            print(f"{i}: {adapter.name} ({adapter.vendor}, LUID 0x{adapter.luid & 0xffffffffffffffff:016x})")
+        return
 
     if args.gpu:
         from .collector import enumerate_adapters, select_adapter

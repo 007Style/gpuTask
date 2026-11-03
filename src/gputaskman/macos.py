@@ -280,7 +280,7 @@ class MacCounters:
         else:
             adapters[ADAPTER_KEY].dedicated = float(dev.allocated)
             self.device = NvDevice(index=0, name=dev.model, driver_model="Metal", mem_total=physical_memory(),
-                                   mem_used=dev.allocated, util_gpu=dev.utilization)
+                                   mem_used=dev.allocated, util_gpu=dev.utilization, source="IOKit")
         per_pid = parse_clients(clients)
         elapsed = now - self._last if self._last is not None else None
         targets: list[tuple[float, int, object]] = []

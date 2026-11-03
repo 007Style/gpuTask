@@ -8,8 +8,30 @@ import sys
 import time
 
 
+def diff_main(argv: list[str]) -> None:
+    import json
+
+    ap = argparse.ArgumentParser(prog="gputaskman diff",
+                                 description="Compare two --json snapshots, for example before and after loading a model.")
+    ap.add_argument("before", help="earlier --json snapshot")
+    ap.add_argument("after", help="later --json snapshot")
+    ap.add_argument("--json", action="store_true", help="print the comparison as JSON")
+    args = ap.parse_args(argv)
+
+    from .diff import diff, load, to_text
+
+    try:
+        result = diff(load(args.before), load(args.after))
+    except (OSError, ValueError) as error:
+        ap.error(str(error))
+    print(json.dumps(result, indent=2) if args.json else to_text(result))
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser(prog="gputaskman", description="What's inside your GPU: per-process VRAM, engines, and LLM weights/KV-cache breakdown.")
+    if len(sys.argv) > 1 and sys.argv[1] == "diff":
+        return diff_main(sys.argv[2:])
+    ap = argparse.ArgumentParser(prog="gputaskman", description="What's inside your GPU: per-process VRAM, engines, and LLM weights/KV-cache breakdown.",
+                                 epilog="gputaskman diff BEFORE.json AFTER.json compares two --json snapshots.")
     ap.add_argument("--once", action="store_true", help="print one snapshot and exit (no TUI)")
     ap.add_argument("--json", action="store_true", help="print one JSON snapshot and exit (implies --once)")
     ap.add_argument("--gpu", type=int, default=0, help="GPU index (default 0)")

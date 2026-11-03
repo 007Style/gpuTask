@@ -55,6 +55,7 @@ cli.py ──► Collector.sample()  (collector.py)
             ├─ LLM detail      llm.py: buffer logs, ServerProber (local APIs), build_view()
             └─ app adapters    handy.py (settings + bounded log tail)
          ──► Snapshot ──► app.py (Textual TUI) / report.py (text and JSON)
+cli.py diff ──► diff.py: compares two saved --json snapshots (no collection)
 ```
 
 The backend is chosen at import time in `collector.py`: `BACKEND` is `wddm` on Windows, `nvml` on
@@ -70,7 +71,8 @@ identify everything immediately; the TUI spreads scans across refreshes.
 | Probe a new local server API | `llm.py` `ServerProber` | GET only, short timeouts, the process's own ports |
 | Support an app that reads and closes its model | `handy.py` as the template | Read-only settings plus a bounded, mtime-cached log tail; never read transcription content. Generalize into data-driven adapters once a second app needs one |
 | Add a GPU vendor or backend | `dxgi.py`, `collector.py`, a new module | Pair devices by LUID or PCI bus ID, never by name or index; load vendor DLLs by absolute system path |
-| Add a column or JSON field | `report.py` and `app.py` | Follow the null rules above; update the README tables |
+| Add a column or JSON field | `report.py` and `app.py` | Follow the null rules above; update the README tables. If it is a measured byte count, consider adding it to `diff.py` `MEASURED` |
+| Change snapshot comparison | `diff.py` | Works only on saved `--json` files, never live state. Compare measured fields directly; keep runtime-reported and estimated values in their own sections; an absent row is `not listed`, not zero |
 | Change WSL matching | `wslhost.py` `ContextTracker` | Keep `tests/test_wslhost.py` replays passing; they are measured sequences |
 
 ## Verify
@@ -91,6 +93,7 @@ uv run --locked gputaskman --json
   Windows `.venv`. The project needs Python 3.11+, which uv downloads if the distro's is older.
 - Live checks: run a bounded, known workload (for example a llama-server with a model you have, or
   a fixed-size CUDA allocation), then compare `--json` against Task Manager or `nvidia-smi`.
+  `gputaskman diff before.json after.json` shows exactly which measured bucket moved.
   Record hardware, driver, and results in the PR.
 - Screenshots: `tools/capture_screenshots.py` strips command lines and full paths, but review model
   and process names before publishing.

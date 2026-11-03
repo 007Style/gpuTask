@@ -243,6 +243,7 @@ uv run --locked gtm                     # shorter alias
 uv run --locked gputaskman -i 2         # sample every two seconds
 uv run --locked gputaskman --once       # one text snapshot
 uv run --locked gputaskman --json       # one JSON snapshot; implies --once
+uv run --locked gputaskman diff before.json after.json   # compare two --json snapshots
 uv run --locked gputaskman --no-host    # WSL: don't read Windows host counters through interop
 uv run --locked gputaskman --help
 ```
@@ -293,6 +294,35 @@ text and the TUI and as `null` in JSON. For example, a missing NVML power limit 
 driver did not expose that reading; it does not by itself indicate a hardware fault.
 Missing per-process memory or engine samples likewise show `N/A`/`null`; the paged estimate is
 unavailable when any of its input counters is missing.
+
+### Comparing snapshots
+
+To see which memory bucket actually grew when you load a model or change the context length, save
+a JSON snapshot before and after and compare them:
+
+```powershell
+uv run --locked gputaskman --json > before.json
+# load the model, or restart the server with a different -c, then send it one request
+uv run --locked gputaskman --json > after.json
+uv run --locked gputaskman diff before.json after.json          # add --json for machine-readable output
+```
+
+The device and process tables compare **measured** counters only. Runtime-reported segments
+(llama.cpp buffer logs) and estimates (KV cache from GGUF metadata and `-c`) are listed separately
+under each process and are never added to measured totals. A model file that appears in a process
+is listed as evidence that the process opened or named it, not as GPU growth.
+
+Processes are paired by PID, then by name and listening ports, then by a unique name, because a
+model reload often restarts the server under a new PID. A process missing from one snapshot shows
+`not listed`, not zero: it was not running or used too little GPU to be listed. Processes that
+moved by less than 16 MB are hidden from the text output but included in `--json`.
+
+Take the "after" snapshot once the model has answered one request: CUDA and Vulkan can allocate
+lazily, and allocators keep freed memory cached, so shrinkage may appear late. On an RTX 4080 SUPER
+with Docker Model Runner's llama-server (Vulkan) and gemma-3-270m, changing `-c 4096` to `-c 32768`
+estimated +504 MB of KV cache, but the server's measured dedicated memory grew by only +83 MB.
+Gemma 3 uses sliding-window attention, so the estimate is an upper bound. The comparison makes
+that gap visible instead of hiding it.
 
 ## How can it know what's inside?
 
@@ -566,6 +596,7 @@ downloads are bundled in this repository.
 | `llm.py` | Buffer logs, local server probing, and breakdowns |
 | `collector.py` | Shared snapshot collection |
 | `app.py` / `report.py` / `cli.py` | TUI, text/JSON, and command-line entry points |
+| `diff.py` | Before/after comparison of two `--json` snapshots |
 
 ## Next
 

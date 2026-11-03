@@ -449,6 +449,9 @@ Identification is designed to stay cheap. Measured on one Windows machine:
 | GGUF header, model-store manifests | ms, cached | Once per file / every 60 s |
 | Local API probes | ms, local only | llama-server `/v1/models` only when its model path changes |
 | `psutil.open_files()` | 0.6-2.5 s per process | Never |
+| macOS: `ioreg` device stats + Metal clients | ~10 ms | Every refresh |
+| macOS: memory-map scan (`proc_pidinfo` region walk) | ~4 ms per process | Same policy as the memory-map scan above |
+| macOS: `footprint` GPU memory | ~70 ms per process, background thread | Busy and new processes every ~2 s, idle ones every 30 s (54 runs in 40 s with 27 GPU processes, M4 Mac mini) |
 
 With two llama-servers running, a steady refresh costs roughly 15-30 ms of CPU (about 340 ms before
 process details were cached).

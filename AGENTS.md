@@ -46,9 +46,10 @@ these rules:
 
 ```
 cli.py ──► Collector.sample()  (collector.py)
-            ├─ adapters        dxgi.py (Windows) / linux.enumerate_adapters
-            ├─ counters        pdh.py GpuCounters (Windows PDH) / linux.py LinuxCounters (NVML)
-            ├─ device metrics  nvml.py
+            ├─ adapters        dxgi.py (Windows) / linux.enumerate_adapters / macos.enumerate_adapters
+            ├─ counters        pdh.py GpuCounters (Windows PDH) / linux.py LinuxCounters (NVML) /
+            │                  macos.py MacCounters (IOKit Metal clients + footprint poller)
+            ├─ device metrics  nvml.py (macOS: MacCounters.device from IOKit)
             ├─ WSL host        wslhost.py: HostStream (powershell PDH via interop), ContextTracker
             ├─ processes       procinfo.py: runtime DLLs, mapped files, cmdline, classify()
             ├─ model naming    stores.py (Ollama, LM Studio, Hugging Face), gguf.py (header, kind, sizes)
@@ -58,7 +59,7 @@ cli.py ──► Collector.sample()  (collector.py)
 ```
 
 The backend is chosen at import time in `collector.py`: `BACKEND` is `wddm` on Windows, `nvml` on
-native Linux, and `wsl` under WSL. One-shot output (`--once`, `--json`) uses `scan_budget=None` to
+native Linux, `wsl` under WSL, and `metal` on macOS. One-shot output (`--once`, `--json`) uses `scan_budget=None` to
 identify everything immediately; the TUI spreads scans across refreshes.
 
 ## Where to change things
@@ -82,8 +83,9 @@ uv run --locked gputaskman --once
 uv run --locked gputaskman --json
 ```
 
-- Tests are hardware-independent (mocks and replayed measurements). CI runs them on Windows and
-  Ubuntu with Python 3.11 and 3.13.
+- Tests are hardware-independent (mocks and replayed measurements). CI runs them on Windows, Ubuntu,
+  and macOS with Python 3.11 and 3.13. UI tests that render NVIDIA snapshots pin
+  `gputaskman.app.BACKEND`, so they behave the same on a Mac.
 - A running `.venv\Scripts\gputaskman.exe` locks the script, so `uv run` fails with
   `Access is denied`. Quit the monitor first.
 - Textual UI tests must `await pilot.pause()` before querying widgets.
@@ -118,6 +120,6 @@ run builds artifacts without publishing.
 
 ## Known limits
 
-Validated live: Windows 11 with an RTX 4080 SUPER (WDDM, plus WSL2), and a Linux container with an
-RTX 3060 Ti. Not yet validated on hardware: bare-metal Linux, multi-GPU systems, and GPU-backed
+Validated live: Windows 11 with an RTX 4080 SUPER (WDDM, plus WSL2), a Linux container with an
+RTX 3060 Ti, and macOS 26.3.1 on an M4 Mac mini (Metal; own-user processes, not run as root). Not yet validated on hardware: bare-metal Linux, multi-GPU systems, and GPU-backed
 WinML on Copilot+ PCs. Planned work is listed under **Next** in the README.

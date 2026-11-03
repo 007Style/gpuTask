@@ -49,6 +49,11 @@ Use **64-bit Windows 10/11**, an **NVIDIA or AMD GPU with a current WDDM driver*
 RTX Spark N1X on Windows ARM64. CUDA workloads are supported on ARM64 with a compatible NVIDIA
 driver and ARM64 CUDA runtime.
 
+AMD live check: Radeon 860M Graphics on Windows 11 Enterprise build 26300, AMD driver 32.0.22050.1003.
+During desktop/browser activity, WDDM reported per-process VRAM and AMD ADL reported GPU utilization,
+clocks, and ASIC power; temperature, memory activity, and PCIe readings were unavailable. Vulkan/ROCm
+workloads were not tested on this machine.
+
 Install [Git for Windows](https://git-scm.com/downloads/win) and
 [uv](https://docs.astral.sh/uv/getting-started/installation/) if needed. With WinGet:
 

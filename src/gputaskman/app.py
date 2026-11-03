@@ -317,7 +317,7 @@ class GpuTaskManager(App):
         scale = min(1.0, s.vram_used / attributed) if attributed and s.vram_used is not None else 1.0
         order = sorted(by_kind.items(), key=lambda kv: -kv[1])
         parts = [(v * scale, KIND_STYLE.get(k, "white")) for k, v in order] if s.vram_used is not None else []
-        other = max(s.vram_used - attributed * scale, 0) if s.vram_used is not None and s.attributed is not None else 0
+        other = max(s.vram_used - attributed * scale, 0) if s.vram_used is not None else 0
         parts.append((other, "grey35"))
         width = max(min(self.size.width - 40, 90), 20)
         vram = Text("VRAM ")

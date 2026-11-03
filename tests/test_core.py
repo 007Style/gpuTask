@@ -861,6 +861,20 @@ class UiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("compute 65%", hdr)
                 self.assertIn("spill(RAM) n/a", hdr)
 
+    async def test_unknown_process_memory_preserves_unattributed_adapter_usage(self):
+        s = snapshot()
+        s.procs[0].gpu.dedicated = 2 * GiB
+        unknown = ProcGpu(attributed=False, engines={"3d": 20})
+        unknown.available.clear()
+        s.procs.append(ProcRow(30, "unknown", "app", unknown, ProcDetail(30, "unknown")))
+        with patch.object(GpuTaskManager, "poll"), patch("gputaskman.app.stacked_bar", wraps=stacked_bar) as bar:
+            app = GpuTaskManager()
+            async with app.run_test(size=(180, 42)) as pilot:
+                app.apply(s)
+                await pilot.pause()
+                self.assertIsNone(s.attributed)
+                self.assertTrue(any((6 * GiB, "grey35") in call.args[0] for call in bar.call_args_list))
+
     async def test_eighth_chart_records_sm_clock_with_scale_and_missing_readings(self):
         with patch.object(GpuTaskManager, "poll"):
             app = GpuTaskManager()

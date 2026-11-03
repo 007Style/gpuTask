@@ -6,13 +6,14 @@ import os
 import tempfile
 import time
 import unittest
-from unittest.mock import mock_open, patch
+from unittest.mock import Mock, mock_open, patch
 
 from gputaskman import collector as collector_mod
 from gputaskman import wslhost
 from gputaskman.collector import Collector, ProcRow, Snapshot
+from gputaskman.llm import LlmView
 from gputaskman.pdh import AdapterGpu, ProcGpu
-from gputaskman.procinfo import ProcDetail
+from gputaskman.procinfo import MappedModel, ProcDetail
 from gputaskman.report import to_dict, to_text
 from gputaskman.wslhost import ContextTracker, HostSample, HostStream, match_adapter, parse_line
 
@@ -171,8 +172,8 @@ class TrackerTests(unittest.TestCase):
     def test_a_workload_started_after_us_is_not_taken_for_our_context(self):
         t = self.make()
         h = [("S", 900), ("W", 950)]  # W created its CUDA context between our NVML init and the first sample
-        self.check(self.step(t, [20 / 1024, 0.0], h), {"W": (0.02, "?")})
-        self.check(self.step(t, [5.0, 0.0], h), {"W": (5.0, "?")})
+        self.check(self.step(t, [20 / 1024, 0.0], h), {"W": (0.02, "*")})
+        self.check(self.step(t, [5.0, 0.0], h), {"W": (5.0, "*")})
 
     def test_cache_forgets_a_foreign_context_that_exited(self):
         t = self.make()
@@ -199,10 +200,59 @@ class TrackerTests(unittest.TestCase):
         self.check(self.step(t, [0.0, 0.15], h), {"A": (0.15, "?")})  # A's context isn't there yet
         self.check(self.step(t, [6.0, 0.0, 0.15], h), {"A": (6.0, "*")})
 
-    def test_startup_with_only_this_monitor_teaches_foreign(self):
+    def test_cached_foreign_sizes_only_rank_startup_guesses(self):
         self.step(self.make(), [0.0, 0.15], [("S", 900)])  # only gputaskman holds the GPU: 0.15 is foreign
         t = self.make()  # a later start in the same boot, with a job already running
-        self.check(self.step(t, [0.0, 2.0, 0.15], [("S", 900), ("X", 5)]), {"X": (2.0, "*")})
+        self.check(self.step(t, [0.0, 0.15, 2.0], [("S", 900), ("X", 5)]), {"X": (2.0, "?")})
+        self.check(self.step(t, [0.0, 0.15, 2.5], [("S", 900), ("X", 5)]), {"X": (2.5, "?")})
+
+    def test_foreign_cache_clears_immediately_when_last_foreign_context_exits(self):
+        t = self.make()
+        self.step(t, [0.0, 2.0], [("S", 900)])
+        with open(self.path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["foreign"], [2 * GiB])
+        self.step(t, [0.0], [("S", 900)])
+        self.assertEqual(t.cached_foreign, [])
+        with open(self.path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["foreign"], [])
+        self.check(self.step(self.make(), [0.0, 2.0], [("S", 900), ("X", 5)]), {"X": (2.0, "*")})
+
+    def test_foreign_cache_clears_while_local_workload_remains(self):
+        t = self.make()
+        self.step(t, [0.0, 0.4], [("S", 900)])
+        h = [("S", 900), ("X", 950)]
+        self.step(t, [2.0, 0.0, 0.4], h)
+        self.check(self.step(t, [2.0, 0.0], h), {"X": (2.0, "*")})
+        with open(self.path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["foreign"], [])
+
+    def test_stale_cache_never_takes_a_local_context(self):
+        self.step(self.make(), [0.0, 2.0], [("S", 900)])
+        # The foreign process exits while the monitor is off; a local process reuses that size.
+        self.check(self.step(self.make(), [0.0, 2.0], [("S", 900), ("X", 5)]), {"X": (2.0, "*")})
+
+    def test_first_sample_finds_monitor_zero_instead_of_newest_small_context(self):
+        t = self.make()
+        h = [("S", 900), ("X", 950)]
+        guesses, _ = t.update(RTX, [20 * MiB, 0], h, now=self.clock)
+        self.assertEqual(guesses["S"].bytes, 0)
+        self.assertEqual(guesses["X"].bytes, 20 * MiB)
+        self.check(self.step(t, [5.0, 0.0], h), {"X": (5.0, "*")})
+
+    def test_equal_zero_contexts_never_pin_monitor_ownership(self):
+        t = self.make()
+        h = [("S", 900), ("X", 950)]
+        self.check(self.step(t, [0.0, 0.0], h), {"X": (0.0, "*")})
+        self.assertFalse(any(e.sure for e in t.entries))
+        self.check(self.step(t, [5.0, 0.0], h), {"X": (5.0, "?")})
+        self.assertFalse(any(e.label == "S" and e.value for e in t.entries))
+
+    def test_idle_zero_ambiguity_does_not_pollute_foreign_cache(self):
+        t = self.make()
+        self.step(t, [0.0, 0.15, 0.0], [("S", 900)])
+        self.assertEqual(t.cached_foreign, [0.15 * GiB])
+        self.assertFalse(any(e.label == "S" and e.sure for e in t.entries))
+        self.check(self.step(t, [2.0, 0.0, 0.15, 0.0], [("S", 900), ("X", 950)]), {"X": (2.0, "*")})
 
     def test_a_reused_pid_is_a_new_process(self):
         t = self.make()
@@ -221,12 +271,12 @@ class TrackerTests(unittest.TestCase):
         for _ in range(5):
             self.check(self.step(t, [0.5, 0.0, 2.12, 3.05, 0.0], h), {"D": (0.5, "*"), "C": (2.12, "?"), "B": (3.05, "?")})
 
-    def test_no_holders_teaches_foreign_and_elimination_confirms(self):
+    def test_no_holders_teaches_foreign_without_confirming_future_owners(self):
         self.make().update(RTX, at([0.4]), [], now=self.clock)  # nothing in this distro: 0.4 is foreign
         t = self.make()  # a fresh start in the same boot, with a job already running
-        self.check(self.step(t, [0.0, 2.0, 0.4], [("S", 900), ("X", 5)]), {"X": (2.0, "*")})
+        self.check(self.step(t, [0.0, 0.4, 2.0], [("S", 900), ("X", 5)]), {"X": (2.0, "?")})
         t = self.make(boot="boot-2")  # a new boot knows nothing
-        self.check(self.step(t, [0.0, 2.0, 0.4], [("S", 900), ("X", 5)]), {"X": (2.0, "?")})
+        self.check(self.step(t, [0.0, 0.4, 2.0], [("S", 900), ("X", 5)]), {"X": (0.4, "?")})
 
     def test_context_that_lags_its_process_is_still_pinned(self):
         t = self.make()
@@ -278,8 +328,9 @@ class TrackerTests(unittest.TestCase):
     def test_different_adapter_resets_history(self):
         self.make().update(RTX, at([0.4]), [], now=self.clock)
         t = self.make()
-        self.check(self.step(t, [0.0, 2.0, 0.4], [("S", 900), ("X", 5)]), {"X": (2.0, "*")})
-        guesses, _ = t.update(0x1234, at([0.0, 2.0, 0.4]), [("S", 900), ("X", 5)], now=self.clock + 5)
+        self.check(self.step(t, [0.0, 0.4, 2.0], [("S", 900), ("X", 5)]), {"X": (2.0, "?")})
+        guesses, _ = t.update(0x1234, at([0.0, 0.4, 2.0]), [("S", 900), ("X", 5)], now=self.clock + 5)
+        self.assertEqual(guesses["X"].bytes, 0.4 * GiB)
         self.assertEqual(guesses["X"].confidence, "order")
 
 
@@ -307,7 +358,6 @@ class HostRowTests(unittest.TestCase):
         c._host_restarted = time.time()
         c.tracker = ContextTracker(path=os.path.join(self.tmp.name, "ctx.json"), boot_id="boot", self_pid=os.getpid())
         c._own_start = time.time()
-        c._inferred = {}
         return c
 
     def setUp(self):
@@ -349,11 +399,57 @@ class HostRowTests(unittest.TestCase):
         row = next(r for r in snap.procs if not r.host)
         self.assertEqual((row.gpu.inferred, row.gpu.inferred_by), (3.0 * GiB, "consistent"))
         self.assertFalse(row.gpu.attributed)  # engines are still unknown
+        row.llm = LlmView()
         text = to_text(snap)
         self.assertIn("3.00 GB*", text)
+        self.assertIn("== python3 (2744)  VRAM 3.00 GB*", text)
         self.assertIn("* matched", text)
         data = to_dict(snap)["processes"][1]
         self.assertEqual((data["vram_inferred_bytes"], data["vram_inferred_by"]), (3.0 * GiB, "consistent"))
+        self.assertEqual(snap.attributed, 3 * GiB)  # the Linux child is not added to the VM total again
+
+    def test_current_inferred_vram_sets_first_sample_scan_priority(self):
+        big_pid = Collector.DEEP_TOP_N + 1
+        total = 8 * GiB + Collector.DEEP_TOP_N * MiB
+        busy = line([["local usage", f"pid_24820_{LUID}", v]
+                     for v in [0, 8 * GiB] + [MiB] * Collector.DEEP_TOP_N]
+                    + [["dedicated usage", LUID, total]], {"24820": "vmwp"})
+        c = self.collector(FakeStream(parse_line(busy, now=time.time())))
+        c.adapter, c.adapters, c.gpu_index, c.scan_budget = None, [], 0, None
+        c.host_status = ""
+        c.nvml = Mock(ok=False, driver="", cuda_version="")
+        c.counters = Mock(outside={})
+        c.counters.sample.return_value = (
+            {RTX: {pid: ProcGpu(attributed=False) for pid in range(1, big_pid + 1)}},
+            {RTX: AdapterGpu(dedicated=total)})
+        details = {pid: ProcDetail(pid, "python3", create_time=pid, parents=[])
+                   for pid in range(1, big_pid + 1)}
+        c.inspector = Mock()
+        c.inspector.get.side_effect = details.__getitem__
+        c.inspector.needs_scan.return_value = True
+
+        def scan(d, mem):
+            if d.pid == big_pid:
+                d.models = [MappedModel("large.gguf", 8 * GiB, 0, True, kind="LLM")]
+
+        c.inspector.scan.side_effect = scan
+        c.prober = Mock()
+        c.prober.get.return_value = None
+        with patch.object(collector_mod, "BACKEND", "wsl"), \
+                patch.object(collector_mod, "build_view", return_value=LlmView()) as view:
+            snap = c.sample()
+            self.assertEqual(c.inspector.scan.call_count, Collector.DEEP_TOP_N)
+            self.assertEqual(c.inspector.scan.call_args_list[0].args, (details[big_pid], 8 * GiB))
+            self.assertNotIn(Collector.DEEP_TOP_N, [call.args[0].pid for call in c.inspector.scan.call_args_list])
+            self.assertEqual([r.pid for r in snap.procs[:2]], [24820, big_pid])
+            self.assertEqual(snap.procs[1].kind, "LLM")  # classification follows the scan
+            self.assertEqual(view.call_args.args[1], 8 * GiB)
+            self.assertTrue(view.call_args.kwargs["attributed"])
+            self.assertEqual(snap.attributed, total)
+            c.scan_budget = 0.0
+            c.inspector.scan.reset_mock()
+            c.sample()
+            c.inspector.scan.assert_not_called()
 
     def test_order_guess_is_marked(self):
         # an extra (foreign) context and no history: placement is a guess

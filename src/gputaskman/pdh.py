@@ -72,18 +72,18 @@ class ProcGpu:
     shared: float = 0.0  # bytes resident in shared (system RAM) GPU memory -- "spill" ("Non Local Usage")
     committed: float = 0.0  # all GPU memory this process allocated, resident or not ("Total Committed")
     engines: dict[str, float] = field(default_factory=lambda: defaultdict(float))  # engtype -> util %
-    # False when the OS knows this process uses the GPU but cannot say how much (WSL: the Windows host
-    # charges every Linux process's VRAM to the VM). Numbers are then unknown, not zero.
+    # False when per-process VRAM is unavailable. Native NVML may still report engines independently;
+    # WSL charges every Linux process's VRAM and engine activity to the Windows VM worker.
     attributed: bool = True
     # WSL: VRAM matched from the VM's GPU contexts (see wslhost.ContextTracker). An exact counter value whose
     # owner is inferred; kept apart from `dedicated` so it isn't counted twice next to the WSL VM row.
     inferred: float | None = None
-    inferred_by: str = ""  # "consistent" (only one explanation fits) | "order" (start-order guess)
+    inferred_by: str = ""  # "consistent" (candidates agree on bytes) | "order" (heuristic owner)
 
     @property
-    def shown_vram(self) -> float:
-        """The VRAM figure a row displays: measured, else inferred (WSL), else 0 for sorting."""
-        return self.dedicated if self.attributed else (self.inferred or 0.0)
+    def shown_vram(self) -> float | None:
+        """Measured or inferred bytes for display and priority, not for summing adapter totals."""
+        return self.dedicated if self.attributed else self.inferred
 
     @property
     def paged_out(self) -> float:

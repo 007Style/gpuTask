@@ -7,7 +7,7 @@ from unittest.mock import patch
 from gputaskman import linux
 from gputaskman.collector import ProcRow, Snapshot
 from gputaskman.gguf import GgufInfo
-from gputaskman.llm import build_view
+from gputaskman.llm import LlmView, build_view
 from gputaskman.pdh import ProcGpu
 from gputaskman.procinfo import ProcDetail, _lib_name, _match_runtimes, classify
 from gputaskman.report import to_dict, to_text
@@ -275,7 +275,8 @@ class UnattributedReportTests(unittest.TestCase):
     def test_reports_say_unknown_instead_of_zero(self):
         data = to_dict(self.snapshot())
         self.assertEqual(data["backend"], "wsl")
-        self.assertIsNone(data["processes"][0]["vram_bytes"])
+        for key in ("vram_bytes", "shared_bytes", "committed_bytes", "paged_out_bytes", "gpu_pct", "engines"):
+            self.assertIsNone(data["processes"][0][key], key)
         self.assertFalse(data["processes"][0]["vram_attributed"])
         text = to_text(self.snapshot())
         row = next(line for line in text.splitlines() if "4242" in line)
@@ -305,6 +306,44 @@ class UnattributedReportTests(unittest.TestCase):
                         ProcDetail(p, "python3")) for p, v in ((1, GiB), (2, 5 * GiB), (3, None))]
         key = GpuTaskManager.SORTS[0][1]
         self.assertEqual([r.pid for r in sorted(rows, key=key)], [2, 1, 3])
+
+    def test_native_hidden_vram_does_not_hide_measured_engine_load(self):
+        snap = self.snapshot()
+        snap.backend = "nvml"
+        snap.procs[0].gpu.engines["compute"] = 47
+        row = to_dict(snap)["processes"][0]
+        self.assertIsNone(row["vram_bytes"])
+        self.assertEqual(row["gpu_pct"], 47)
+        self.assertEqual(row["engines"], {"compute": 47})
+        for key in ("shared_bytes", "committed_bytes", "paged_out_bytes"):
+            self.assertIsNone(row[key], key)
+        text = next(line for line in to_text(snap).splitlines() if "4242" in line)
+        self.assertIn("47", text)
+
+    def test_measured_zero_is_not_changed_to_unknown(self):
+        snap = self.snapshot()
+        snap.backend = "nvml"
+        snap.procs[0].gpu.attributed = True
+        row = to_dict(snap)["processes"][0]
+        self.assertEqual(row["vram_bytes"], 0)
+        self.assertEqual(row["gpu_pct"], 0)
+        self.assertEqual(row["engines"], {})
+        self.assertIsNone(row["shared_bytes"])
+        snap.backend = "wsl"
+        snap.procs[0].host, snap.procs[0].origin = True, "windows"
+        row = to_dict(snap)["processes"][0]
+        for key in ("vram_bytes", "shared_bytes", "committed_bytes", "paged_out_bytes", "gpu_pct"):
+            self.assertEqual(row[key], 0, key)
+
+    def test_model_detail_header_uses_inferred_or_unknown_vram(self):
+        for inferred, label in ((None, "n/a"), (0, "0 MB*"), (3 * GiB, "3.00 GB*")):
+            with self.subTest(inferred=inferred):
+                snap = self.snapshot()
+                p = snap.procs[0]
+                p.llm = LlmView()
+                p.gpu.inferred, p.gpu.inferred_by = inferred, "consistent"
+                self.assertIn(f"== python3 (4242)  VRAM {label}", to_text(snap))
+                self.assertIsNone(to_dict(snap)["processes"][0]["vram_bytes"])
 
     def test_empty_wsl_view_explains_itself(self):
         snap = self.snapshot()

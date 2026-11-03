@@ -20,7 +20,7 @@ from textual.worker import get_current_worker
 from .collector import Collector, ProcRow, Snapshot
 from .llm import gb
 from .nvml import NvDevice, format_metric
-from .report import WSL_EMPTY, inferred_note, vram_label, wsl_note
+from .report import WSL_EMPTY, has_engine_counters, has_wddm_counters, inferred_note, vram_label, wsl_note
 
 KIND_STYLE = {
     "LLM": "bold magenta", "decision": "bold orchid", "decision?": "orchid",
@@ -84,7 +84,8 @@ are Linux processes with `/dev/dxg` open and show `n/a` rather than a made-up sh
 interop is enabled, the Windows host's counters are read through `powershell.exe`: **WSL VM**
 (`vmwp.exe`) is then the exact total of Linux GPU memory, and Windows apps appear as `W:<pid>`
 rows. `--no-host` turns this off. Linux rows get their VRAM by matching the VM's GPU contexts
-(newest first) to Linux processes: `*` when only one explanation fits, `?` for a start-order guess.
+(newest first) to Linux processes: `*` when candidates agree on the size, `?` for a heuristic owner.
+Cached foreign sizes only help rank guesses; they never prove ownership across runs.
 
 **Why does nvidia-smi say N/A?** GeForce cards on Windows run in *WDDM* mode: Windows, not the
 NVIDIA driver, owns video memory, so NVML can't attribute it to processes. The Windows counters can.
@@ -175,7 +176,7 @@ class GpuTaskManager(App):
         Binding("p", "pause", "Pause"),
         Binding("question_mark", "help", "Explain"),
     ]
-    SORTS = [("VRAM", lambda r: -r.gpu.shown_vram), ("GPU%", lambda r: -r.gpu.gpu_pct),
+    SORTS = [("VRAM", lambda r: -(r.gpu.shown_vram or 0)), ("GPU%", lambda r: -r.gpu.gpu_pct),
              ("spill", lambda r: -r.gpu.shared), ("paged", lambda r: -r.gpu.paged_out),
              ("name", lambda r: r.name.lower())]
     CHART_COLORS = {
@@ -279,7 +280,7 @@ class GpuTaskManager(App):
                 history.append(None)
         self.hist_vram.append(100 * snap.vram_used / snap.vram_total if snap.vram_total else None)
         if not self._auto_selected:
-            llm = next((r for r in sorted(snap.procs, key=lambda r: -r.gpu.shown_vram) if r.llm), None)
+            llm = next((r for r in sorted(snap.procs, key=self.SORTS[0][1]) if r.llm), None)
             if llm:
                 self.selected_key = llm.key
             self._auto_selected = True
@@ -428,23 +429,28 @@ class GpuTaskManager(App):
         keep = self.selected_key
         t.clear()
 
-        def pct(v: float) -> Text:
+        def pct(v: float | None) -> Text:
+            if v is None:
+                return Text("n/a", justify="right", style="grey62")
             return Text(f"{v:.0f}" if v >= 0.5 else "", justify="right", style="bold" if v >= 20 else "")
 
         for r in rows:
             e = r.gpu.engines
-            spill = Text(gb(r.gpu.shared) if r.gpu.shared >= 1 << 20 else "", justify="right",
+            wddm = has_wddm_counters(s, r)
+            engines = has_engine_counters(s, r)
+            spill = Text(gb(r.gpu.shared) if wddm and r.gpu.shared >= 1 << 20 else "", justify="right",
                          style="bold red" if r.gpu.shared >= 256 << 20 and r.kind in ("LLM", "AI") else "yellow")
-            paged = Text(gb(r.gpu.paged_out) if r.gpu.paged_out >= 1 << 20 else "", justify="right", style="grey62")
+            paged = Text(gb(r.gpu.paged_out) if wddm and r.gpu.paged_out >= 1 << 20 else "", justify="right", style="grey62")
             t.add_row(
                 Text(r.pid_label, justify="right", style="grey62" if r.host else ""),
                 Text(r.name),
                 Text(r.kind, style=KIND_STYLE.get(r.kind, "")),
                 Text(" ".join(r.detail.runtimes[:3]), style="grey70"),
                 Text(vram_label(r.gpu), justify="right", style="bold" if r.gpu.attributed else "grey62"), spill, paged,
-                pct(r.gpu.gpu_pct) if r.gpu.attributed else Text("n/a", justify="right", style="grey62"),
-                pct(e.get("3d", 0) + e.get("compute", 0)), pct(e.get("copy", 0)),
-                pct(e.get("decode", 0) + e.get("encode", 0)),
+                pct(r.gpu.gpu_pct if engines else None),
+                pct(e.get("3d", 0) + e.get("compute", 0) if engines else None),
+                pct(e.get("copy", 0) if engines else None),
+                pct(e.get("decode", 0) + e.get("encode", 0) if engines else None),
                 Text(r.inside, style="magenta" if r.llm else "grey62", overflow="ellipsis", no_wrap=True),
                 key=r.key,
             )
@@ -468,12 +474,12 @@ class GpuTaskManager(App):
         panel.border_title = f"{r.name} ({where}{r.pid}) - {r.kind}"
         out: list = []
         e = r.gpu.engines
-        wddm = s.backend == "wddm" or r.origin == "windows"  # spill and commit counters only exist in WDDM
+        wddm = has_wddm_counters(s, r)
         engines = " ".join(f"{k} {v:.0f}%" for k, v in e.items() if v >= 0.5) or "idle"
         hdr = Text.assemble(("VRAM ", "bold"), (vram_label(r.gpu), "bold"), "   spill(RAM) ",
                             (gb(r.gpu.shared) if wddm else "n/a", "bold red" if r.gpu.shared > 256 << 20 else ""),
                             "   paged(est) ", gb(r.gpu.paged_out) if wddm else "n/a",
-                            "   engines ", engines if r.gpu.attributed else "n/a")
+                            "   engines ", engines if has_engine_counters(s, r) else "n/a")
         if r.detail.runtimes:
             hdr.append("   runtime ", style="grey62")
             hdr.append(" ".join(r.detail.runtimes), style="cyan")
@@ -485,7 +491,7 @@ class GpuTaskManager(App):
                 out.append(Text(inferred_note(r.gpu), style="grey62"))
             elif s.wsl_split:
                 out.append(Text(f"No per-process VRAM: {s.wsl_split}.", style="grey62"))
-        if r.gpu.paged_out >= 64 << 20:
+        if wddm and r.gpu.paged_out >= 64 << 20:
             out.append(Text(f"{gb(r.gpu.paged_out)} of {gb(r.gpu.committed)} committed is not accounted for by local/non-local "
                             "usage. Estimated non-residency, not proof of eviction or disk paging.",
                             style="yellow"))
@@ -501,7 +507,7 @@ class GpuTaskManager(App):
         v = r.llm
         if v:
             width = max(min(self.size.width - 8, 100), 20)
-            total = max(r.gpu.shown_vram, sum(x.bytes for x in v.segments), 1)
+            total = max(r.gpu.shown_vram or 0, sum(x.bytes for x in v.segments), 1)
             out.append(stacked_bar([(x.bytes, SEG_STYLE[x.kind]) for x in v.segments], total, width))
             legend = Text()
             for x in v.segments:

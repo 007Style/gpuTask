@@ -306,7 +306,8 @@ class ContextTracker:
     Contexts are aligned sample to sample (survivors keep their order). A match becomes *sure* only from
     evidence: a new Linux GPU process and a new context appearing together, elimination (as many unsure
     contexts as unsure processes, and just one process), contexts seen at startup while no other Linux process
-    holds the GPU (foreign; cached per WSL boot), or this monitor's own 0-byte context being the newest at startup.
+    holds the GPU, or this monitor's own context being the only 0-byte candidate at startup.
+    Cached foreign sizes help rank guesses but never establish ownership across runs.
     Everything else is an order guess (newest process <-> newest context, foreign assumed oldest),
     recomputed each sample and never used as evidence.
     """
@@ -314,7 +315,6 @@ class ContextTracker:
     PENDING = 5.0  # seconds a new process may take to create its context
     GONE = 5.0  # seconds an exited process's context may linger in the (older) host sample
     TOL_MIN = 64 * MiB
-    SELF_MAX = 1 * MiB  # an NVML-only context (this monitor) holds 0 bytes
     TOL_REL = 0.10
 
     def __init__(self, path: str | None = None, boot_id: str | None = None, self_pid: object = None) -> None:
@@ -400,6 +400,7 @@ class ContextTracker:
             self._reset()
         start = dict(holders)
         first = self.entries is None
+        had_foreign = any(e.label == FOREIGN and e.sure for e in self.entries or [])
         cur = [_Entry(v) for v in contexts]
         fresh: list[_Entry] = []  # contexts that appeared since the previous sample
         if not first:
@@ -446,20 +447,13 @@ class ContextTracker:
                 if e.label is None:
                     e.label, e.sure = FOREIGN, True
         elif first:
-            # Our NVML-only context is 0 bytes and newest at startup, unless another process started after us:
-            # its CUDA context could then be the newest one (and small while it initializes).
-            later = any(t >= start[self.self_pid] for p, t in start.items() if p != self.self_pid) \
-                if self.self_pid in start else True
-            if not later and cur and cur[0].value <= self.SELF_MAX:
-                cur[0].label, cur[0].sure = self.self_pid, True
-            if set(start) == {self.self_pid} and cur and cur[0].label == self.self_pid:
-                for e in cur[1:]:  # nothing else in this distro holds the GPU: the rest is foreign
-                    e.label, e.sure = FOREIGN, True
-            for v in self.cached_foreign:
-                free = [e for e in reversed(cur) if e.label is None and abs(e.value - v) <= self._tol(v)]
-                if free:
-                    best = min(free, key=lambda e: abs(e.value - v))
-                    best.label, best.sure = FOREIGN, True
+            zeros = [e for e in cur if e.value == 0]
+            if self.self_pid in start and len(zeros) == 1:
+                zeros[0].label, zeros[0].sure = self.self_pid, True
+            if set(start) == {self.self_pid} and zeros:
+                for e in cur:
+                    if e.value > 0:  # NVML alone holds no VRAM; other zero-byte owners remain ambiguous
+                        e.label, e.sure = FOREIGN, True
         elif fresh:
             pending = sorted((p for p in start if p not in labeled() and p not in self.initial
                               and now - self.seen[p] <= self.PENDING),
@@ -473,6 +467,10 @@ class ContextTracker:
 
         unsure = sorted((p for p in start if p not in labeled()), key=lambda p: -age(p))
         free = [e for e in cur if e.label is None]
+        if unsure and len(free) > len(unsure):
+            # Cached sizes may outlive their owners: rank guesses, never exclude candidates or pin labels.
+            free.sort(key=lambda e: e.value > 0 and any(
+                v > 0 and abs(e.value - v) <= self._tol(v) for v in self.cached_foreign))
         reason = ""
         if unsure:
             if len(free) < len(unsure):
@@ -492,12 +490,11 @@ class ContextTracker:
                     e.label, e.same = pid, same
 
         self.entries = cur
-        # Foreign labels only come from evidence, so the cache follows them, including down to none: a cached
-        # context that exited must not later claim a local context of the same size.
-        foreign = [e.value for e in cur if e.label == FOREIGN and e.sure]
-        if sorted(foreign) != sorted(self.cached_foreign):
-            self.cached_foreign = foreign
-            self._save()
+        foreign = [e.value for e in cur if e.label == FOREIGN and e.sure and e.value > 0]
+        if not start or set(start) == {self.self_pid} or foreign or had_foreign:
+            if sorted(foreign) != sorted(self.cached_foreign):
+                self.cached_foreign = foreign
+                self._save()
         out = {e.label: ContextGuess(e.value, "consistent" if e.sure or e.same else "order")
                for e in cur if e.label in start}
         return out, reason

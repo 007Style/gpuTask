@@ -171,7 +171,6 @@ class Collector:
         self._host_luid: int | None = None  # host adapter for this GPU, matched once and kept
         self.tracker = ContextTracker(self_pid=os.getpid()) if self.host is not None else None
         self._own_start = time.time()  # our NVML context is created now, not when the process started
-        self._inferred: dict[int, float] = {}  # WSL: last inferred VRAM per Linux PID
         self._host_restarted = time.time()
 
     def _parent_ports(self, pid: int, depth: int = 2) -> list[int]:
@@ -207,32 +206,35 @@ class Collector:
 
         snap.host_status = self.host_status
         live = [(pid, g) for pid, g in procs.items() if _is_live(g)]
-        # WSL Linux rows are ranked by last sample's inferred size, so the deep-scan budget reaches them too
-        live.sort(key=lambda x: -(x[1].dedicated or self._inferred.get(x[0], 0.0)))
-        deep_pids = {pid for pid, _ in live[: self.DEEP_TOP_N]} | {pid for pid, g in live if g.gpu_pct >= 2}
-        deadline = None if self.scan_budget is None else time.perf_counter() + self.scan_budget
-        ollama_runners = []
-        for pid, g in live:  # largest VRAM first, so the budget goes to what matters
+        live.sort(key=lambda x: -(x[1].shown_vram or 0))
+        for pid, g in live:
             d = self.inspector.get(pid)
-            # WSL: Linux rows carry no counter of their own; the last inferred size triggers rescans instead
-            mem = g.dedicated + g.shared or self._inferred.get(pid, 0.0)
-            if (pid in deep_pids and (deadline is None or time.perf_counter() < deadline)
-                    and self.inspector.needs_scan(d, mem)):
-                self.inspector.scan(d, mem)
             row = ProcRow(pid=pid, name=d.name, kind=classify(d, g.engines), gpu=g, detail=d)
             snap.procs.append(row)
-            # Old Ollama: "ollama.exe runner ..."; newer Ollama: its own lib\ollama\llama-server.exe
-            exe = d.exe.lower()
-            if row.kind in AI_KINDS and ("\\ollama\\" in exe or "/ollama/" in exe or
-                                         (d.name.lower().startswith("ollama") and "runner" in d.cmdline)):
-                ollama_runners.append(row)
 
         for pid, g in getattr(self.counters, "outside", {}).get(luid, {}).items():
             # A container sees the host's PIDs from NVML; unmatched ones are other containers or the host.
             snap.procs.append(ProcRow(pid, "(outside this container)", "external", g,
                                       ProcDetail(pid, "(outside this container)"), host=True, origin="outside"))
-        if self.host is not None:  # before LLM views, so an inferred VRAM total feeds the breakdown
+        if self.host is not None:  # current inferred sizes drive both scan priority and the LLM breakdown
             self._add_host_rows(snap)
+        local_rows = [r for r in snap.procs if not r.host]
+        deep_pids = {r.pid for r in local_rows[: self.DEEP_TOP_N]} | {
+            r.pid for r in local_rows if r.gpu.gpu_pct >= 2}
+        deadline = None if self.scan_budget is None else time.perf_counter() + self.scan_budget
+        ollama_runners = []
+        for row in local_rows:  # largest VRAM first, so the budget goes to what matters
+            d, g = row.detail, row.gpu
+            mem = (g.shown_vram or 0) + g.shared
+            if (row.pid in deep_pids and (deadline is None or time.perf_counter() < deadline)
+                    and self.inspector.needs_scan(d, mem)):
+                self.inspector.scan(d, mem)
+            row.kind = classify(d, g.engines)
+            # Old Ollama: "ollama.exe runner ..."; newer Ollama: its own lib\ollama\llama-server.exe
+            exe = d.exe.lower()
+            if row.kind in AI_KINDS and ("\\ollama\\" in exe or "/ollama/" in exe or
+                                         (d.name.lower().startswith("ollama") and "runner" in d.cmdline)):
+                ollama_runners.append(row)
         for row in snap.procs:
             if row.host:
                 continue
@@ -243,10 +245,9 @@ class Collector:
             own = self.prober.get(row.detail.ports)
             host = self.prober.get(self._parent_ports(row.pid))  # Ollama / LM Studio front-end process
             log = ollama_log_path() if row in ollama_runners and len(ollama_runners) == 1 else None
-            inferred = row.gpu.inferred
-            row.llm = build_view(row.detail, row.gpu.dedicated if inferred is None else inferred, row.gpu.shared,
+            row.llm = build_view(row.detail, row.gpu.shown_vram or 0, row.gpu.shared,
                                  own or host, log, host=host if own else None,
-                                 attributed=row.gpu.attributed or inferred is not None)
+                                 attributed=row.gpu.shown_vram is not None)
 
         self.inspector.prune(set(procs))
         return snap
@@ -295,6 +296,7 @@ class Collector:
         at = next((i + 1 for i, r in enumerate(host_rows) if r.kind == "wsl-vm"), 0)
         if len(vm_workers) == 1 and self.tracker is not None:
             self._attribute(snap, luid, hs.contexts.get(luid, {}).get(vm_workers[0], []))
+        snap.procs.sort(key=lambda r: -(r.gpu.shown_vram or 0))
         snap.procs = host_rows[:at] + snap.procs + host_rows[at:]
 
     def _attribute(self, snap: Snapshot, luid: int, contexts: list[float]) -> None:
@@ -303,7 +305,6 @@ class Collector:
         holders = [(r.pid, r.detail.create_time) for r in linux] + [(os.getpid(), self._own_start)]
         guesses, reason = self.tracker.update(luid, contexts, holders)
         snap.wsl_split = reason
-        self._inferred = {pid: g.bytes for pid, g in guesses.items()}
         for r in linux:
             g = guesses.get(r.pid)
             if g is not None:

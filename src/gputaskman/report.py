@@ -6,9 +6,10 @@ import dataclasses
 import json
 import os
 
-from .collector import Snapshot
+from .collector import ProcRow, Snapshot
 from .llm import gb
 from .nvml import format_metric
+from .pdh import ProcGpu
 
 
 WSL_HOST_NOTE = ("WSL + Windows host counters: 'WSL VM' is the exact total of Linux GPU memory (all distros). "
@@ -29,20 +30,27 @@ WSL_NOTE = ("WSL: VRAM and engine load are device-wide. The Windows host charges
             "VRAM to the VM, so rows below are processes using the GPU, not their share of it.")
 
 
-def vram_label(g) -> str:
+def has_wddm_counters(s: Snapshot, row: ProcRow) -> bool:
+    return s.backend == "wddm" or row.origin == "windows"
+
+
+def has_engine_counters(s: Snapshot, row: ProcRow) -> bool:
+    return s.backend != "wsl" or row.origin == "windows"
+
+
+def vram_label(g: ProcGpu) -> str:
     """Measured size; '*' / '?' when the size is exact but which local process owns it is inferred."""
     mark = {"order": "?", "consistent": "*"}.get(g.inferred_by, "")
-    if g.attributed:
-        return gb(g.dedicated) + mark
-    return "n/a" if g.inferred is None else gb(g.inferred) + mark
+    return "n/a" if g.shown_vram is None else gb(g.shown_vram) + mark
 
 
 INFERRED_NOTE = ("* matched: the size is exact (Windows' counter for a WSL VM GPU context, or NVML for a host PID "
                  "seen from a container); which local process owns it is inferred, and only one explanation fits "
                  "(or every one that fits gives the same size).")
 ORDER_NOTE = ("? order guess: the size is exact but several owners fit, so newer processes are paired with newer "
-              "GPU contexts / PIDs and outside ones are assumed oldest. Becomes * with evidence, such as a process "
-              "starting while gputaskman runs.")
+              "GPU contexts / PIDs and outside ones are assumed oldest. Cached foreign-size hints only rank extra "
+              "candidates; they never prove ownership. Becomes * with evidence, such as a process starting while "
+              "gputaskman runs.")
 
 
 def inferred_note(g) -> str:
@@ -53,20 +61,18 @@ def to_dict(s: Snapshot) -> dict:
     nv = dataclasses.asdict(s.nv) if s.nv else None
     procs = []
     for p in s.procs:
-        # Unknown is null, not 0: WSL Linux rows have no per-process counters, and spill/commit only exist
-        # in WDDM (native Windows, or Windows processes seen from WSL).
-        known = p.gpu.attributed
-        wddm = known and (s.backend == "wddm" or p.origin == "windows")
+        wddm = has_wddm_counters(s, p)
+        engines = has_engine_counters(s, p)
         item = {
             "pid": p.pid, "host": p.origin if p.host else None, "name": p.name, "kind": p.kind, "runtimes": p.detail.runtimes,
             "vram_attributed": p.gpu.attributed, "vram_inferred_bytes": p.gpu.inferred,
             "vram_inferred_by": p.gpu.inferred_by or None,
-            "vram_bytes": int(p.gpu.dedicated) if known else None,
+            "vram_bytes": int(p.gpu.dedicated) if p.gpu.attributed else None,
             "shared_bytes": int(p.gpu.shared) if wddm else None,
             "committed_bytes": int(p.gpu.committed) if wddm else None,
             "paged_out_bytes": int(p.gpu.paged_out) if wddm else None,
-            "gpu_pct": round(p.gpu.gpu_pct, 1) if known else None,
-            "engines": {k: round(v, 1) for k, v in p.gpu.engines.items() if v} if known else None,
+            "gpu_pct": round(p.gpu.gpu_pct, 1) if engines else None,
+            "engines": {k: round(v, 1) for k, v in p.gpu.engines.items() if v} if engines else None,
             "ports": p.detail.ports, "inside": p.inside,
             "model_files": [dataclasses.asdict(m) for m in p.detail.models],
             "installed_models": [dataclasses.asdict(m) for m in p.detail.candidates],
@@ -123,10 +129,11 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
     w = max([7] + [len(p.pid_label) for p in shown])  # host PIDs like W:120880 are wider
     out.append(f"{'PID':>{w}}  {'PROCESS':<24} {'KIND':<10} {'RUNTIME':<24} {'VRAM':>9} {'SPILL':>8} {'PAGED':>8} {'GPU%':>5}  INSIDE")
     for p in shown:
-        spill = gb(p.gpu.shared) if p.gpu.shared >= 1 << 20 else ""
-        paged = gb(p.gpu.paged_out) if p.gpu.paged_out >= 1 << 20 else ""
+        wddm = has_wddm_counters(s, p)
+        spill = gb(p.gpu.shared) if wddm and p.gpu.shared >= 1 << 20 else ""
+        paged = gb(p.gpu.paged_out) if wddm and p.gpu.paged_out >= 1 << 20 else ""
         pid = p.pid_label
-        pct = f"{p.gpu.gpu_pct:.0f}" if p.gpu.attributed else "n/a"
+        pct = f"{p.gpu.gpu_pct:.0f}" if has_engine_counters(s, p) else "n/a"
         out.append(f"{pid:>{w}}  {p.name[:24]:<24} {p.kind:<10} {p.runtime[:24]:<24} {vram_label(p.gpu):>9} {spill:>8} "
                    f"{paged:>8} {pct:>5}  {p.inside}")
     if any(p.gpu.inferred_by == "consistent" for p in shown):

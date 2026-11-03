@@ -123,6 +123,10 @@ and per-process SM, encoder, and decoder load from NVML utilization samples. Lin
 equivalent of WDDM's shared-memory or commit counters, so Spill and Paged stay blank rather than
 showing zero. Only processes you can inspect are listed; other users' processes need `sudo`.
 
+JSON uses `null` for unavailable counters, not a measured zero: spill/commit/paged values on
+native Linux, and per-process engine load for WSL Linux rows. Native NVML engine readings remain
+available even if NVML hides that process's VRAM. Windows host rows retain their measured counters.
+
 **Containers** (Docker, Kubernetes, rented GPU boxes) need one more step: NVML reports *host*
 PIDs, which mean nothing in the container's `/proc`, and the container cannot see the host PID of
 its own processes. gputaskman pairs NVML's unresolved PIDs with the container's processes that
@@ -172,15 +176,22 @@ gputaskman follows the contexts from sample to sample and labels them with evide
 
 | Marker | Meaning | Established by |
 |---|---|---|
-| `*` matched | Windows' exact size; the owner is inferred, and only one explanation fits (or every one that fits gives the same size) | A new Linux GPU process and a new context appearing together; elimination; contexts seen when gputaskman starts while no other Linux process in this distro uses the GPU (remembered for this WSL boot in `~/.cache/gputaskman/`); this monitor's own 0-byte context being newest at startup; candidate contexts that are exactly the same size |
-| `?` guess | Start-order guess for processes that were already running | Newer process ↔ newer context, outside contexts assumed oldest |
+| `*` matched | Windows' exact size; the owner is inferred, and only one explanation fits (or every one that fits gives the same size) | A new Linux GPU process and a new context appearing together; elimination; this monitor's own context being the only zero-byte candidate at startup; candidate contexts that are exactly the same size |
+| `?` guess | Heuristic owner for processes that were already running | Newer process ↔ newer context, outside contexts assumed oldest; cached foreign sizes can rank extra candidates but never establish ownership |
 | `n/a` | No context could be assigned | For example, a process that has not created its GPU context yet |
 
 A guess is recomputed every refresh and never counts as evidence for itself. An exited process's
 context is held aside until it disappears, so it is not handed to a newcomer, and a context that
-grows by gigabytes between refreshes (weights uploading) keeps its owner. The matched size also
-feeds the LLM weights / KV-cache breakdown. The inspector and `--json` (`vram_inferred_by`) say
-which kind of match each row has.
+grows by gigabytes between refreshes (weights uploading) keeps an established owner. Multiple
+zero-byte contexts at startup do not pin the monitor to an arbitrary one that might later grow.
+Foreign sizes observed while only the monitor is running are cached per WSL boot in
+`~/.cache/gputaskman/`, but remain hints: a process may exit while the monitor is off and a local
+process may reuse its size. Observed foreign-context exits and idle samples clear obsolete hints.
+
+The matched size also feeds VRAM sorting, initial model selection, the bounded model-file scan
+priority, and the LLM weights / KV-cache breakdown. Inferred Linux rows remain below the VM total
+and are never added to it again. The inspector and `--json` (`vram_inferred_by`) say which kind
+of match each row has.
 
 In one live check, a 2 GB and a 5 GB PyTorch allocation were matched to the right PIDs at
 2.119 GiB and 4.914 GiB: the allocator's own figure plus about 0.26 GiB of CUDA context.

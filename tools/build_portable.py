@@ -106,6 +106,8 @@ def create_linux_archive(bundle: Path, output: Path, version: str, arch: str) ->
     def normalize(info: tarfile.TarInfo) -> tarfile.TarInfo:
         info.uid = info.gid = 0
         info.uname = info.gname = ""
+        if info.name == f"{name}/gputaskman":
+            info.mode |= 0o755  # filesystems without an executable bit (Windows) would otherwise drop it
         return info
 
     with tarfile.open(archive, "w:gz") as packed:

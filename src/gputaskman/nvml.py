@@ -31,6 +31,7 @@ class NvDevice:
     sm_clock: int | None = None
     sm_clock_max: int | None = None
     mem_clock: int | None = None
+    video_clock: int | None = None
     pcie_rx_kbs: int | None = None  # host -> GPU
     pcie_tx_kbs: int | None = None  # GPU -> host
     pcie_gen: int | None = None
@@ -112,6 +113,7 @@ class Nvml:
             d.sm_clock = _try(N.nvmlDeviceGetClockInfo, h, N.NVML_CLOCK_SM)
             d.sm_clock_max = _try(N.nvmlDeviceGetMaxClockInfo, h, N.NVML_CLOCK_SM)
             d.mem_clock = _try(N.nvmlDeviceGetClockInfo, h, N.NVML_CLOCK_MEM)
+            d.video_clock = _try(N.nvmlDeviceGetClockInfo, h, N.NVML_CLOCK_VIDEO)
             d.pcie_rx_kbs = _try(N.nvmlDeviceGetPcieThroughput, h, N.NVML_PCIE_UTIL_RX_BYTES)
             d.pcie_tx_kbs = _try(N.nvmlDeviceGetPcieThroughput, h, N.NVML_PCIE_UTIL_TX_BYTES)
             d.pcie_gen = _try(N.nvmlDeviceGetCurrPcieLinkGeneration, h)

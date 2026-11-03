@@ -1,0 +1,84 @@
+name: Portable Windows release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-2022
+          - arch: arm64
+            runner: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.13.6"
+          python-version: "3.13"
+      - run: uv sync --locked --group release
+      - run: uv run --locked python -m unittest discover -s tests -v
+      - name: Build portable ZIP
+        shell: pwsh
+        env:
+          BUILD_ARCH: ${{ matrix.arch }}
+        run: |
+          $buildArgs = @("--arch", $env:BUILD_ARCH)
+          if ($env:GITHUB_REF_TYPE -eq "tag") {
+            $buildArgs += @("--tag", $env:GITHUB_REF_NAME)
+          }
+          uv run --locked --group release python tools\build_portable.py @buildArgs
+          if ($LASTEXITCODE -ne 0) { throw "Portable build failed" }
+      - name: Smoke-test the extracted executable without Python
+        shell: pwsh
+        run: |
+          $zip = Get-Item dist\*.zip
+          $portable = Join-Path $env:RUNNER_TEMP "portable app"
+          Expand-Archive -LiteralPath $zip.FullName -DestinationPath $portable
+          $exe = (Get-ChildItem $portable -Filter gputaskman.exe -Recurse).FullName
+          $env:PYTHONPATH = ""
+          $env:PYTHONHOME = ""
+          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+          Push-Location $portable
+          try {
+            & $exe --help
+            if ($LASTEXITCODE -ne 0) { throw "Frozen executable smoke test failed" }
+          } finally {
+            Pop-Location
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.arch }}-portable
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: windows-*-portable
+          merge-multiple: true
+          path: release-assets
+      - name: Publish both architectures together
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release create "$RELEASE_TAG" release-assets/* --verify-tag --generate-notes --title "GPU Task Manager $RELEASE_TAG"

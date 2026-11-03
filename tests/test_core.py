@@ -4,20 +4,25 @@ import contextlib
 import io
 import json
 import os
+from types import SimpleNamespace
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest.mock import patch
 
-from gputaskman.app import GpuTaskManager
+from rich.console import Console
+from rich.table import Table
+from textual.widgets import Footer, Select, Static
+
+from gputaskman.app import GpuTaskManager, spark
 from gputaskman.cli import main
 from gputaskman.collector import ProcRow, Snapshot, select_adapter, select_nv_device
 from gputaskman.dxgi import Adapter
 from gputaskman.gguf import GgufInfo, read_gguf
 from gputaskman.llm import (LlmView, ServerInfo, build_view, is_gpu_device, llama_server_models, lmstudio_models,
                             parse_flags, parse_load_log, probe_server)
-from gputaskman.nvml import NvDevice
+from gputaskman.nvml import NvDevice, Nvml
 from gputaskman.pdh import GpuCounters, ProcGpu
 from gputaskman.procinfo import (AI_KINDS, MappedModel, ProcDetail, ProcInspector, _is_model_file,
                                 _models_from_cmdline, classify, installed_models, make_model)
@@ -139,15 +144,65 @@ class MemoryTests(unittest.TestCase):
 
     def test_text_shows_unavailable_device_metrics_without_fabricating_zeroes(self):
         s = snapshot()
-        s.nv = NvDevice(index=0, util_gpu=0, power_w=2.4, pcie_tx_kbs=0)
+        s.nv = NvDevice(index=0, util_gpu=0, power_w=2.4, pcie_tx_kbs=0, video_clock=656)
         text = to_text(s)
         self.assertIn("GPU 0%", text)
         self.assertIn("mem-bandwidth N/A", text)
         self.assertIn("2/N/A W", text)
         self.assertIn("P N/A", text)
+        self.assertIn("video 656 MHz", text)
         self.assertIn("PCIe rx N/A MB/s tx 0 MB/s", text)
         self.assertNotIn("None", text.splitlines()[2])
         self.assertIsNone(to_dict(s)["device"]["power_limit_w"])
+        self.assertEqual(to_dict(s)["device"]["video_clock"], 656)
+
+    def test_video_clock_is_optional_nvml_metric(self):
+        memory = SimpleNamespace(total=16 * GiB, used=GiB, reserved=0)
+        clock_calls = []
+
+        def clock_info(_handle, clock):
+            clock_calls.append(clock)
+            if clock == 8:
+                return 656
+            raise RuntimeError("unsupported")
+
+        api = SimpleNamespace(
+            NVML_CLOCK_SM=1, NVML_CLOCK_MEM=2, NVML_CLOCK_VIDEO=8,
+            NVML_TEMPERATURE_GPU=0, nvmlMemory_v2=object(),
+            NVML_PCIE_UTIL_RX_BYTES=0, NVML_PCIE_UTIL_TX_BYTES=1,
+            nvmlInit=lambda: None, nvmlShutdown=lambda: None,
+            nvmlSystemGetDriverVersion=lambda: "621.01",
+            nvmlSystemGetCudaDriverVersion_v2=lambda: None,
+            nvmlSystemGetCudaDriverVersion=lambda: None,
+            nvmlDeviceGetCount=lambda: 1, nvmlDeviceGetHandleByIndex=lambda _i: "gpu",
+            nvmlDeviceGetName=lambda _h: "NVIDIA test GPU",
+            nvmlDeviceGetPciInfo=lambda _h: SimpleNamespace(busId=b"0000:01:00.0"),
+            nvmlDeviceGetDriverModel=lambda _h: (0, 0),
+            nvmlDeviceGetMemoryInfo=lambda *_args: memory,
+            nvmlDeviceGetUtilizationRates=lambda _h: None,
+            nvmlDeviceGetEncoderUtilization=lambda _h: None,
+            nvmlDeviceGetDecoderUtilization=lambda _h: None,
+            nvmlDeviceGetTemperature=lambda *_args: None,
+            nvmlDeviceGetPowerUsage=lambda _h: None,
+            nvmlDeviceGetEnforcedPowerLimit=lambda _h: None,
+            nvmlDeviceGetFanSpeed=lambda _h: None,
+            nvmlDeviceGetPerformanceState=lambda _h: None,
+            nvmlDeviceGetClockInfo=clock_info,
+            nvmlDeviceGetMaxClockInfo=lambda *_args: None,
+            nvmlDeviceGetPcieThroughput=lambda *_args: None,
+            nvmlDeviceGetCurrPcieLinkGeneration=lambda _h: None,
+            nvmlDeviceGetCurrPcieLinkWidth=lambda _h: None,
+            nvmlDeviceGetCurrentClocksEventReasons=lambda _h: None,
+            nvmlDeviceGetCurrentClocksThrottleReasons=lambda _h: None,
+            nvmlDeviceGetCudaComputeCapability=lambda _h: None,
+        )
+        with patch("gputaskman.nvml.N", api):
+            nvml = Nvml()
+            device = nvml.sample()[0]
+            nvml.close()
+        self.assertEqual(device.video_clock, 656)
+        self.assertIn(api.NVML_CLOCK_VIDEO, clock_calls)
+        self.assertIsNone(device.mem_clock)
 
     def test_capture_does_not_change_original_or_publish_command_line(self):
         original = snapshot()
@@ -516,7 +571,65 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(model.sources, ["cmdline"])
 
 
+class ChartTests(unittest.TestCase):
+    def test_spark_distinguishes_zero_from_missing_and_clamps_values(self):
+        self.assertEqual(spark([None, 0, 50, 100], 4), " ▁▅█")
+        self.assertEqual(spark([-10, 200], 2), "▁█")
+        self.assertEqual(spark([100, None, 0], 2), " ▁")
+
+    def test_chart_palette_uses_distinct_explicit_colors_consistently(self):
+        app = GpuTaskManager()
+        colors = app.CHART_COLORS
+        self.assertEqual(len(set(colors.values())), len(app.CHARTS))
+        for index, name in enumerate(app.CHARTS):
+            self.assertRegex(colors[name], r"^#[0-9a-f]{6}$")
+            self.assertEqual(app.chart_series(index, None)[3], colors[name])
+        s = snapshot()
+        s.nv = NvDevice(index=0, util_gpu=0, util_mem=0)
+        metrics = next(line for line in app.render_device(s).renderables if "Mem activity" in line.plain)
+        self.assertTrue(any(span.style == colors["Mem activity"] for span in metrics.spans))
+
+
 class UiTests(unittest.IsolatedAsyncioTestCase):
+    def chart_text(self, app):
+        widget = app.query_one("#charts", Static)
+        output = io.StringIO()
+        Console(file=output, width=widget.content_size.width, color_system=None).print(widget.content)
+        return output.getvalue()
+
+    async def test_eighth_chart_records_sm_clock_with_scale_and_missing_readings(self):
+        with patch.object(GpuTaskManager, "poll"):
+            app = GpuTaskManager()
+            async with app.run_test(size=(117, 59)) as pilot:
+                self.assertEqual(len(app.CHARTS), 8)
+                index = app.CHARTS.index("SM clock")
+                s = snapshot()
+                s.nv = NvDevice(index=0, sm_clock=1500, sm_clock_max=3003)
+                app.apply(s)
+                await pilot.pause()
+                self.assertIn("1500 MHz", self.chart_text(app))
+                self.assertIn("SM clock 0–3003 MHz", str(app.query_one("#chart-note", Static).content))
+                self.assertEqual(app.chart_series(index, s.nv)[1:3], (3003, " MHz"))
+                self.assertEqual(len(app.query_one("#charts", Static).content.rows), 4)
+
+                s.nv.sm_clock = 0
+                app.apply(s)
+                s.nv.sm_clock = None
+                s.nv.sm_clock_max = None
+                app.apply(s)
+                self.assertEqual(list(app.hist_clock), [1500, 0, None])
+                self.assertEqual(app.chart_series(index, s.nv)[1], 1500)
+                app.query_one("#chart-mode", Select).value = index
+                await pilot.pause()
+                self.assertIn("N/A", self.chart_text(app))
+                self.assertIn("█▁ ", self.chart_text(app))
+
+                s.nv = None
+                app.apply(s)
+                self.assertEqual(list(app.hist_clock), [1500, 0, None, None])
+                app.hist_clock.clear()
+                self.assertEqual(app.chart_series(index, None)[1], 1)
+
     async def test_unavailable_device_metrics_render_as_na(self):
         with patch.object(GpuTaskManager, "poll"):
             app = GpuTaskManager()
@@ -531,6 +644,116 @@ class UiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("None", lines)
                 self.assertIsNone(app.hist_util[-1])
                 self.assertEqual(app.hist_bw[-1], 0)
+
+    async def test_chart_cycle_shows_selected_metric_and_preserves_gaps(self):
+        with patch.object(GpuTaskManager, "poll"):
+            app = GpuTaskManager()
+            async with app.run_test(size=(180, 42)) as pilot:
+                s = snapshot()
+                s.nv = NvDevice(index=0, util_gpu=50, util_mem=0, temp=49, power_w=72,
+                                power_limit_w=150, enc=None, dec=0, video_clock=656)
+                app.apply(s)
+                await pilot.pause()
+                self.assertEqual(app.chart_idx, -1)
+                self.assertEqual(app.query_one("#chart-mode", Select).value, -1)
+                for name in app.CHARTS:
+                    self.assertIn(name, self.chart_text(app))
+                for expected in app.CHARTS:
+                    await pilot.press("c")
+                    await pilot.pause()
+                    self.assertEqual(app.CHARTS[app.chart_idx], expected)
+                    rendered = self.chart_text(app)
+                    self.assertIn(expected, rendered)
+                    self.assertEqual(len(app.query_one("#charts", Static).content.columns), 1)
+                    if expected == "Encoder":
+                        self.assertIn("N/A", rendered)
+                        screenshot = ET.fromstring(app.export_screenshot())
+                        self.assertIn("Encoder", "".join(screenshot.itertext()))
+                await pilot.press("c")
+                self.assertEqual(app.chart_idx, -1)
+                device = "\n".join(line.plain for line in app.render_device(s).renderables)
+                self.assertIn("video 656 MHz", device)
+                self.assertIsNone(app.hist_enc[-1])
+                self.assertEqual(app.hist_dec[-1], 0)
+                self.assertIn("0%", rendered)
+                self.assertIn("▁", rendered)
+
+    async def test_chart_dropdown_is_clickable_and_keyboard_accessible(self):
+        with patch.object(GpuTaskManager, "poll"):
+            app = GpuTaskManager()
+            async with app.run_test(size=(117, 59)) as pilot:
+                app.apply(snapshot())
+                await pilot.pause()
+                self.assertIs(app.focused, app.query_one("#procs"))
+                await pilot.click("#chart-mode", offset=(2, 0))
+                selector = app.query_one("#chart-mode", Select)
+                self.assertTrue(selector.expanded)
+                await pilot.press("down", "down", "enter")
+                await pilot.pause()
+                self.assertEqual(selector.value, 1)
+                self.assertEqual(app.chart_idx, 1)
+                self.assertIn(app.CHARTS[1], self.chart_text(app))
+                await pilot.press("enter", "home", "enter")
+                await pilot.pause()
+                self.assertEqual(selector.value, -1)
+                for name in app.CHARTS:
+                    self.assertIn(name, self.chart_text(app))
+
+    async def test_chart_layout_reflows_while_paused_and_keeps_processes_visible(self):
+        with patch.object(GpuTaskManager, "poll"):
+            app = GpuTaskManager()
+            async with app.run_test(size=(180, 50)) as pilot:
+                s = snapshot()
+                s.nv = NvDevice(index=0, util_gpu=50, temp=49, power_w=200, power_limit_w=150)
+                app.apply(s)
+                await pilot.pause()
+                await pilot.press("down", "p")
+                history = list(app.hist_util)
+                for width, height, columns in ((180, 50, 3), (117, 59, 2), (80, 40, 1),
+                                               (60, 24, 1), (80, 24, 1), (180, 50, 3)):
+                    with self.subTest(width=width, height=height):
+                        await pilot.resize_terminal(width, height)
+                        await pilot.pause()
+                        grid = app.query_one("#charts", Static).content
+                        self.assertIsInstance(grid, Table)
+                        self.assertEqual(len(grid.columns), columns)
+                        self.assertEqual(len(grid.rows), (len(app.CHARTS) + columns - 1) // columns)
+                        self.assertEqual(list(app.hist_util), history)
+                        self.assertEqual(app.selected_pid, 20)
+                        self.assertTrue(app.paused)
+                        processes = app.query_one("#procs")
+                        footer = app.query_one(Footer)
+                        self.assertGreaterEqual(processes.region.height, 4)
+                        self.assertLessEqual(processes.region.bottom, footer.region.y)
+                        self.assertLessEqual(app.query_one("#inspector").region.bottom, footer.region.y)
+                        self.assertLessEqual(footer.region.bottom, height)
+                        for name in app.CHARTS:
+                            self.assertIn(name, self.chart_text(app))
+                        if height == 24:
+                            dashboard = app.query_one("#dashboard")
+                            self.assertGreater(dashboard.max_scroll_y, 0)
+                            dashboard.scroll_end(animate=False)
+                            await pilot.pause()
+                            screenshot = "".join(ET.fromstring(app.export_screenshot()).itertext())
+                            self.assertIn("Decoder", screenshot)
+                            if width == 60:
+                                note = app.query_one("#chart-note", Static)
+                                self.assertGreaterEqual(note.region.height, 2)
+                self.assertIn("0–200 W", str(app.query_one("#chart-note", Static).content))
+
+    async def test_all_charts_work_without_nvml_or_vram_capacity(self):
+        with patch.object(GpuTaskManager, "poll"):
+            app = GpuTaskManager()
+            async with app.run_test(size=(117, 59)) as pilot:
+                s = snapshot()
+                s.vram_total = 0
+                app.apply(s)
+                await pilot.pause()
+                self.assertIsNone(app.hist_vram[-1])
+                self.assertIsNone(app.hist_util[-1])
+                rendered = self.chart_text(app)
+                self.assertEqual(rendered.count("N/A"), len(app.CHARTS))
+                self.assertNotIn("▁", rendered)
 
     async def test_likely_kind_is_explicit_in_process_and_inspector(self):
         g = gguf("qwen35", block_count=2, context_length=4096, **{"general.name": "Snapshot_Cfg"})

@@ -30,6 +30,9 @@ gtm = "gputaskman.cli:main"
 Repository = "https://github.com/shanselman/gputaskman"
 Issues = "https://github.com/shanselman/gputaskman/issues"
 
+[dependency-groups]
+release = ["pyinstaller==6.22.3"]
+
 [build-system]
 requires = ["uv_build>=0.9.26,<0.10.0"]
 build-backend = "uv_build"

@@ -61,7 +61,9 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
         out.append(f"GPU {format_metric(nv.util_gpu, unit='%')}  mem-bandwidth {format_metric(nv.util_mem, unit='%')}  "
                    f"{format_metric(nv.temp, unit='C')}  {format_metric(nv.power_w, '.0f')}/"
                    f"{format_metric(nv.power_limit_w, '.0f')} W  {pstate}  "
-                   f"SM {format_metric(nv.sm_clock)} MHz  PCIe rx {format_metric(rx, '.0f')} MB/s "
+                   f"SM {format_metric(nv.sm_clock)} MHz  "
+                   f"video {format_metric(nv.video_clock)} MHz  "
+                   f"PCIe rx {format_metric(rx, '.0f')} MB/s "
                    f"tx {format_metric(tx, '.0f')} MB/s")
     out.append("")
     out.append(f"{'PID':>7}  {'PROCESS':<24} {'KIND':<10} {'RUNTIME':<24} {'VRAM':>9} {'SPILL':>8} {'PAGED':>8} {'GPU%':>5}  INSIDE")

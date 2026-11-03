@@ -12,14 +12,14 @@ from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import DataTable, Footer, Markdown, Static
+from textual.widgets import DataTable, Footer, Markdown, Select, Static
 from textual.worker import get_current_worker
 
 from .collector import Collector, ProcRow, Snapshot
 from .llm import gb
-from .nvml import format_metric
+from .nvml import NvDevice, format_metric
 
 KIND_STYLE = {
     "LLM": "bold magenta", "decision": "bold orchid", "decision?": "orchid",
@@ -93,13 +93,24 @@ not necessarily current residency. A game's textures cannot be enumerated here.
 **GPU%** = busiest engine (like Task Manager). On GeForce/WDDM, CUDA kernels are usually reported
 on the **3D** engine.
 
-Keys: `↑/↓` select · `s` sort · `a` show all · `p` pause · `?` this help · `q` quit
+Keys: `↑/↓` select · `s` sort · `c` chart · `a` show all · `p` pause · `?` this help · `q` quit
+
+All eight trend charts are visible by default. They stack in narrow terminals and
+share rows when there is room. Click the **Charts** dropdown to show all charts or
+one metric; `c` cycles the same choices. A blank sample means no reading; zero is
+drawn at the baseline. Percentage charts use 0–100%, temperature uses 0–120°C,
+and the power and SM clock scales are shown below the charts. In short terminals,
+scroll the dashboard or inspector without losing the process list.
 """
 
 
 def spark(values, width: int = 30, top: float = 100.0) -> str:
     vals = list(values)[-width:]
-    return "".join(SPARK[min(int(v / top * (len(SPARK) - 1) + 0.5), len(SPARK) - 1)] if v else " " for v in vals)
+    return "".join(
+        SPARK[min(max(int(v / top * (len(SPARK) - 1) + 0.5), 0), len(SPARK) - 1)]
+        if v is not None else " "
+        for v in vals
+    )
 
 
 def stacked_bar(parts: list[tuple[float, str]], total: float, width: int) -> Text:
@@ -131,13 +142,22 @@ class GpuTaskManager(App):
     TITLE = "gputaskman"
     CSS = """
     Screen { layout: vertical; }
+    #dashboard { height: auto; max-height: 50%; }
     #device { height: auto; border: round $accent; padding: 0 1; }
-    #procs { height: 1fr; min-height: 8; }
-    #inspector { height: auto; max-height: 55%; border: round $secondary; padding: 0 1; }
+    #history { height: auto; border: round $secondary; padding: 0 1; }
+    #chart-controls { height: 1; }
+    #chart-label { width: 8; text-style: bold; }
+    #chart-mode { width: 24; }
+    #chart-hint { width: 1fr; color: $text-muted; }
+    #charts { height: auto; }
+    #chart-note { height: auto; color: $text-muted; }
+    #procs { height: 1fr; min-height: 4; }
+    #inspector { height: auto; max-height: 30%; overflow-y: auto; border: round $secondary; padding: 0 1; }
     """
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("s", "cycle_sort", "Sort"),
+        Binding("c", "cycle_chart", "Chart"),
         Binding("a", "toggle_all", "All/Top"),
         Binding("p", "pause", "Pause"),
         Binding("question_mark", "help", "Explain"),
@@ -145,6 +165,17 @@ class GpuTaskManager(App):
     SORTS = [("VRAM", lambda r: -r.gpu.dedicated), ("GPU%", lambda r: -r.gpu.gpu_pct),
              ("spill", lambda r: -r.gpu.shared), ("paged", lambda r: -r.gpu.paged_out),
              ("name", lambda r: r.name.lower())]
+    CHART_COLORS = {
+        "GPU": "#4ade80",
+        "SM clock": "#fb923c",
+        "VRAM": "#60a5fa",
+        "Mem activity": "#a78bfa",
+        "Temperature": "#ef4444",
+        "Power": "#facc15",
+        "Encoder": "#e2e8f0",
+        "Decoder": "#22d3ee",
+    }
+    CHARTS = tuple(CHART_COLORS)
 
     def __init__(self, gpu_index: int = 0, interval: float = 1.0) -> None:
         super().__init__()
@@ -156,12 +187,29 @@ class GpuTaskManager(App):
         self.show_all = False
         self.paused = False
         self.hist_util: deque = deque(maxlen=60)
+        self.hist_clock: deque = deque(maxlen=60)
         self.hist_bw: deque = deque(maxlen=60)
         self.hist_vram: deque = deque(maxlen=60)
+        self.hist_temp: deque = deque(maxlen=60)
+        self.hist_power: deque = deque(maxlen=60)
+        self.hist_enc: deque = deque(maxlen=60)
+        self.hist_dec: deque = deque(maxlen=60)
+        self.chart_idx = -1
         self._auto_selected = False
 
     def compose(self) -> ComposeResult:
-        yield Static("Sampling GPU counters...", id="device")
+        with VerticalScroll(id="dashboard"):
+            yield Static("Sampling GPU counters...", id="device")
+            with Vertical(id="history"):
+                with Horizontal(id="chart-controls"):
+                    yield Static("Charts", id="chart-label")
+                    yield Select(
+                        [("All charts", -1), *((name, index) for index, name in enumerate(self.CHARTS))],
+                        value=-1, allow_blank=False, compact=True, id="chart-mode",
+                    )
+                    yield Static("Click to choose · c cycles", id="chart-hint")
+                yield Static(id="charts")
+                yield Static(id="chart-note")
         table = DataTable(id="procs", cursor_type="row", zebra_stripes=True)
         yield table
         yield Static("", id="inspector")
@@ -171,6 +219,7 @@ class GpuTaskManager(App):
         t = self.query_one("#procs", DataTable)
         for col in ("PID", "Process", "Kind", "Runtime", "VRAM", "Spill", "Paged", "GPU%", "3D", "Copy", "Video", "What's inside"):
             t.add_column(col, key=col)
+        t.focus()
         self.poll()
 
     @work(thread=True, exclusive=True)
@@ -194,14 +243,24 @@ class GpuTaskManager(App):
         nv = snap.nv
         if nv:
             self.hist_util.append(nv.util_gpu)
+            self.hist_clock.append(nv.sm_clock)
             self.hist_bw.append(nv.util_mem)
-        self.hist_vram.append(100 * snap.vram_used / snap.vram_total if snap.vram_total else 0)
+            self.hist_temp.append(nv.temp)
+            self.hist_power.append(nv.power_w)
+            self.hist_enc.append(nv.enc)
+            self.hist_dec.append(nv.dec)
+        else:
+            for history in (self.hist_util, self.hist_clock, self.hist_bw, self.hist_temp,
+                            self.hist_power, self.hist_enc, self.hist_dec):
+                history.append(None)
+        self.hist_vram.append(100 * snap.vram_used / snap.vram_total if snap.vram_total else None)
         if not self._auto_selected:
             llm = next((r for r in sorted(snap.procs, key=lambda r: -r.gpu.dedicated) if r.llm), None)
             if llm:
                 self.selected_pid = llm.pid
             self._auto_selected = True
         self.query_one("#device", Static).update(self.render_device(snap))
+        self.render_charts()
         self.render_table(snap)
         self.render_inspector()
 
@@ -246,12 +305,8 @@ class GpuTaskManager(App):
             tx = nv.pcie_tx_kbs / 1024 if nv.pcie_tx_kbs is not None else None
             pstate = f"P{nv.pstate}" if nv.pstate is not None else "P N/A"
             m = Text()
-            m.append("GPU ", style="bold")
-            m.append(f"{format_metric(nv.util_gpu, unit='%'):>4} ", style="bold green")
-            m.append(spark(self.hist_util, 24), style="green")
-            m.append("  MemBW ", style="bold")
-            m.append(f"{format_metric(nv.util_mem, unit='%'):>4} ", style="bold dark_orange")
-            m.append(spark(self.hist_bw, 24), style="dark_orange")
+            m.append(f"GPU {format_metric(nv.util_gpu, unit='%')}", style=f"bold {self.CHART_COLORS['GPU']}")
+            m.append(f"  Mem activity {format_metric(nv.util_mem, unit='%')}", style=self.CHART_COLORS["Mem activity"])
             m.append(f"  PCIe↓{format_metric(rx, '.0f'):>5} ↑{format_metric(tx, '.0f'):>4} MB/s")
             if nv.enc or nv.dec:
                 m.append(f"  enc {format_metric(nv.enc, unit='%')} dec {format_metric(nv.dec, unit='%')}")
@@ -259,13 +314,71 @@ class GpuTaskManager(App):
             st = Text(f"{format_metric(nv.temp, unit='°C')}  {format_metric(nv.power_w, '.0f')}/"
                       f"{format_metric(nv.power_limit_w, '.0f')} W  {pstate}  "
                       f"SM {format_metric(nv.sm_clock)}/{format_metric(nv.sm_clock_max)} MHz  "
-                      f"mem {format_metric(nv.mem_clock)} MHz  "
+                      f"mem {format_metric(nv.mem_clock)} MHz  video {format_metric(nv.video_clock)} MHz  "
                       f"PCIe gen{format_metric(nv.pcie_gen)} x{format_metric(nv.pcie_width)}  "
                       f"CC {nv.compute_cap or 'N/A'}", style="grey70")
             if nv.throttle:
                 st.append("  throttle: " + ",".join(nv.throttle), style="yellow")
             lines.append(st)
         return Group(*lines)
+
+    def chart_series(self, index: int, nv: NvDevice | None) -> tuple[deque, float, str, str]:
+        chart = self.CHARTS[index]
+        color = self.CHART_COLORS[chart]
+        if chart == "GPU":
+            return self.hist_util, 100, "%", color
+        if chart == "SM clock":
+            values = [value for value in self.hist_clock if value is not None]
+            scale = max((nv.sm_clock_max if nv else None) or 0, max(values, default=0), 1)
+            return self.hist_clock, scale, " MHz", color
+        if chart == "VRAM":
+            return self.hist_vram, 100, "%", color
+        if chart == "Mem activity":
+            return self.hist_bw, 100, "%", color
+        if chart == "Temperature":
+            return self.hist_temp, 120, "°C", color
+        if chart == "Power":
+            values = [value for value in self.hist_power if value is not None]
+            scale = max((nv.power_limit_w if nv else None) or 0, max(values, default=0), 1)
+            return self.hist_power, scale, " W", color
+        if chart == "Encoder":
+            return self.hist_enc, 100, "%", color
+        return self.hist_dec, 100, "%", color
+
+    def render_charts(self) -> None:
+        if self.snap is None:
+            return
+        widget = self.query_one("#charts", Static)
+        # Reserve the border, padding, and scrollbar even before child resize events arrive.
+        width = max(1, self.size.width - 6)
+        indices = list(range(len(self.CHARTS))) if self.chart_idx == -1 else [self.chart_idx]
+        columns = min(len(indices), 3, max(1, (width + 2) // 46))
+        cell_width = max(1, (width - 2 * (columns - 1)) // columns)
+        grid = Table.grid(padding=(0, 2), pad_edge=False, expand=True)
+        for _ in range(columns):
+            grid.add_column(width=cell_width, no_wrap=True, overflow="crop")
+        cells = []
+        for index in indices:
+            values, scale, unit, style = self.chart_series(index, self.snap.nv)
+            current = values[-1] if values else None
+            cell = Text(f"{self.CHARTS[index]:<12} ", style=style)
+            cell.append(f"{format_metric(current, '.0f', unit):>8} ", style="bold")
+            cell.append(spark(values, max(1, cell_width - 22), scale))
+            cells.append(cell)
+        for start in range(0, len(cells), columns):
+            grid.add_row(*cells[start:start + columns])
+        widget.update(grid)
+        _, power_scale, _, _ = self.chart_series(self.CHARTS.index("Power"), self.snap.nv)
+        _, clock_scale, _, _ = self.chart_series(self.CHARTS.index("SM clock"), self.snap.nv)
+        self.query_one("#chart-note", Static).update(
+            f"Recent samples · blank = no reading · power 0–{power_scale:.0f} W · "
+            f"SM clock 0–{clock_scale:.0f} MHz"
+        )
+
+    def on_resize(self) -> None:
+        if self.is_mounted and self.snap is not None:
+            self.query_one("#device", Static).update(self.render_device(self.snap))
+            self.call_after_refresh(self.render_charts)
 
     def visible_rows(self, s: Snapshot) -> list[ProcRow]:
         rows = s.procs
@@ -403,6 +516,14 @@ class GpuTaskManager(App):
         self.sort_idx = (self.sort_idx + 1) % len(self.SORTS)
         if self.snap:
             self.render_table(self.snap)
+
+    def action_cycle_chart(self) -> None:
+        self.query_one("#chart-mode", Select).value = (self.chart_idx + 2) % (len(self.CHARTS) + 1) - 1
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "chart-mode" and isinstance(event.value, int):
+            self.chart_idx = event.value
+            self.render_charts()
 
     def action_toggle_all(self) -> None:
         self.show_all = not self.show_all

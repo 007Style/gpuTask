@@ -20,6 +20,27 @@ CPU-only, NPU-only, and cloud workloads are out of scope.
 > Early, experimental software. Device and process counters are measurements; classifications
 > and GGUF-derived breakdowns are estimates. This does not dump VRAM or enumerate a game's textures.
 
+## Portable Windows download
+
+The [Releases page](https://github.com/shanselman/gputaskman/releases) is where tagged builds
+publish two portable ZIPs: `gputaskman-VERSION-windows-x64.zip` for Intel/AMD Windows PCs, and
+`gputaskman-VERSION-windows-arm64.zip` for native Windows ARM64. These are separate native builds,
+not a universal executable. If no release is published yet, use the source instructions below.
+
+Extract the **entire ZIP**, keeping `_internal` beside `gputaskman.exe`. Open Windows Terminal
+or PowerShell in the extracted folder:
+
+```powershell
+.\gputaskman.exe
+.\gputaskman.exe --once
+.\gputaskman.exe --json
+```
+
+No Python, uv, CUDA Toolkit, model download, or installation is needed. An NVIDIA GPU with a
+current Windows WDDM driver is still required. Builds are currently **unsigned**; code signing
+and an installer are not part of this initial distribution. Each ZIP includes licenses and a
+`.zip.sha256` companion file is published for integrity checks.
+
 ## Clone and run
 
 Use **64-bit Windows 10/11**, an **NVIDIA GPU with a current WDDM driver**, and a terminal
@@ -67,7 +88,8 @@ skips the consistency check, so do not use it after changing dependencies.
 
 ## What you get
 
-- **Device view:** VRAM usage, GPU activity, memory activity, PCIe traffic, temperature, power and clocks.
+- **Device view:** VRAM usage, GPU activity, memory activity, PCIe traffic, temperature, power,
+  video-engine clock, and responsive history charts with an all-charts or single-metric view.
 - **Process view:** local GPU memory, GPU-accessible system RAM, estimated non-resident commit,
   engine activity, and detected runtimes such as CUDA, Vulkan, Direct3D, ggml and ONNX Runtime.
 - **Model inspector:** which model each process holds (LLM, decision, embedding, speech, or diffusion), how
@@ -110,6 +132,7 @@ uv run --locked gputaskman --help
 |---|---|
 | Up / Down | Select a process and inspect it |
 | `s` | Cycle sort: VRAM, GPU%, spill, paged, name |
+| `c` | Cycle all charts or a single metric (also available in the **Charts** dropdown) |
 | `a` | Switch between top and all collected processes |
 | `p` | Pause / resume collection |
 | `?` | Explain the counters and their limits |
@@ -117,6 +140,12 @@ uv run --locked gputaskman --help
 | `q` | Quit |
 
 A wide terminal (roughly 140 columns or more) makes the full table easier to read.
+All eight history charts are shown by default: GPU, SM clock, VRAM, memory activity,
+temperature, power, encoder, and decoder. They stack in narrow terminals and share rows as
+the window widens. Click the **Charts** dropdown to focus on one metric or return to **All charts**.
+A blank sample means no reading; zero is drawn at the baseline. Percentages use a 0–100%
+scale, temperature uses 0–120°C, and the power and SM clock scales are displayed below the charts.
+The dashboard and inspector scroll independently in short terminals so the process list stays usable.
 Model/runtime discovery is throttled, so newly loaded models may take about 15 seconds to appear.
 
 `--gpu N` selects a detected NVIDIA graphics adapter, ordered by dedicated memory; an out-of-range
@@ -177,7 +206,7 @@ fallback and slower inference, but the counter alone cannot establish why it was
 It is not an eviction trace, a pagefile measurement, or proof that Windows just moved
 those bytes out of VRAM. The value is also less reliable when fallback counters are in use.
 
-Memory labels currently use `GB` / `MB` for binary units (GiB / MiB). The top-level `MemBW`
+Memory labels currently use `GB` / `MB` for binary units (GiB / MiB). The `Mem activity`
 reading is NVML's memory-activity percentage, **not measured bandwidth in GB/s**.
 
 ## LLM and model support
@@ -322,6 +351,30 @@ uv build
 
 The Windows CI runs hardware-independent checks on Python 3.11 and 3.13. Live GPU behavior
 still needs a real Windows GPU; the CI does not pretend to validate that.
+
+### Building portable releases
+
+Use Python 3.13 of the **target architecture**. PyInstaller does not cross-compile: an x64
+Python process makes an x64 executable even when running under ARM64 emulation.
+
+```powershell
+uv sync --locked --group release --python 3.13
+uv run --locked --group release python tools\build_portable.py --arch x64
+# On a native ARM64 interpreter, use --arch arm64 instead.
+```
+
+The builder verifies the interpreter and executable architectures, includes Textual resources
+and dependency licenses, and writes the complete portable ZIP and SHA-256 file to `dist`.
+It does not bundle Windows/NVIDIA DLLs, inference servers, or models. Keep uv for development;
+the executable ZIP is for running the monitor without a Python environment.
+
+The **Portable Windows release** GitHub Actions workflow builds on `windows-2022` (x64) and
+`windows-11-arm` (ARM64). A manual run produces downloadable workflow artifacts without publishing
+a release. A pushed `vVERSION` tag must match `project.version` in `pyproject.toml`; once both builds
+pass, the workflow publishes both ZIPs and checksums together with generated release notes.
+Build jobs have read-only permissions; only the tag-triggered publish job can write releases.
+CI checks the extracted executable's `--help` outside the checkout with Python removed from `PATH`;
+interactive rendering and real GPU snapshots require local hardware testing.
 
 To capture native SVG screenshots of your own running workloads:
 

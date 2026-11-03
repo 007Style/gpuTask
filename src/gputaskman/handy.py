@@ -122,6 +122,8 @@ def inspect_handy(
     if sys.platform == "win32":
         default_data = os.environ.get("APPDATA", "")
         default_local = os.environ.get("LOCALAPPDATA", "")
+    elif sys.platform == "darwin":  # Tauri's app data dir on macOS (logs/ location unverified)
+        default_data = default_local = os.path.join(os.path.expanduser("~"), "Library", "Application Support")
     else:  # Tauri keeps both the settings store and logs/ under the XDG data dir on Linux
         default_data = default_local = os.environ.get("XDG_DATA_HOME") or os.path.join(
             os.path.expanduser("~"), ".local", "share")

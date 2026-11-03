@@ -21,6 +21,11 @@ if sys.platform == "win32":
     from .pdh import GpuCounters
 
     BACKEND = "wddm"
+elif sys.platform == "darwin":
+    from .macos import MacCounters as GpuCounters
+    from .macos import enumerate_adapters, macos_version
+
+    BACKEND = "metal"
 else:
     from .linux import LinuxCounters as GpuCounters
     from .linux import enumerate_adapters, is_wsl
@@ -103,7 +108,7 @@ class Snapshot:
     vram_used: int  # adapter-wide dedicated usage (WDDM counters, or NVML on Linux): the ground truth
     shared_used: int
     procs: list[ProcRow] = field(default_factory=list)
-    backend: str = "wddm"  # wddm (Windows) | nvml (native Linux) | wsl (device-wide only)
+    backend: str = "wddm"  # wddm (Windows) | nvml (native Linux) | wsl (device-wide only) | metal (macOS)
     host_status: str = ""  # WSL only: Windows host counters via interop -- ok | starting | off (...) | ...
     wsl_split: str = ""  # WSL only: why Linux rows have no (inferred) VRAM, when they don't
 
@@ -173,6 +178,13 @@ class Collector:
         self._own_start = time.time()  # our NVML context is created now, not when the process started
         self._host_restarted = time.time()
 
+    def _driver(self) -> str:
+        if BACKEND == "metal":
+            if not hasattr(self, "_macos"):
+                self._macos = f"macOS {macos_version()}".strip()
+            return self._macos
+        return self.nvml.driver
+
     def _parent_ports(self, pid: int, depth: int = 2) -> list[int]:
         d = self.inspector.get(pid)
         if d.parents is None:
@@ -195,11 +207,13 @@ class Collector:
         a = adapters.get(luid)
         nvs = self.nvml.sample() if self.nvml.ok else []
         nv = select_nv_device(self.adapter, nvs, self.gpu_index)
+        if BACKEND == "metal":
+            nv = self.counters.device  # IOKit's device stats in the shape the header renders
         total = (nv.mem_total if nv else 0) or (self.adapter.dedicated_vram if self.adapter else 0)
 
         snap = Snapshot(
             taken=time.time(), adapter=self.adapter, adapters=self.adapters, nv=nv,
-            driver=self.nvml.driver, cuda=self.nvml.cuda_version, vram_total=total,
+            driver=self._driver(), cuda=self.nvml.cuda_version, vram_total=total,
             vram_used=int(a.dedicated) if a else (nv.mem_used if nv else 0),
             shared_used=int(a.shared) if a else 0, backend=BACKEND,
         )

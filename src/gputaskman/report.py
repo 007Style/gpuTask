@@ -57,6 +57,11 @@ def inferred_note(g) -> str:
     return ORDER_NOTE if g.inferred_by == "order" else INFERRED_NOTE
 
 
+METAL_NOTE = ("macOS: unified memory, so GPU memory is part of system RAM. Rows show each process's graphics "
+              "footprint; other users' processes (WindowServer, daemons) show GPU% only, since reading their "
+              "memory needs root.")
+
+
 def to_dict(s: Snapshot) -> dict:
     nv = dataclasses.asdict(s.nv) if s.nv else None
     procs = []
@@ -108,12 +113,19 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
     out = []
     nv = s.nv
     name = s.adapter.name if s.adapter else "GPU"
-    out.append(f"{name}  driver {s.driver}  CUDA {s.cuda}  {nv.driver_model if nv else ''}")
-    shared = f"   shared (in system RAM) {gb(s.shared_used)}" if s.backend == "wddm" or s.host_data else ""
-    out.append(f"VRAM {gb(s.vram_used)} / {gb(s.vram_total)}{shared}")
+    if s.backend == "metal":
+        out.append(f"{name}  {s.driver}  Metal")
+        out.append(f"GPU memory {gb(s.vram_used)} allocated / {gb(s.vram_total)} unified")
+        out.append(METAL_NOTE)
+        if nv:
+            out.append(f"GPU {format_metric(nv.util_gpu, unit='%')}")
+    else:
+        out.append(f"{name}  driver {s.driver}  CUDA {s.cuda}  {nv.driver_model if nv else ''}")
+        shared = f"   shared (in system RAM) {gb(s.shared_used)}" if s.backend == "wddm" or s.host_data else ""
+        out.append(f"VRAM {gb(s.vram_used)} / {gb(s.vram_total)}{shared}")
     if s.backend == "wsl":
         out.append(wsl_note(s))
-    if nv:
+    if nv and s.backend != "metal":
         rx = nv.pcie_rx_kbs / 1024 if nv.pcie_rx_kbs is not None else None
         tx = nv.pcie_tx_kbs / 1024 if nv.pcie_tx_kbs is not None else None
         pstate = f"P{nv.pstate}" if nv.pstate is not None else "P N/A"

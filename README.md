@@ -2,7 +2,8 @@
 
 **An `htop` for what's inside your GPU, not just how full it is.**
 
-Windows + NVIDIA, with Linux and WSL support (see [Linux and WSL](#linux-and-wsl)). A terminal UI
+Windows + NVIDIA, with Linux and WSL support (see [Linux and WSL](#linux-and-wsl)) and macOS on Apple
+Silicon (see [macOS](#macos-apple-silicon)). A terminal UI
 that connects per-process GPU memory and engine activity with loaded runtimes, model files, and
 LLM buffer breakdowns.
 
@@ -198,6 +199,34 @@ In one live check, a 2 GB and a 5 GB PyTorch allocation were matched to the righ
 That is one machine and driver, not a guarantee. A process that started long before it first used
 the GPU can break the start-order guess, and processes started in the same refresh are ordered by
 guess unless their sizes match.
+
+## macOS (Apple Silicon)
+
+Run from a clone (`uv run gputaskman`); there is no portable macOS download yet. Apple GPUs share
+one pool of memory with the CPU, so there is no VRAM to split and no spill/commit counters. What
+macOS exposes without root:
+
+| Column | Source | Who |
+|---|---|---|
+| GPU memory (header) | IOAccelerator `PerformanceStatistics`: `Alloc system memory` (all GPU allocations) out of physical RAM | device |
+| GPU% (header) | `Device Utilization %` | device |
+| GPU% | Each Metal client (`AGXDeviceUserClient`) names its creator PID and keeps a cumulative `accumulatedGPUTime`; the rate between samples | every process |
+| VRAM | `footprint`: the process's memory macOS charges to graphics (the `(graphics)` categories: Metal buffers, textures) | your own processes |
+| Runtime, model files | Mapped files from `proc_pidinfo` region walks (psutil has no memory maps on macOS): `libggml*.dylib`, `libllama*.dylib`, `libmlx*.dylib`, `libtorch_cpu.dylib`, the Metal driver bundle | your own processes |
+
+Other users' processes (WindowServer, system daemons) show GPU% with memory `n/a`: `footprint` needs
+root for them. Idle ones are left out of the table, except WindowServer. `footprint` takes ~70 ms per
+process, so it runs in a background thread, busiest process first; a new process shows `n/a` for a
+second or two until its first measurement. Spill, paged, clocks, power, and temperature are not
+available.
+
+Live check on an M4 Mac mini (macOS 26.3.1): a PyTorch MPS job with a 2 GiB buffer and a matmul loop
+showed `Python  AI  PyTorch+Metal  3.06 GB  99%`, with device utilization at 99% and allocated GPU
+memory rising by the same amount.
+
+Scans skip other apps' sandbox containers (`~/Library/Containers`, `~/Library/Group Containers`) and
+system files without opening them: opening a file in a protected container blocks while macOS waits
+for a privacy consent prompt.
 
 ## What you get
 
@@ -486,7 +515,7 @@ uv run --locked python -m unittest discover -s tests -v
 uv build
 ```
 
-CI runs hardware-independent checks on Windows and Ubuntu, Python 3.11 and 3.13. Live GPU behavior
+CI runs hardware-independent checks on Windows, Ubuntu and macOS, Python 3.11 and 3.13. Live GPU behavior
 still needs real hardware; the CI does not pretend to validate that. The WSL matching tests replay
 context sequences measured on a real WSL2 machine.
 
@@ -533,6 +562,7 @@ downloads are bundled in this repository.
 | `pdh.py` / `dxgi.py` | Windows counters and adapter enumeration |
 | `linux.py` | Linux backend: NVML adapters and per-process usage, container PID matching, WSL detection, `/dev/dxg` holders |
 | `wslhost.py` | WSL: interop check, Windows host counter stream, adapter pairing, context matching |
+| `macos.py` | macOS backend: IOKit device stats and per-process GPU time, `footprint` GPU memory poller, libproc memory maps |
 | `nvml.py` | NVIDIA device readings |
 | `procinfo.py` | Runtime, mapped-file, and process discovery |
 | `stores.py` | Friendly names from Ollama, LM Studio, and Hugging Face model stores |
@@ -547,6 +577,8 @@ downloads are bundled in this repository.
 - Explicit provenance and availability for every counter and estimate.
 - Reliable multi-GPU matching and per-device model placement.
 - Bare-metal Linux validation on hardware; AMD and Intel GPUs on Linux through DRM fdinfo.
+- macOS: a portable build, Ollama/llama.cpp/MLX validation, and compressed GPU memory (footprint's
+  `swapped`) as the paged column.
 - WSL: per-process GPU load for Linux rows, and Ollama's systemd journal as a log source.
 - Live throughput deltas, LM Studio validation, and per-model context accounting.
 - Opt-in ETW file-open tracing to name models loaded by read-and-close runtimes (any whisper or ONNX

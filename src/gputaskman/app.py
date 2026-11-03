@@ -20,7 +20,7 @@ from textual.worker import get_current_worker
 from .collector import Collector, ProcRow, Snapshot
 from .llm import gb
 from .nvml import NvDevice, format_metric
-from .report import WSL_EMPTY, has_engine_counters, has_wddm_counters, inferred_note, vram_label, wsl_note
+from .report import METAL_NOTE, WSL_EMPTY, has_engine_counters, has_wddm_counters, inferred_note, vram_label, wsl_note
 
 KIND_STYLE = {
     "LLM": "bold magenta", "decision": "bold orchid", "decision?": "orchid",
@@ -150,6 +150,9 @@ class HelpScreen(ModalScreen):
     def compose(self) -> ComposeResult:
         with VerticalScroll():
             yield Markdown(HELP_MD)
+
+
+METAL_CHARTS = ("GPU", "VRAM")
 
 
 class GpuTaskManager(App):
@@ -292,8 +295,11 @@ class GpuTaskManager(App):
     def render_device(self, s: Snapshot) -> Group:
         nv = s.nv
         name = s.adapter.name if s.adapter else (nv.name if nv else "GPU")
-        head = Text.assemble((name, "bold"), f"   driver {s.driver}  CUDA {s.cuda}  ",
-                             (nv.driver_model if nv else "", "bold yellow"), f"  {nv.pci_bus if nv else ''}")
+        if s.backend == "metal":
+            head = Text.assemble((name, "bold"), f"   {s.driver}  ", ("Metal", "bold yellow"), "  unified memory")
+        else:
+            head = Text.assemble((name, "bold"), f"   driver {s.driver}  CUDA {s.cuda}  ",
+                                 (nv.driver_model if nv else "", "bold yellow"), f"  {nv.pci_bus if nv else ''}")
         if self.paused:
             head.append("   [PAUSED]", style="bold red")
 
@@ -309,7 +315,7 @@ class GpuTaskManager(App):
         other = max(s.vram_used - attributed * scale, 0)
         parts.append((other, "grey35"))
         width = max(min(self.size.width - 40, 90), 20)
-        vram = Text("VRAM ")
+        vram = Text("GPU mem " if s.backend == "metal" else "VRAM ")
         vram.append_text(stacked_bar(parts, s.vram_total, width))
         vram.append(f" {gb(s.vram_used)} / {gb(s.vram_total)}", style="bold")
         legend = Text("     ")
@@ -326,9 +332,14 @@ class GpuTaskManager(App):
             legend.append("   [bar normalized; labels are raw]", style="grey62")
         if s.backend == "wsl":
             legend.append("\n     " + wsl_note(s), style="grey62")
+        if s.backend == "metal":
+            legend.append("\n     " + METAL_NOTE, style="grey62")
 
         lines = [head, vram, legend]
-        if nv:
+        if nv and s.backend == "metal":
+            lines.append(Text(f"GPU {format_metric(nv.util_gpu, unit='%')}",
+                              style=f"bold {self.CHART_COLORS['GPU']}"))
+        elif nv:
             rx = nv.pcie_rx_kbs / 1024 if nv.pcie_rx_kbs is not None else None
             tx = nv.pcie_tx_kbs / 1024 if nv.pcie_tx_kbs is not None else None
             pstate = f"P{nv.pstate}" if nv.pstate is not None else "P N/A"
@@ -380,6 +391,8 @@ class GpuTaskManager(App):
         # Reserve the border, padding, and scrollbar even before child resize events arrive.
         width = max(1, self.size.width - 6)
         indices = list(range(len(self.CHARTS))) if self.chart_idx == -1 else [self.chart_idx]
+        if self.snap.backend == "metal" and self.chart_idx == -1:
+            indices = [i for i in indices if self.CHARTS[i] in METAL_CHARTS]  # IOKit has no clocks/power/temp
         columns = min(len(indices), 3, max(1, (width + 2) // 46))
         cell_width = max(1, (width - 2 * (columns - 1)) // columns)
         grid = Table.grid(padding=(0, 2), pad_edge=False, expand=True)
@@ -399,6 +412,7 @@ class GpuTaskManager(App):
         _, power_scale, _, _ = self.chart_series(self.CHARTS.index("Power"), self.snap.nv)
         _, clock_scale, _, _ = self.chart_series(self.CHARTS.index("SM clock"), self.snap.nv)
         self.query_one("#chart-note", Static).update(
+            "Recent samples · blank = no reading" if self.snap.backend == "metal" else
             f"Recent samples · blank = no reading · power 0–{power_scale:.0f} W · "
             f"SM clock 0–{clock_scale:.0f} MHz"
         )
@@ -491,6 +505,10 @@ class GpuTaskManager(App):
                 out.append(Text(inferred_note(r.gpu), style="grey62"))
             elif s.wsl_split:
                 out.append(Text(f"No per-process VRAM: {s.wsl_split}.", style="grey62"))
+            elif s.backend == "metal":
+                out.append(Text("GPU memory n/a: footprint can't read other users' processes without root "
+                                "(or hasn't measured this one yet). GPU% comes from Metal's per-process GPU time.",
+                                style="grey62"))
         if wddm and r.gpu.paged_out >= 64 << 20:
             out.append(Text(f"{gb(r.gpu.paged_out)} of {gb(r.gpu.committed)} committed is not accounted for by local/non-local "
                             "usage. Estimated non-residency, not proof of eviction or disk paging.",

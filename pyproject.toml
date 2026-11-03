@@ -1,0 +1,35 @@
+[project]
+name = "gputaskman"
+version = "0.1.0"
+description = "An htop for what's inside your GPU: per-process VRAM, engine load, and LLM weights / KV cache breakdown"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Scott Hanselman" }
+]
+requires-python = ">=3.11"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Monitoring",
+]
+dependencies = [
+    "nvidia-ml-py>=13.615.71",
+    "psutil>=7.2.2",
+    "textual>=8.2.8",
+]
+
+[project.scripts]
+gputaskman = "gputaskman.cli:main"
+gtm = "gputaskman.cli:main"
+
+[project.urls]
+Repository = "https://github.com/shanselman/gputaskman"
+Issues = "https://github.com/shanselman/gputaskman/issues"
+
+[build-system]
+requires = ["uv_build>=0.9.26,<0.10.0"]
+build-backend = "uv_build"

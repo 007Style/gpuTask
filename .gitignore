@@ -1,0 +1,27 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.venv-*
+
+# Local captures, credentials and model downloads
+.env
+.env.*
+*.log
+*.gguf
+*.ggml
+*.safetensors
+*.onnx
+*.pt
+*.pth
+.coverage
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+captures/

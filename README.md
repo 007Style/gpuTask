@@ -527,6 +527,9 @@ CI runs hardware-independent checks on Windows, Ubuntu and macOS, Python 3.11 an
 still needs real hardware; the CI does not pretend to validate that. The WSL matching tests replay
 context sequences measured on a real WSL2 machine.
 
+Contributors and coding agents: [AGENTS.md](AGENTS.md) lists the evidence rules every change must
+keep, a module map, verification steps, and the release process.
+
 ### Building portable releases
 
 Use Python 3.13 of the **target architecture**. PyInstaller does not cross-compile: an x64

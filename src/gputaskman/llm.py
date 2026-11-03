@@ -282,7 +282,16 @@ class LlmView:
         """Best human name for models[i]: model-store name, else GGUF basename/name."""
         f = self.files[i] if i < len(self.files) else None
         g = self.models[i]
+        if f and f.kind_hint:
+            return f.store_name or os.path.basename(f.path)
         return (f.store_name if f and f.store_name else None) or g.metadata.get("general.basename") or g.name
+
+    def kind_label(self, i: int) -> str:
+        f = self.files[i] if i < len(self.files) else None
+        g = self.models[i]
+        if f and f.kind_hint:
+            return f.kind_label
+        return g.kind + (f" ({g.decision_type})" if g.decision_type else "")
 
 
 def gb(n: float) -> str:

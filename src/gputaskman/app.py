@@ -22,8 +22,8 @@ from .llm import gb
 from .nvml import format_metric
 
 KIND_STYLE = {
-    "LLM": "bold magenta", "decision": "bold orchid", "embedding": "plum2", "speech": "light_sky_blue1",
-    "diffusion": "orchid",
+    "LLM": "bold magenta", "decision": "bold orchid", "decision?": "orchid",
+    "embedding": "plum2", "speech": "light_sky_blue1", "diffusion": "orchid",
     "AI": "medium_purple1", "compute": "orange3", "3D/game": "green3",
     "video": "yellow", "browser": "dodger_blue2", "app": "cyan", "compositor": "grey50",
     "kernel": "grey50", "system": "grey50",
@@ -66,6 +66,12 @@ HELP_MD = """\
 **Evidence** shows how a model was identified: `api` (the runtime says it is loaded), `mapped`
 (Windows shows the file mapped into the process right now), `cmdline` (a launch argument only).
 Two sources, including `api` or `mapped`, is shown as *confirmed*.
+
+**Local workloads only:** inference, decision models, vision, speech, training, graphics and video.
+Cloud-hosted models are outside this monitor's scope. DLLs identify runtimes, not models or tasks.
+`decision?` / *likely decision model (name)* is a filename or model-folder hint when a specific
+GGUF kind is missing. It does not confirm the kind, GPU residency, or execution. Installed
+candidates remain unproven; engine activity is measured per process, not per model.
 
 **Why does nvidia-smi say N/A?** GeForce cards on Windows run in *WDDM* mode: Windows, not the
 NVIDIA driver, owns video memory, so NVML can't attribute it to processes. The Windows counters can.
@@ -342,14 +348,14 @@ class GpuTaskManager(App):
                     mt.add_column(col)
                 for i, g in enumerate(v.models):
                     f = v.files[i] if i < len(v.files) else None
-                    kind = g.kind + (f" ({g.decision_type})" if g.decision_type else "")
-                    mt.add_row(Text(kind, style="magenta"), v.label(i), g.arch, g.params_label, g.quant,
+                    mt.add_row(Text(v.kind_label(i), style="magenta"), v.label(i), g.arch, g.params_label, g.quant,
                                str(g.n_layers or ""), f"{g.ctx_train:,}" if g.ctx_train else "",
                                gb(g.gpu_weight_bytes()), Text(f.evidence if f else "", style="green"),
                                Text(os.path.basename(g.path), style="grey50", overflow="ellipsis"))
                 out.append(mt)
             for f in v.other_files:
-                out.append(Text(f"file: {f.path}  ({gb(f.size)})", style="grey62"))
+                kind = f", {f.kind_label}" if f.kind_label else ""
+                out.append(Text(f"file: {f.store_name or f.path}  ({gb(f.size)}, {f.evidence}{kind})", style="grey62"))
             if v.server:
                 sv = v.server
                 st = Text.assemble(("server ", "bold"), (f"{sv.kind} {sv.url}", "cyan"))
@@ -370,12 +376,14 @@ class GpuTaskManager(App):
         else:
             out.append(Text(EXPLAIN.get(r.kind, ""), style="grey70"))
             for m in r.detail.models:
-                out.append(Text(f"file: {m.store_name or m.path}  ({gb(m.size)}, {m.evidence})", style="magenta"))
+                kind = f", {m.kind_label}" if m.kind_label else ""
+                out.append(Text(f"file: {m.store_name or m.path}  ({gb(m.size)}, {m.evidence}{kind})", style="magenta"))
             if r.detail.candidates:
-                out.append(Text("This runtime read its model into memory and closed the file, so Windows cannot show "
-                                "which one is loaded. Model files installed with this app:", style="grey70"))
+                out.append(Text("No mapped model file was observed. Some runtimes read then close model files. "
+                                "Installed candidates (not proven loaded):", style="grey70"))
                 for m in r.detail.candidates:
-                    out.append(Text(f"  {m.store_name or m.path}  ({gb(m.size)})", style="grey62"))
+                    kind = f", {m.kind_label}" if m.kind_label else ""
+                    out.append(Text(f"  {m.store_name or m.path}  ({gb(m.size)}{kind})", style="grey62"))
         if r.detail.ports:
             out.append(Text("listening: " + ", ".join(map(str, r.detail.ports[:8])), style="grey50"))
         if r.detail.cmdline:

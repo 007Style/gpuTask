@@ -41,7 +41,8 @@ LLM_NAMES = ("llama-", "llama.", "ollama", "lm studio", "lmstudio", "llmster", "
 # GGUF file kind -> process kind, in display priority order
 MODEL_KINDS = {"LLM": "LLM", "decision model": "decision", "embedding model": "embedding",
                "reranker": "embedding", "speech model": "speech"}
-AI_KINDS = {"LLM", "decision", "embedding", "speech", "diffusion", "AI"}
+AI_KINDS = {"LLM", "decision", "decision?", "embedding", "speech", "diffusion", "AI"}
+_DECISION_NAME = re.compile(r"(?<![a-z0-9])(?:openjev|laya|julia-1|lev|kev)(?![a-z0-9])", re.I)
 MiB = 1 << 20
 INSTALLED_TTL = 300.0
 _SKIP_DIRS = {"ebwebview", "cache", "code cache", "gpucache", "node_modules", "logs", "crashpad", "locales", "__pycache__"}
@@ -57,6 +58,11 @@ class MappedModel:
     sources: list[str] = field(default_factory=lambda: ["mapped"])  # mapped | cmdline | api | installed
     store_name: str | None = None  # e.g. "qwen3:14b" from an Ollama manifest
     kind: str = ""  # GGUF kind: LLM, decision model, embedding model, ...
+    kind_hint: str = ""  # name-based suggestion only; never changes loading evidence or GGUF math
+
+    @property
+    def kind_label(self) -> str:
+        return f"likely {self.kind_hint} (name)" if self.kind_hint else self.kind
 
     def add_source(self, source: str) -> None:
         if source not in self.sources:
@@ -134,7 +140,16 @@ def _is_model_file(ext: str, size: int, gg: bool, store: str | None) -> bool:
 def make_model(path: str, size: int, resident: int, gg: bool, source: str, store: str | None = None) -> MappedModel:
     g = read_gguf(path) if gg else None
     kind = g.kind if g is not None and not g.error else ""
-    return MappedModel(path, size, resident, gg, [source], store if store is not None else store_name(path), kind)
+    store = store if store is not None else store_name(path)
+    hint = _name_kind_hint(path, store) if kind in ("", "model", "LLM") else ""
+    return MappedModel(path, size, resident, gg, [source], store, kind, hint)
+
+
+def _name_kind_hint(path: str, store: str | None) -> str:
+    names = [os.path.basename(path), os.path.basename(os.path.dirname(path))]
+    # Match the model name, not a publisher, user directory, or Ollama tag.
+    names += [name.rsplit("/", 1)[-1].split(":", 1)[0] for name in (store or "").split(", ")]
+    return "decision model" if any(_DECISION_NAME.search(name) for name in names) else ""
 
 
 def _walk(root: str, depth: int, out: list[tuple[str, int]], budget: list[int]) -> None:
@@ -195,7 +210,7 @@ def installed_models(exe: str, now: float | None = None) -> list[MappedModel]:
             path, size = group[0]
             found.append(make_model(path, size, 0, path.lower().endswith(".gguf") and is_gguf(path), "installed"))
         else:  # several files (encoder + decoder, shards): name it by the folder
-            found.append(MappedModel(folder, sum(s for _, s in group), 0, False, ["installed"], store_name(group[0][0])))
+            found.append(make_model(folder, sum(s for _, s in group), 0, False, "installed", store_name(group[0][0])))
     found = sorted(found, key=lambda m: -m.size)[:6]
     _installed[key] = (now, found)
     return found
@@ -340,10 +355,12 @@ def classify(d: ProcDetail, engines: dict[str, float]) -> str:
         return "system"
     if d.is_diffusion:
         return "diffusion"
-    kinds = {MODEL_KINDS[m.kind] for m in d.models if m.kind in MODEL_KINDS}
+    kinds = {MODEL_KINDS[m.kind] for m in d.models if m.kind in MODEL_KINDS and not m.kind_hint}
     for k in ("LLM", "decision", "embedding", "speech"):
         if k in kinds:
             return k
+    if any(m.kind_hint == "decision model" for m in d.models):
+        return "decision?"
     if "llama.cpp" in d.runtimes or n.startswith(LLM_NAMES):
         return "LLM"
     video = engines.get("decode", 0) + engines.get("encode", 0) > 1

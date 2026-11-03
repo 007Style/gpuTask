@@ -8,6 +8,13 @@ with loaded runtimes, model files, and LLM buffer breakdowns.
 Task Manager says "15 GB used." This tries to answer: *by what? Model weights? KV cache?
 Your browser? The desktop compositor? And why is so much GPU memory in system RAM?*
 
+**Scope: local GPU workloads, not cloud services.** Decision models, vision, speech, LLM inference,
+training/fine-tuning (including Unsloth), graphics, and video all belong here. Visibility varies:
+process memory and engine activity are measured; identifying individual models and their work
+requires supporting evidence. A PyTorch/CUDA DLL alone cannot identify a model or prove training,
+and a mapped file does not prove that model is resident on the GPU or being exercised.
+CPU-only, NPU-only, and cloud workloads are out of scope.
+
 ![Live GPU overview with an LLM's weights, KV cache, and compute buffer breakdown](docs/screenshots/overview.png)
 
 > Early, experimental software. Device and process counters are measurements; classifications
@@ -183,6 +190,20 @@ reading is NVML's memory-activity percentage, **not measured bandwidth in GB/s**
 | stable-diffusion.cpp (`--diffusion-model`) | Diffusion, text-encoder and VAE files from launch arguments; no LLM memory breakdown |
 | Hugging Face cache | `models--org--repo` paths are named `org/repo` |
 | Other AI runtimes | DLL detection, plus model files installed with the app (marked *not proven loaded*) |
+| Handy | Local speech workloads are in scope; runtime DLLs/mapped files and installed candidates are inspected. A selected/downloaded speech model alone is not proof of GPU residency or use |
+| WinML / local helper processes | GPU-backed execution is in scope; generic process counters and runtime detection only. No WinML-specific model/session or client-to-helper attribution yet |
+| Windows Studio Effects | Only any observable GPU portion is in scope. NPU inference is out of scope; do not interpret GPU camera/render activity as proof of model execution |
+
+WinML can select different execution backends; a local helper/service is still **local**, not
+cloud-hosted. The GPU counters belong to whichever process holds/uses the GPU resources.
+Parent-PID lookup currently helps find Ollama/LM Studio APIs; it is not a general cross-process
+ownership graph for shared Windows services.
+
+GPU-backed WinML and Studio Effects paths have **not been validated on a Copilot+ PC**. A future
+hardware check should compare idle versus active workload samples, record the actual GPU adapter
+and resource-owning PID (including helpers), and verify the execution provider using runtime
+diagnostics. Match any reported model/session to that PID before claiming attribution. If execution
+is CPU/NPU-only, record it as out of scope rather than a missing GPU model. No NPU collector is planned.
 
 ### How models are identified
 
@@ -196,14 +217,31 @@ Every model row shows its **evidence**, strongest first:
 | `installed` | Found in the app's install or data folder; nothing proves it is loaded |
 
 Two sources including `api` or `mapped` show as **confirmed**. Model-store folders only supply a
-friendly name. The model *kind* comes from GGUF header keys, not filenames: `decision.type` marks a
+friendly name. The authoritative model *kind* comes from GGUF header keys: `decision.type` marks a
 decision model (for example [Laya](https://huggingface.co/ggml-org/Laya-GGUF)), `pooling_type`
 an embedding model or reranker, `stt.*` a speech model, and a causal model with layers and a
 trained context an LLM. llama-server's `/v1/models` `output_modalities` (`text`, `decisions`)
 confirms it. Non-causal encoders such as Laya allocate no KV cache, so none is estimated.
 
+When a file lacks specific kind metadata, known local decision-model names (`openjev`, `laya`,
+`julia-1`, `lev`, `kev`) supply a **likely decision model (name)** hint. Matching uses delimited
+names in the filename, immediate model folder, or resolved store model name, not arbitrary path
+substrings, publishers, or Ollama tags. The process category is `decision?`; specific GGUF kinds
+take precedence. Hints do not change loading evidence, causal/KV calculations, or installed-candidate
+status. JSON preserves the header-derived `kind` separately from `kind_hint` and `kind_label`.
+
+For example, [ggml-org/OpenJev-GGUF](https://huggingface.co/ggml-org/OpenJev-GGUF) includes
+`qwen35.decision.type=openjev`; the inspected community
+[openjev/openjev-GGUF](https://huggingface.co/openjev/openjev-GGUF) Q4_K_M header lacks that key and
+uses the generic internal name `Snapshot_Cfg`, so its filename or store name supplies only a hint.
+Neither a type hint nor an API/file match proves which model produced the process's GPU activity.
+
 Some runtimes (ONNX Runtime, whisper.cpp) read a model into memory and close the file. Windows then
 has no record of which file is loaded, so the app's installed models are listed as candidates only.
+For Handy, the configured `selected_model` can refer to a different model in a separate cache;
+the current installed-folder fallback does not read that setting. Even reading it would establish
+selection, not current GPU residency or execution. Do not assume the largest installed speech
+model is the one in use.
 
 Identification is designed to stay cheap. Measured on one Windows machine:
 

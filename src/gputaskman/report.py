@@ -24,6 +24,8 @@ def to_dict(s: Snapshot) -> dict:
             "model_files": [dataclasses.asdict(m) for m in p.detail.models],
             "installed_models": [dataclasses.asdict(m) for m in p.detail.candidates],
         }
+        if p.handy:
+            item["handy"] = dataclasses.asdict(p.handy)
         if p.llm:
             item["llm"] = {
                 "models": [{"path": g.path, "name": g.name, "label": p.llm.label(i), "arch": g.arch, "kind": g.kind,
@@ -71,6 +73,13 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
         out.append(f"{p.pid:>7}  {p.name[:24]:<24} {p.kind:<10} {p.runtime[:24]:<24} {gb(p.gpu.dedicated):>9} {spill:>8} "
                    f"{paged:>8} {p.gpu.gpu_pct:>5.0f}  {p.inside}")
     for p in s.procs:
+        if p.handy:
+            out.append("")
+            if p.handy.selected_model:
+                out.append(f"== {p.name} ({p.pid}) Handy selected (settings, not load proof): {p.handy.selected_model}")
+            if p.handy.last_event:
+                out.append(f"   last Handy event: {p.handy.last_event} {p.handy.last_model or ''} "
+                           f"at {p.handy.last_event_local} (runtime-reported history, not current GPU residency)")
         if not p.llm:
             continue
         out.append("")

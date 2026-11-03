@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 import psutil
 
 from .dxgi import VENDOR_NVIDIA, Adapter, enumerate_adapters
+from .handy import HandyEvidence, inspect_handy
 from .llm import LlmView, ServerProber, build_view, gb, ollama_log_path
 from .nvml import Nvml, NvDevice
 from .pdh import GpuCounters, ProcGpu
@@ -25,6 +26,7 @@ class ProcRow:
     gpu: ProcGpu
     detail: ProcDetail
     llm: LlmView | None = None
+    handy: HandyEvidence | None = None
 
     @property
     def runtime(self) -> str:
@@ -33,6 +35,11 @@ class ProcRow:
     @property
     def inside(self) -> str:
         """One-line 'what's in there' summary for the process table."""
+        if self.handy:
+            if self.handy.last_model:
+                return f"Handy last log ({self.handy.last_event}): {self.handy.last_model.rsplit('/', 1)[-1]}"
+            if self.handy.selected_model:
+                return f"Handy selected (not load proof): {self.handy.selected_model.rsplit('/', 1)[-1]}"
         if self.llm and self.llm.models:
             parts = []
             for i, g in enumerate(self.llm.models):
@@ -164,6 +171,8 @@ class Collector:
                 ollama_runners.append(row)
 
         for row in snap.procs:
+            if os.path.basename(row.detail.exe).lower() == "handy.exe":
+                row.handy = inspect_handy(row.detail.create_time)
             if row.detail.is_diffusion or row.kind not in AI_KINDS or not (row.detail.models or row.kind == "LLM"):
                 continue
             own = self.prober.get(row.detail.ports)

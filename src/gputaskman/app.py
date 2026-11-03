@@ -329,6 +329,14 @@ class GpuTaskManager(App):
                             "usage. Estimated non-residency, not proof of eviction or disk paging.",
                             style="yellow"))
 
+        if r.handy:
+            if r.handy.selected_model:
+                out.append(Text(f"Handy selected (settings; not load proof): {r.handy.selected_model}", style="grey70"))
+            if r.handy.last_event:
+                out.append(Text(f"Handy last event: {r.handy.last_event} {r.handy.last_model or ''} "
+                                f"at {r.handy.last_event_local} (runtime-reported history, not current GPU residency)",
+                                style="green"))
+
         v = r.llm
         if v:
             width = max(min(self.size.width - 8, 100), 20)

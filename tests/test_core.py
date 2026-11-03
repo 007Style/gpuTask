@@ -7,6 +7,7 @@ import os
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,6 +16,7 @@ from gputaskman.cli import main
 from gputaskman.collector import ProcRow, Snapshot, select_adapter, select_nv_device
 from gputaskman.dxgi import Adapter
 from gputaskman.gguf import GgufInfo, read_gguf
+from gputaskman.handy import HandyEvidence, inspect_handy, _log_cache, _settings_cache
 from gputaskman.llm import (LlmView, ServerInfo, build_view, is_gpu_device, llama_server_models, lmstudio_models,
                             parse_flags, parse_load_log, probe_server)
 from gputaskman.nvml import NvDevice
@@ -159,6 +161,74 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(public.procs[0].llm.models[0].path, "model.gguf")
         self.assertIn("private-test-value", original.procs[0].detail.cmdline)
         self.assertIn("Users", original.procs[0].llm.models[0].path)
+
+
+class HandyTests(unittest.TestCase):
+    def setUp(self):
+        _log_cache.clear()
+        _settings_cache.clear()
+
+    def test_selected_model_is_distinct_from_runtime_load_and_unload_events(self):
+        with tempfile.TemporaryDirectory() as directory:
+            appdata, localappdata = Path(directory) / "Roaming", Path(directory) / "Local"
+            settings_dir = appdata / "com.pais.handy"
+            log_dir = localappdata / "com.pais.handy" / "logs"
+            settings_dir.mkdir(parents=True)
+            log_dir.mkdir(parents=True)
+            selected = "handy-computer/nemotron/model-Q8_0.gguf"
+            (settings_dir / "settings_store.json").write_text(
+                json.dumps({"settings": {"selected_model": selected}}), encoding="utf-8"
+            )
+            (log_dir / "handy.log").write_text(
+                "[2026-11-02][22:59:00][transcription][INFO] Loaded whisper model 'old.gguf'\n"
+                "[2026-11-02][23:01:00][transcription][INFO] Loaded whisper model 'handy-computer/nemotron/model-Q8_0.gguf' (backend 'Vulkan0')\n"
+                "[2026-11-02][23:01:01][transcription][INFO] Live streaming transcription started (model 'handy-computer/nemotron/model-Q8_0.gguf', backend 'Vulkan0')\n"
+                "[2026-11-02][23:01:02][transcription][INFO] Model idle for 3606s (limit: 3600s), unloading\n"
+                "[2026-11-02][23:01:03][transcription][INFO] Model unloaded due to inactivity (took 20ms)\n"
+                "[2026-11-02][23:01:04][transcription][INFO] Partial transcription: private dictation text\n",
+                encoding="utf-8",
+            )
+            started = datetime(2026, 11, 2, 23, 0, tzinfo=timezone.utc).timestamp()
+            evidence = inspect_handy(started, str(appdata), str(localappdata))
+        self.assertEqual(evidence.selected_model, selected)
+        self.assertEqual(evidence.last_model, "handy-computer/nemotron/model-Q8_0.gguf")
+        self.assertEqual(evidence.last_event, "unloaded")
+        self.assertTrue(evidence.last_event_at.endswith("+00:00"))
+        local = datetime(2026, 11, 2, 23, 1, 3, tzinfo=timezone.utc).astimezone()
+        self.assertEqual(evidence.last_event_local, local.strftime("%Y-%m-%d %H:%M:%S"))
+        self.assertNotIn("private dictation text", repr(evidence))
+
+    def test_selected_model_without_fresh_log_is_not_reported_as_loaded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            appdata, localappdata = Path(directory) / "Roaming", Path(directory) / "Local"
+            settings_dir = appdata / "com.pais.handy"
+            log_dir = localappdata / "com.pais.handy" / "logs"
+            settings_dir.mkdir(parents=True)
+            log_dir.mkdir(parents=True)
+            selected = "handy-computer/nemotron/model-Q8_0.gguf"
+            (settings_dir / "settings_store.json").write_text(
+                json.dumps({"settings": {"selected_model": selected}}), encoding="utf-8"
+            )
+            (log_dir / "handy.log").write_text(
+                "[2026-11-02][22:59:00][transcription][INFO] Loaded whisper model 'old.gguf'\n",
+                encoding="utf-8",
+            )
+            started = datetime(2026, 11, 2, 23, 0, tzinfo=timezone.utc).timestamp()
+            evidence = inspect_handy(started, str(appdata), str(localappdata))
+        self.assertEqual(evidence.selected_model, selected)
+        self.assertIsNone(evidence.last_model)
+        self.assertIsNone(evidence.last_event)
+
+    def test_handy_evidence_is_visible_in_text_and_json(self):
+        s = snapshot()
+        s.procs[0] = ProcRow(
+            10, "handy.exe", "AI", ProcGpu(dedicated=GiB), ProcDetail(10, "handy.exe"),
+            handy=HandyEvidence("handy-computer/nemotron/model.gguf", "model.gguf", "loaded",
+                                "2026-11-02T23:01:00+00:00"),
+        )
+        self.assertIn("Handy last log (loaded): model.gguf", s.procs[0].inside)
+        self.assertIn("not current GPU residency", to_text(s))
+        self.assertEqual(to_dict(s)["processes"][0]["handy"]["last_event"], "loaded")
 
 
 class ModelTests(unittest.TestCase):
@@ -531,6 +601,24 @@ class UiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("None", lines)
                 self.assertIsNone(app.hist_util[-1])
                 self.assertEqual(app.hist_bw[-1], 0)
+
+    async def test_handy_evidence_is_explicit_in_inspector(self):
+        with patch.object(GpuTaskManager, "poll"):
+            app = GpuTaskManager()
+            async with app.run_test(size=(180, 42)) as pilot:
+                s = snapshot()
+                s.procs[0] = ProcRow(
+                    10, "handy.exe", "AI", ProcGpu(dedicated=GiB), ProcDetail(10, "handy.exe"),
+                    handy=HandyEvidence("handy-computer/nemotron/model.gguf", "model.gguf", "loaded",
+                                        "2026-11-02T23:01:00+00:00"),
+                )
+                app.apply(s)
+                await pilot.pause()
+                await pilot.press("down")
+                await pilot.pause()
+                text = " ".join(ET.fromstring(app.export_screenshot()).itertext()).replace("\u00a0", " ")
+                self.assertIn("Handy selected (settings; not load proof)", text)
+                self.assertIn("runtime-reported history, not current GPU residency", text)
 
     async def test_likely_kind_is_explicit_in_process_and_inspector(self):
         g = gguf("qwen35", block_count=2, context_length=4096, **{"general.name": "Snapshot_Cfg"})

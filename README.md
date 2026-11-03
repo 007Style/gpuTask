@@ -190,7 +190,7 @@ reading is NVML's memory-activity percentage, **not measured bandwidth in GB/s**
 | stable-diffusion.cpp (`--diffusion-model`) | Diffusion, text-encoder and VAE files from launch arguments; no LLM memory breakdown |
 | Hugging Face cache | `models--org--repo` paths are named `org/repo` |
 | Other AI runtimes | DLL detection, plus model files installed with the app (marked *not proven loaded*) |
-| Handy | Local speech workloads are in scope; runtime DLLs/mapped files and installed candidates are inspected. A selected/downloaded speech model alone is not proof of GPU residency or use |
+| Handy | Reads selected model from settings and bounded load/start/preview/unload events from `handy.log`; selection is not load evidence and log events are historical, not proof of current residency |
 | WinML / local helper processes | GPU-backed execution is in scope; generic process counters and runtime detection only. No WinML-specific model/session or client-to-helper attribution yet |
 | Windows Studio Effects | Only any observable GPU portion is in scope. NPU inference is out of scope; do not interpret GPU camera/render activity as proof of model execution |
 
@@ -215,9 +215,11 @@ Every model row shows its **evidence**, strongest first:
 | `mapped` | Windows shows the file memory-mapped into the process right now |
 | `cmdline` | The file was a launch argument (`-m model.gguf`) |
 | `installed` | Found in the app's install or data folder; nothing proves it is loaded |
+| Handy settings / log | Settings show selection; timestamped log events show what Handy reported, not current residency |
 
-Two sources including `api` or `mapped` show as **confirmed**. Model-store folders only supply a
-friendly name. The authoritative model *kind* comes from GGUF header keys: `decision.type` marks a
+Two sources including `api` or `mapped` show as **confirmed**. Runtime logs can report model events,
+but are displayed as timestamped history and do not prove current residency. Model-store folders
+only supply a friendly name. The authoritative model *kind* comes from GGUF header keys: `decision.type` marks a
 decision model (for example [Laya](https://huggingface.co/ggml-org/Laya-GGUF)), `pooling_type`
 an embedding model or reranker, `stt.*` a speech model, and a causal model with layers and a
 trained context an LLM. llama-server's `/v1/models` `output_modalities` (`text`, `decisions`)
@@ -238,10 +240,23 @@ Neither a type hint nor an API/file match proves which model produced the proces
 
 Some runtimes (ONNX Runtime, whisper.cpp) read a model into memory and close the file. Windows then
 has no record of which file is loaded, so the app's installed models are listed as candidates only.
-For Handy, the configured `selected_model` can refer to a different model in a separate cache;
-the current installed-folder fallback does not read that setting. Even reading it would establish
-selection, not current GPU residency or execution. Do not assume the largest installed speech
-model is the one in use.
+For Handy, gputaskman reads the configured `selected_model` and only model-load, streaming-start,
+preview, and unload events from its local log. Settings prove selection; a fresh log event proves
+Handy reported that event after the current process started. Neither proves continuous GPU residency.
+Log parsing is bounded to the last 512 KiB, cached until the file changes, and ignores transcription
+content. Handy's selected Hugging Face model can live outside its Roaming `models` folder. Handy
+logs in UTC; JSON keeps that UTC timestamp and the TUI/text output show local time.
+
+**Other speech and vision apps.** Handy is the first *app adapter*: a read-only recipe for where an
+app keeps its settings and which log lines mark a model load or unload. Most whisper-style apps
+(whisper.cpp, faster-whisper, sherpa-onnx, ONNX Runtime) read a model and close the file, so the OS
+keeps no record of it. Adapters give exact names when an app logs them, but each app needs its own
+recipe, and a log-format change can break it. The runtime-agnostic answer is to see the file being
+opened during the load: Windows kernel file-I/O ETW events record which process opened which model
+file. Combined with that process's VRAM jump, this identifies the model without app-specific code.
+It needs elevation and must already be running when the load happens, so it is planned as an
+opt-in mode. Until then, unknown apps show their runtime DLLs, VRAM, engine activity, and installed
+candidates. Reading model names out of another process's memory is deliberately not done.
 
 Identification is designed to stay cheap. Measured on one Windows machine:
 
@@ -349,6 +364,9 @@ downloads are bundled in this repository.
 - Explicit provenance and availability for every counter and estimate.
 - Reliable multi-GPU matching and per-device model placement.
 - Live throughput deltas, LM Studio validation, and per-model context accounting.
+- Opt-in ETW file-open tracing to name models loaded by read-and-close runtimes (any whisper or ONNX
+  app), correlated with the process's VRAM jump at load time.
+- Data-driven app adapters (settings path plus load/unload log patterns) once a second app needs one.
 - Optional ETW / runtime instrumentation for allocation lifetime and residency detail.
 
 ## License

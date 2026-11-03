@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,7 +17,8 @@ from gputaskman.gguf import GgufInfo, read_gguf
 from gputaskman.llm import (LlmView, ServerInfo, build_view, is_gpu_device, llama_server_models, lmstudio_models,
                             parse_flags, parse_load_log, probe_server)
 from gputaskman.pdh import GpuCounters, ProcGpu
-from gputaskman.procinfo import MappedModel, ProcDetail, ProcInspector, _is_model_file, classify, installed_models
+from gputaskman.procinfo import (AI_KINDS, MappedModel, ProcDetail, ProcInspector, _is_model_file, classify,
+                                installed_models, make_model)
 from gputaskman.report import to_dict, to_text
 from gputaskman.stores import store_name
 from tools.capture_screenshots import for_publication
@@ -172,6 +174,106 @@ LAYA = dict(block_count=30, context_length=8192, **{"decision.type": "laya", "at
 
 
 class IdentityTests(unittest.TestCase):
+    def test_decision_name_hints_use_model_names_not_substrings(self):
+        matches = [
+            (r"C:\models\OpenJev-Q4_K_M.gguf", None),
+            (r"C:\models\Laya-Q8_0.gguf", None),
+            (r"C:\models\julia-1.gguf", None),
+            (r"C:\models\LEV-Q4_K_M.gguf", None),
+            (r"C:\models\kev.gguf", None),
+            (r"C:\models\OpenJev\model.safetensors", None),
+            (r"C:\models\blob", "ggml-org/OpenJev-GGUF"),
+            (r"C:\models\blob", "openjev:latest"),
+            (r"C:\models\blob", "qwen3:14b, openjev:latest"),
+        ]
+        misses = [
+            (r"C:\models\clever.gguf", None),
+            (r"C:\models\kevin.gguf", None),
+            (r"C:\models\openjevish.gguf", None),
+            (r"C:\Users\laya\models\qwen.gguf", None),
+            (r"C:\models\model.gguf", "openjev/qwen3"),
+            (r"C:\models\model.gguf", "qwen3:openjev"),
+            (r"C:\models\model.gguf", "unsloth/Qwen3-GGUF"),
+            (r"C:\models\jev.gguf", None),
+        ]
+        for cases, expected in ((matches, "decision model"), (misses, "")):
+            for path, store in cases:
+                with self.subTest(path=path, store=store), \
+                        patch("gputaskman.procinfo.store_name", return_value=store):
+                    m = make_model(path, 1000, 0, False, "mapped", store)
+                    self.assertEqual(m.kind_hint, expected)
+                    self.assertEqual(m.sources, ["mapped"])
+                    self.assertEqual(m.evidence, "in use (mapped)")
+
+    def test_specific_header_kinds_override_name_hints(self):
+        kinds = [
+            gguf("modern-bert", **LAYA), gguf("clip"), gguf("bert", pooling_type=1),
+            gguf("bert", pooling_type=4), gguf("parakeet", **{"stt.variant": "tdt"}),
+            gguf("qwen3", **{"general.type": "adapter"}),
+        ]
+        for g in kinds:
+            with self.subTest(kind=g.kind), patch("gputaskman.procinfo.read_gguf", return_value=g):
+                m = make_model("OpenJev.gguf", 1000, 0, True, "mapped", "openjev/openjev-GGUF")
+            self.assertEqual(m.kind, g.kind)
+            self.assertEqual(m.kind_hint, "")
+            self.assertEqual(m.kind_label, g.kind)
+
+    def test_openjev_hint_does_not_change_header_kv_or_loading_evidence(self):
+        g = gguf("qwen35", block_count=2, context_length=4096, **{
+            "general.name": "Snapshot_Cfg", "attention.head_count": 4,
+            "attention.head_count_kv": 2, "embedding_length": 16})
+        with patch("gputaskman.procinfo.read_gguf", return_value=g):
+            m = make_model("OpenJev-Q4_K_M.gguf", 1000, 0, True, "mapped", "")
+        d = ProcDetail(10, "llama-server.exe", models=[m])
+        self.assertEqual(classify(d, {}), "decision?")
+        self.assertIn("decision?", AI_KINDS)
+        self.assertEqual(m.kind, "LLM")
+        self.assertEqual(m.kind_label, "likely decision model (name)")
+        server = ServerInfo("llama-server", "http://127.0.0.1:1", n_ctx=4, model_path=m.path)
+        with patch("gputaskman.llm.read_gguf", return_value=g):
+            v = build_view(d, 1000, 0, server)
+        self.assertEqual(v.label(0), "OpenJev-Q4_K_M.gguf")
+        self.assertEqual(v.kind_label(0), "likely decision model (name)")
+        self.assertEqual(v.files[0].evidence, "confirmed (api+mapped)")
+        self.assertEqual(m.sources, ["mapped"])
+        self.assertEqual(g.kind, "LLM")
+        self.assertIsNone(g.decision_type)
+        self.assertEqual(v.kv_per_token, 64)
+        self.assertTrue(any(s.kind == "kv" for s in v.segments))
+        self.assertFalse(any("Non-causal" in n for n in v.notes))
+        s = snapshot()
+        s.procs[0] = ProcRow(10, d.name, classify(d, {}), ProcGpu(dedicated=1000), d, v)
+        data = to_dict(s)["processes"][0]
+        self.assertEqual(data["kind"], "decision?")
+        self.assertEqual(data["model_files"][0]["kind_hint"], "decision model")
+        self.assertEqual(data["llm"]["models"][0]["kind"], "LLM")
+        self.assertEqual(data["llm"]["models"][0]["kind_hint"], "decision model")
+        self.assertEqual(data["llm"]["models"][0]["kind_label"], "likely decision model (name)")
+        self.assertIn("likely decision model (name)", to_text(s))
+        self.assertIn("confirmed (api+mapped)", to_text(s))
+
+    def test_installed_kind_hints_do_not_classify_the_process(self):
+        m = make_model("OpenJev.safetensors", 1000, 0, False, "installed", "")
+        d = ProcDetail(10, "python.exe", runtimes=["PyTorch"], candidates=[m])
+        self.assertEqual(m.kind_label, "likely decision model (name)")
+        self.assertEqual(m.evidence, "installed, not proven loaded")
+        self.assertEqual(classify(d, {}), "AI")
+        row = ProcRow(10, d.name, classify(d, {}), ProcGpu(), d)
+        self.assertIn("installed (unproven)", row.inside)
+        self.assertIn("likely decision model (name)", row.inside)
+
+    def test_non_gguf_hints_are_visible_in_reports(self):
+        m = make_model("OpenJev.safetensors", 1000, 0, False, "mapped", "")
+        d = ProcDetail(10, "python.exe", runtimes=["PyTorch"], models=[m])
+        v = build_view(d, 1000, 0, None)
+        s = snapshot()
+        s.procs[0] = ProcRow(10, d.name, classify(d, {}), ProcGpu(dedicated=1000), d, v)
+        self.assertEqual(v.models, [])
+        self.assertEqual(v.other_files, [m])
+        self.assertIn("likely decision model (name)", s.procs[0].inside)
+        self.assertIn("likely decision model (name)", to_text(s))
+        self.assertEqual(to_dict(s)["processes"][0]["model_files"][0]["kind_hint"], "decision model")
+
     def test_gguf_kinds_come_from_header_keys(self):
         cases = {
             "LLM": gguf("qwen3", block_count=28, context_length=40960),
@@ -307,6 +409,27 @@ class IdentityTests(unittest.TestCase):
 
 
 class UiTests(unittest.IsolatedAsyncioTestCase):
+    async def test_likely_kind_is_explicit_in_process_and_inspector(self):
+        g = gguf("qwen35", block_count=2, context_length=4096, **{"general.name": "Snapshot_Cfg"})
+        with patch.object(GpuTaskManager, "poll"):
+            app = GpuTaskManager()
+            async with app.run_test(size=(240, 50)) as pilot:
+                for ext in ("gguf", "safetensors"):
+                    with self.subTest(format=ext):
+                        with patch("gputaskman.procinfo.read_gguf", return_value=g):
+                            m = make_model(f"OpenJev.{ext}", 1000, 0, ext == "gguf", "mapped", "")
+                        d = ProcDetail(10, "llama-server.exe", models=[m])
+                        with patch("gputaskman.llm.read_gguf", return_value=g):
+                            v = build_view(d, GiB, 0, None)
+                        s = snapshot()
+                        s.procs[0] = ProcRow(10, d.name, classify(d, {}), ProcGpu(dedicated=GiB), d, v)
+                        app.apply(s)
+                        await pilot.pause()
+                        self.assertEqual(app.query_one("#procs").get_row("10")[2].plain, "decision?")
+                        text = " ".join(ET.fromstring(app.export_screenshot()).itertext()).replace("\u00a0", " ")
+                        self.assertIn("likely decision model (name)", text)
+                        self.assertIn("in use (mapped)", text)
+
     async def test_navigation_sort_pause_and_help(self):
         with patch.object(GpuTaskManager, "poll"):
             app = GpuTaskManager()

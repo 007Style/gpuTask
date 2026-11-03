@@ -26,6 +26,8 @@ def to_dict(s: Snapshot) -> dict:
         if p.llm:
             item["llm"] = {
                 "models": [{"path": g.path, "name": g.name, "label": p.llm.label(i), "arch": g.arch, "kind": g.kind,
+                            "kind_label": p.llm.kind_label(i),
+                            "kind_hint": p.llm.files[i].kind_hint if i < len(p.llm.files) else "",
                             "decision_type": g.decision_type, "params": g.n_params,
                             "quant": g.quant, "layers": g.n_layers, "ctx_train": g.ctx_train,
                             "gpu_weight_bytes": g.gpu_weight_bytes(),
@@ -67,10 +69,13 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
         out.append("")
         out.append(f"== {p.name} ({p.pid})  VRAM {gb(p.gpu.dedicated)}")
         for i, g in enumerate(p.llm.models):
-            kind = g.kind + (f" ({g.decision_type})" if g.decision_type else "")
+            kind = p.llm.kind_label(i)
             ev = p.llm.files[i].evidence if i < len(p.llm.files) else ""
             out.append(f"   {kind}: {p.llm.label(i)}  [{g.arch}, {g.params_label} params, {g.quant}, {g.n_layers} layers, "
                        f"ctx_train {g.ctx_train}]  {os.path.basename(g.path)}  evidence: {ev}")
+        for f in p.llm.other_files:
+            kind = f", {f.kind_label}" if f.kind_label else ""
+            out.append(f"   file: {f.store_name or f.path}  ({gb(f.size)}{kind})  evidence: {f.evidence}")
         for seg in p.llm.segments:
             out.append(f"   {gb(seg.bytes):>9}  {seg.label}{'' if seg.exact else ''}")
         if p.llm.server:

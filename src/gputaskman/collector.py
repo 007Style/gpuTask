@@ -42,10 +42,12 @@ class ProcRow:
                     parts.append(f"{self.llm.label(i)} {g.params_label} {g.quant}")
             return ", ".join(parts)
         if self.detail.models:
-            return ", ".join(m.store_name or os.path.basename(m.path) for m in self.detail.models[:2])
+            return ", ".join((m.store_name or os.path.basename(m.path)) +
+                             (f" ({m.kind_label})" if m.kind_hint else "") for m in self.detail.models[:2])
         if self.detail.candidates:
             return "installed (unproven): " + ", ".join(
-                f"{m.store_name or os.path.basename(m.path)} {gb(m.size)}" for m in self.detail.candidates[:2])
+                f"{m.store_name or os.path.basename(m.path)} {gb(m.size)}" +
+                (f" ({m.kind_label})" if m.kind_hint else "") for m in self.detail.candidates[:2])
         return {
             "compositor": "desktop back buffers + composed frames",
             "kernel": "driver/kernel allocations",

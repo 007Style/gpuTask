@@ -5,6 +5,7 @@ from __future__ import annotations
 import fnmatch
 import os
 import re
+import sys
 import time
 from dataclasses import dataclass, field
 
@@ -13,30 +14,39 @@ import psutil
 from .gguf import is_gguf, read_gguf
 from .stores import store_name
 
-# (tag, dll patterns). Order = display priority (most specific first).
+# (tag, library patterns: Windows DLLs and Linux shared objects with the version suffix removed, see
+# _lib_name). Order = display priority (most specific first).
 RUNTIMES: list[tuple[str, tuple[str, ...]]] = [
-    ("llama.cpp", ("llama.dll", "libllama*.dll", "llama-*.dll", "llm_engine*")),
-    ("whisper.cpp", ("whisper*.dll",)),
-    ("ggml", ("ggml*.dll",)),
-    ("PyTorch", ("torch_cuda*.dll", "torch_cpu.dll")),
-    ("TensorRT", ("nvinfer*.dll",)),
-    ("ONNX RT", ("onnxruntime*.dll",)),
+    ("llama.cpp", ("llama.dll", "libllama*.dll", "llama-*.dll", "llm_engine*", "libllama*.so")),
+    ("whisper.cpp", ("whisper*.dll", "libwhisper*.so")),
+    ("ggml", ("ggml*.dll", "libggml*.so")),
+    ("PyTorch", ("torch_cuda*.dll", "torch_cpu.dll", "libtorch_cuda*.so", "libtorch_cpu.so")),
+    ("TensorRT", ("nvinfer*.dll", "libnvinfer*.so")),
+    ("ONNX RT", ("onnxruntime*.dll", "libonnxruntime*.so")),
     ("DirectML", ("directml.dll",)),
-    ("cuDNN", ("cudnn*.dll",)),
-    ("CUDA", ("nvcuda.dll", "nvcuda64.dll", "cudart64_*.dll", "cublas64_*.dll")),
-    ("Vulkan", ("vulkan-1.dll",)),
-    ("D3D12", ("d3d12core.dll",)),
-    ("OpenGL", ("opengl32.dll",)),
+    ("cuDNN", ("cudnn*.dll", "libcudnn*.so")),
+    ("CUDA", ("nvcuda.dll", "nvcuda64.dll", "cudart64_*.dll", "cublas64_*.dll",
+              "libcuda.so", "libcudart.so", "libcublas.so")),
+    ("Vulkan", ("vulkan-1.dll", "libvulkan.so")),
+    ("D3D12", ("d3d12core.dll", "libd3d12core.so")),
+    ("OpenGL", ("opengl32.dll", "libgl.so", "libglx*.so", "libegl*.so")),
     ("D3D11", ("d3d11.dll",)),
-    ("NVENC", ("nvencodeapi64.dll",)),
-    ("NVDEC", ("nvcuvid.dll", "nvcuvid64.dll")),
+    ("NVENC", ("nvencodeapi64.dll", "libnvidia-encode.so")),
+    ("NVDEC", ("nvcuvid.dll", "nvcuvid64.dll", "libnvcuvid.so")),
 ]
+_SO = re.compile(r"^(.+\.so)(?:\.[0-9][0-9a-z.]*)?$")
 AI_RUNTIMES = {"llama.cpp", "whisper.cpp", "ggml", "PyTorch", "TensorRT", "ONNX RT", "DirectML", "cuDNN"}
 _RUNTIME_RX = [(tag, re.compile("|".join(fnmatch.translate(p) for p in pats))) for tag, pats in RUNTIMES]
 MODEL_EXTS = {".gguf", ".ggml", ".safetensors", ".onnx", ".pt", ".pth", ".bin", ".engine", ".plan", ".tflite", ".ckpt"}
 AMBIGUOUS_EXTS = {".bin", ".pt", ".pth", ".ckpt"}  # also used for caches/tiles, so require size or a model store
 _NOT_MODELS = {".dll", ".exe", ".sys", ".mui", ".ttf", ".ttc", ".otf", ".dat", ".db", ".nls", ".pak", ".mun"}
-BROWSERS = {"msedge.exe", "chrome.exe", "firefox.exe", "msedgewebview2.exe", "brave.exe", "opera.exe", "arc.exe", "vivaldi.exe"}
+BROWSERS = {"msedge.exe", "chrome.exe", "firefox.exe", "msedgewebview2.exe", "brave.exe", "opera.exe", "arc.exe", "vivaldi.exe",
+            "chrome", "chromium", "chromium-browser", "firefox", "firefox-bin", "brave", "msedge", "opera", "vivaldi-bin"}
+# Linux display servers / compositors: they own the desktop back buffers, like dwm.exe on Windows.
+COMPOSITORS = {"dwm.exe", "xorg", "xwayland", "gnome-shell", "kwin_wayland", "kwin_x11", "sway", "hyprland",
+               "mutter", "weston", "wayfire", "labwc", "niri", "cosmic-comp", "picom", "compiz"}
+# Paths in /proc/<pid>/maps that are not regular files: never stat or open them.
+_SPECIAL_PREFIXES = ("[", "/dev/", "/proc/", "/sys/", "/memfd:", "/SYSV", "anon_inode:")
 LLM_NAMES = ("llama-", "llama.", "ollama", "lm studio", "lmstudio", "llmster", "koboldcpp", "jan", "gpt4all", "llamafile")
 # GGUF file kind -> process kind, in display priority order
 MODEL_KINDS = {"LLM": "LLM", "decision model": "decision", "embedding model": "embedding",
@@ -108,6 +118,16 @@ class ProcDetail:
         return _is_diffusion_cmdline(self.cmdline)
 
 
+def _lib_name(base: str) -> str | None:
+    """Lower-cased library file name with any Linux version suffix removed ('libcudart.so.12.4' ->
+    'libcudart.so'), or None when this is not a library."""
+    ext = os.path.splitext(base)[1]
+    if ext in (".dll", ".node"):
+        return base
+    m = _SO.match(base)
+    return m[1] if m else None
+
+
 def _match_runtimes(dll_names: set[str]) -> list[str]:
     return [tag for tag, rx in _RUNTIME_RX if any(rx.match(d) for d in dll_names)]
 
@@ -176,6 +196,24 @@ def _walk(root: str, depth: int, out: list[tuple[str, int]], budget: list[int]) 
                 continue
 
 
+_LINUX_SYSTEM_DIRS = ("/usr/bin/", "/usr/sbin/", "/bin/", "/sbin/", "/usr/lib", "/lib", "/usr/libexec/", "/snap/")
+
+
+def _is_system_path(exe: str) -> bool:
+    if sys.platform == "win32":
+        return exe.startswith(os.path.normcase(os.environ.get("SystemRoot", r"C:\Windows")))
+    # /usr/bin/python3 is shared by every Python app: walking /usr/bin finds nothing about the process.
+    return exe.startswith(_LINUX_SYSTEM_DIRS)
+
+
+def _data_dirs() -> list[str]:
+    if sys.platform == "win32":
+        return [d for d in (os.environ.get("APPDATA"), os.environ.get("LOCALAPPDATA")) if d]
+    home = os.path.expanduser("~")
+    return [os.environ.get("XDG_DATA_HOME") or os.path.join(home, ".local", "share"),
+            os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")]
+
+
 def installed_models(exe: str, now: float | None = None) -> list[MappedModel]:
     """Model files in an app's install and data folders. Fallback for runtimes that read a model into RAM and
     close the file (ONNX Runtime, whisper.cpp), which leaves no OS evidence of which model is loaded.
@@ -189,10 +227,10 @@ def installed_models(exe: str, now: float | None = None) -> list[MappedModel]:
         return hit[1]
     stem = os.path.splitext(os.path.basename(key))[0]
     roots = []
-    if not key.startswith(os.path.normcase(os.environ.get("SystemRoot", r"C:\Windows"))):
+    if not _is_system_path(key):
         roots.append(os.path.dirname(exe))
     if len(stem) >= 4:
-        for base in filter(None, (os.environ.get("APPDATA"), os.environ.get("LOCALAPPDATA"))):
+        for base in _data_dirs():
             try:
                 roots += [e.path for e in os.scandir(base) if stem in e.name.lower() and e.is_dir()]
             except OSError:
@@ -312,10 +350,13 @@ class ProcInspector:
         models: dict[str, MappedModel] = {}
         for m in maps:
             path = m.path
+            if path.startswith(_SPECIAL_PREFIXES) or path.endswith(" (deleted)"):
+                continue
             base = os.path.basename(path).lower()
             ext = os.path.splitext(base)[1]
-            if ext == ".dll" or ext == ".node":
-                dlls.add(base)
+            lib = _lib_name(base)
+            if lib:
+                dlls.add(lib)
                 continue
             if ext in _NOT_MODELS:
                 continue
@@ -347,9 +388,9 @@ class ProcInspector:
 
 def classify(d: ProcDetail, engines: dict[str, float]) -> str:
     n = d.name.lower()
-    if d.pid == 4:
+    if d.pid == 4 and sys.platform == "win32":  # "System"; PID 4 is an ordinary process on Linux
         return "kernel"
-    if n == "dwm.exe":
+    if n in COMPOSITORS:
         return "compositor"
     if n in ("csrss.exe", "winlogon.exe", "lsass.exe", "svchost.exe"):
         return "system"

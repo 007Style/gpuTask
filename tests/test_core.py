@@ -32,6 +32,11 @@ from gputaskman.report import to_dict, to_text
 from gputaskman.stores import store_name
 from tools.capture_screenshots import for_publication
 
+
+def native(path: str) -> str:
+    """Windows-style test paths as native paths, so path logic is exercised the same way on Linux."""
+    return path if os.sep == "\\" else "/" + path.split(":", 1)[-1].lstrip("\\").replace("\\", "/")
+
 GiB = 1 << 30
 MiB = 1 << 20
 
@@ -209,7 +214,7 @@ class MemoryTests(unittest.TestCase):
     def test_capture_does_not_change_original_or_publish_command_line(self):
         original = snapshot()
         original.procs[0].llm.models = [
-            GgufInfo(path=r"C:\Users\example\models\model.gguf", file_size=1, version=3)
+            GgufInfo(path=native(r"C:\Users\example\models\model.gguf"), file_size=1, version=3)
         ]
         public = for_publication(original)
         self.assertEqual(public.procs[0].detail.cmdline, [])
@@ -390,7 +395,7 @@ class IdentityTests(unittest.TestCase):
             for path, store in cases:
                 with self.subTest(path=path, store=store), \
                         patch("gputaskman.procinfo.store_name", return_value=store):
-                    m = make_model(path, 1000, 0, False, "mapped", store)
+                    m = make_model(native(path), 1000, 0, False, "mapped", store)
                     self.assertEqual(m.kind_hint, expected)
                     self.assertEqual(m.sources, ["mapped"])
                     self.assertEqual(m.evidence, "in use (mapped)")

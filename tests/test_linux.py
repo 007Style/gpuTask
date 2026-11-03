@@ -1,0 +1,254 @@
+from __future__ import annotations
+
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from gputaskman import linux
+from gputaskman.collector import ProcRow, Snapshot
+from gputaskman.gguf import GgufInfo
+from gputaskman.llm import build_view
+from gputaskman.pdh import ProcGpu
+from gputaskman.procinfo import ProcDetail, _lib_name, _match_runtimes, classify
+from gputaskman.report import to_dict, to_text
+
+GiB = 1 << 30
+NOT_AVAILABLE = (1 << 64) - 1  # NVML_VALUE_NOT_AVAILABLE as an unsigned long long
+
+
+class FakeNvml:
+    """Just enough of pynvml for LinuxCounters: one GPU, scripted process lists and utilization samples."""
+
+    def __init__(self, compute=(), graphics=(), samples=(), used=4 * GiB):
+        self.compute, self.graphics, self.samples, self.used = list(compute), list(graphics), list(samples), used
+        self.util_calls = []
+
+    def nvmlInit(self):
+        pass
+
+    def nvmlShutdown(self):
+        pass
+
+    def nvmlDeviceGetCount(self):
+        return 1
+
+    def nvmlDeviceGetHandleByIndex(self, i):
+        return "h0"
+
+    def nvmlDeviceGetPciInfo(self, h):
+        return SimpleNamespace(busId=b"00000000:01:00.0")
+
+    def nvmlDeviceGetName(self, h):
+        return "NVIDIA GeForce RTX 3090 Ti"
+
+    def nvmlDeviceGetMemoryInfo(self, h):
+        return SimpleNamespace(total=24 * GiB, used=self.used)
+
+    def nvmlDeviceGetComputeRunningProcesses(self, h):
+        return self.compute
+
+    def nvmlDeviceGetGraphicsRunningProcesses(self, h):
+        return self.graphics
+
+    def nvmlDeviceGetProcessUtilization(self, h, since):
+        self.util_calls.append(since)
+        return self.samples
+
+
+def proc(pid, used):
+    return SimpleNamespace(pid=pid, usedGpuMemory=used)
+
+
+def sample(pid, sm, enc=0, dec=0, ts=1):
+    return SimpleNamespace(pid=pid, smUtil=sm, encUtil=enc, decUtil=dec, timeStamp=ts)
+
+
+KEY = linux.pci_key("00000000:01:00.0")
+
+
+class LinuxLibraryTests(unittest.TestCase):
+    def test_versioned_shared_objects_are_libraries(self):
+        self.assertEqual(_lib_name("libcudart.so.12"), "libcudart.so")
+        self.assertEqual(_lib_name("libcuda.so.1.1"), "libcuda.so")
+        self.assertEqual(_lib_name("libtorch_cuda.so"), "libtorch_cuda.so")
+        self.assertEqual(_lib_name("nvcuda.dll"), "nvcuda.dll")
+        self.assertIsNone(_lib_name("model.gguf"))
+        self.assertIsNone(_lib_name("weights.safetensors"))
+        self.assertIsNone(_lib_name("model.so-weights.bin"))
+
+    def test_linux_runtimes_are_detected(self):
+        libs = {_lib_name(n) for n in ("libggml-cuda.so", "libllama.so", "libcudart.so.12", "libcuda.so.1",
+                                       "libvulkan.so.1", "libtorch_cuda.so", "libnvidia-encode.so.1")}
+        self.assertEqual(_match_runtimes(libs), ["llama.cpp", "ggml", "PyTorch", "CUDA", "Vulkan", "NVENC"])
+
+    def test_linux_compositors_and_browsers(self):
+        self.assertEqual(classify(ProcDetail(900, "Xorg"), {}), "compositor")
+        self.assertEqual(classify(ProcDetail(901, "gnome-shell"), {}), "compositor")
+        self.assertEqual(classify(ProcDetail(902, "firefox"), {}), "browser")
+
+    def test_pid_4_is_only_special_on_windows(self):
+        with patch("gputaskman.procinfo.sys.platform", "linux"):
+            self.assertEqual(classify(ProcDetail(4, "kworker/0:0"), {}), "app")
+        with patch("gputaskman.procinfo.sys.platform", "win32"):
+            self.assertEqual(classify(ProcDetail(4, "System"), {}), "kernel")
+
+
+class PdhImportTests(unittest.TestCase):
+    def test_pdh_module_is_complete_without_loading_the_dll(self):
+        from gputaskman import pdh
+        for name in ("PDH_FMT_DOUBLE", "PDH_FMT_NOCAP100", "PDH_MORE_DATA", "_Item", "_load_pdh"):
+            self.assertTrue(hasattr(pdh, name), name)
+
+
+class LinuxCountersTests(unittest.TestCase):
+    def setUp(self):
+        # Same PID namespace (bare metal): NVML's PIDs are local processes holding an NVIDIA device.
+        holders = patch.object(linux, "nvidia_holders", return_value={100, 101, 200, 300, 555})
+        holders.start()
+        self.addCleanup(holders.stop)
+
+    def counters(self, fake, wsl):
+        with patch.object(linux, "N", fake), patch.object(linux, "is_wsl", return_value=wsl):
+            return linux.LinuxCounters()
+
+    def test_native_linux_attributes_vram_and_engines_per_pid(self):
+        fake = FakeNvml(compute=[proc(100, 3 * GiB), proc(200, 1 * GiB)],
+                        graphics=[proc(200, 1 * GiB), proc(300, 256 << 20)],
+                        samples=[sample(100, 80, ts=5), sample(100, 90, ts=9), sample(300, 30, dec=20, ts=7)])
+        c = self.counters(fake, wsl=False)
+        with patch.object(linux, "N", fake):
+            procs, adapters = c.sample()
+            c.sample()
+        per = procs[KEY]
+        self.assertEqual(adapters[KEY].dedicated, 4 * GiB)
+        self.assertEqual(per[100].dedicated, 3 * GiB)
+        self.assertEqual(per[200].dedicated, 1 * GiB)  # in both lists: counted once
+        self.assertEqual(per[100].engines["compute"], 90)  # latest sample wins
+        self.assertEqual(per[300].engines["3d"], 30)  # graphics-only process: SM load is 3D work
+        self.assertEqual(per[300].engines["decode"], 20)
+        self.assertTrue(all(g.attributed for g in per.values()))
+        self.assertEqual(fake.util_calls, [0, 9])  # next poll asks only for newer samples
+
+    def test_hidden_per_process_memory_is_unknown_not_zero(self):
+        fake = FakeNvml(compute=[proc(100, NOT_AVAILABLE), proc(101, None)])
+        c = self.counters(fake, wsl=False)
+        with patch.object(linux, "N", fake):
+            procs, _ = c.sample()
+        self.assertFalse(procs[KEY][100].attributed)
+        self.assertFalse(procs[KEY][101].attributed)
+
+    def test_utilization_for_unlisted_pids_is_ignored(self):
+        fake = FakeNvml(compute=[proc(100, GiB)], samples=[sample(555, 50)])
+        c = self.counters(fake, wsl=False)
+        with patch.object(linux, "N", fake):
+            procs, _ = c.sample()
+        self.assertNotIn(555, procs[KEY])
+
+    def test_wsl_never_uses_windows_host_pids(self):
+        # Under WSL NVML reports Windows PIDs (dwm 2744, System 4); they must not become Linux rows.
+        fake = FakeNvml(samples=[sample(2744, 12), sample(4, 88)], used=7 * GiB)
+        c = self.counters(fake, wsl=True)
+        with patch.object(linux, "N", fake), patch.object(linux, "dxg_pids", return_value={4242}):
+            procs, adapters = c.sample()
+        self.assertEqual(adapters[KEY].dedicated, 7 * GiB)
+        self.assertEqual(set(procs[KEY]), {4242})
+        self.assertFalse(procs[KEY][4242].attributed)
+        self.assertEqual(fake.util_calls, [])
+
+    def test_adapters_come_from_nvml(self):
+        with patch.object(linux, "N", FakeNvml()):
+            adapters = linux.enumerate_adapters()
+        self.assertEqual([(a.luid, a.name, a.dedicated_vram) for a in adapters],
+                         [(KEY, "NVIDIA GeForce RTX 3090 Ti", 24 * GiB)])
+
+
+class ContainerTests(unittest.TestCase):
+    """Measured on a Vast.ai Docker container: NVML lists host PIDs (2029701...) while the processes are
+    547 and 563 inside; the host's display server shows up only in the graphics list."""
+
+    def sample(self, c, fake, holders, cuda):
+        with patch.object(linux, "N", fake), patch.object(linux, "nvidia_holders", return_value=set(holders)), \
+                patch.object(linux, "has_cuda", side_effect=lambda pid: pid in cuda):
+            return c.sample()[0][KEY]
+
+    def test_host_pids_are_matched_to_container_pids_by_creation_order(self):
+        fake = FakeNvml(compute=[proc(2029701, GiB), proc(2029747, 2 * GiB)],
+                        graphics=[proc(1145, 58 << 20), proc(1360, 21 << 20)],
+                        samples=[sample(2029747, 95, ts=3)])
+        with patch.object(linux, "N", fake), patch.object(linux, "is_wsl", return_value=False):
+            c = linux.LinuxCounters()
+        # 564 is an NVML-only tool (nvidia-smi, this monitor): it holds the devices but has no CUDA context
+        per = self.sample(c, fake, holders={547, 563, 564}, cuda={547, 563})
+        self.assertEqual({pid: (g.dedicated, g.inferred_by) for pid, g in per.items()},
+                         {547: (GiB, "consistent"), 563: (2 * GiB, "consistent")})
+        self.assertEqual(per[563].engines["compute"], 95)  # utilization follows the match
+        self.assertEqual(set(c.outside[KEY]), {1145, 1360})  # never looked up in the container's /proc
+
+    def test_extra_outside_compute_is_a_guess_until_a_start_event(self):
+        fake = FakeNvml(compute=[proc(9000, GiB), proc(2029701, 3 * GiB)])  # 9000: another container
+        with patch.object(linux, "N", fake), patch.object(linux, "is_wsl", return_value=False):
+            c = linux.LinuxCounters()
+        per = self.sample(c, fake, holders={547}, cuda={547})
+        self.assertEqual((per[547].dedicated, per[547].inferred_by), (3 * GiB, "order"))
+        self.assertEqual(set(c.outside[KEY]), {9000})
+        fake.compute.append(proc(2029800, 2 * GiB))  # a new local job starts: one new PID on each side
+        per = self.sample(c, fake, holders={547, 600}, cuda={547, 600})
+        self.assertEqual((per[600].dedicated, per[600].inferred_by), (2 * GiB, "consistent"))
+
+    def test_bare_metal_is_unchanged(self):
+        fake = FakeNvml(compute=[proc(547, GiB)])
+        with patch.object(linux, "N", fake), patch.object(linux, "is_wsl", return_value=False):
+            c = linux.LinuxCounters()
+        per = self.sample(c, fake, holders={547}, cuda={547})
+        self.assertEqual((per[547].dedicated, per[547].inferred_by), (GiB, ""))
+        self.assertEqual(c.outside, {})
+
+    def test_outside_rows_never_borrow_a_local_identity(self):
+        from gputaskman.collector import ProcRow as Row
+        row = Row(1145, "(outside this container)", "external", ProcGpu(dedicated=58 << 20),
+                  ProcDetail(1145, "(outside this container)"), host=True, origin="outside")
+        self.assertEqual((row.key, row.pid_label), ("o1145", "H:1145"))
+        snap = Snapshot(taken=1, adapter=None, adapters=[], nv=None, driver="", cuda="", vram_total=8 * GiB,
+                        vram_used=GiB, shared_used=0, backend="nvml", procs=[row])
+        self.assertIn("H:1145", to_text(snap))
+        self.assertEqual(to_dict(snap)["processes"][0]["host"], "outside")
+
+
+class UnattributedReportTests(unittest.TestCase):
+    def snapshot(self):
+        return Snapshot(taken=1, adapter=None, adapters=[], nv=None, driver="", cuda="", vram_total=24 * GiB,
+                        vram_used=7 * GiB, shared_used=0, backend="wsl",
+                        procs=[ProcRow(4242, "python3", "AI", ProcGpu(attributed=False), ProcDetail(4242, "python3"))])
+
+    def test_reports_say_unknown_instead_of_zero(self):
+        data = to_dict(self.snapshot())
+        self.assertEqual(data["backend"], "wsl")
+        self.assertIsNone(data["processes"][0]["vram_bytes"])
+        self.assertFalse(data["processes"][0]["vram_attributed"])
+        text = to_text(self.snapshot())
+        row = next(line for line in text.splitlines() if "4242" in line)
+        self.assertIn("n/a", row)
+        self.assertNotIn("0 B", row)
+        self.assertIn("WSL:", text)
+        self.assertNotIn("shared (in system RAM)", text)
+
+    def test_empty_wsl_view_explains_itself(self):
+        snap = self.snapshot()
+        snap.procs = []
+        self.assertIn("No Linux process", to_text(snap))
+
+    def test_llm_view_does_not_claim_cpu_inference_when_vram_is_unknown(self):
+        d = ProcDetail(4242, "llama-server", cmdline=["llama-server", "-c", "4096"])
+        d.models = [SimpleNamespace(path="/m/x.gguf", gguf=True, sources=["mapped"], store_name=None,
+                                    kind="", kind_hint="", size=GiB)]
+        with patch("gputaskman.llm.dataclasses.replace", side_effect=lambda m, **kw: m), \
+                patch("gputaskman.llm.read_gguf", return_value=GgufInfo(path="/m/x.gguf", file_size=GiB, version=3)):
+            known = build_view(d, 0, 0, None)
+            unknown = build_view(d, 0, 0, None, attributed=False)
+        self.assertTrue(any("CPU inference" in n for n in known.notes))
+        self.assertFalse(any("CPU inference" in n for n in unknown.notes))
+        self.assertTrue(any("unknown" in n for n in unknown.notes))
+
+
+if __name__ == "__main__":
+    unittest.main()

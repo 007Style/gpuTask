@@ -2,8 +2,8 @@
 
 **An `htop` for what's inside your GPU, not just how full it is.**
 
-Windows + NVIDIA/AMD, with NVIDIA support on Linux and WSL (see [Linux and WSL](#linux-and-wsl)) and
-macOS on Apple Silicon (see [macOS](#macos-apple-silicon)). A terminal UI
+Windows + NVIDIA/AMD, with Linux and WSL support (NVIDIA everywhere, AMD on native Linux; see
+[Linux and WSL](#linux-and-wsl)) and macOS on Apple Silicon (see [macOS](#macos-apple-silicon)). A terminal UI
 that connects per-process GPU memory and engine activity with loaded runtimes, model files, and
 LLM buffer breakdowns.
 
@@ -97,7 +97,8 @@ skips the consistency check, so do not use it after changing dependencies.
 
 Tagged releases include portable Linux builds: `gputaskman-VERSION-linux-x64.tar.gz` and
 `gputaskman-VERSION-linux-arm64.tar.gz`. They need glibc 2.35 or newer (Ubuntu 22.04, Debian 12,
-or newer) and an NVIDIA driver, and work natively, in containers, and in WSL:
+or newer) and an NVIDIA driver (or, on native Linux, an AMD GPU on the `amdgpu` driver), and work
+natively, in containers, and in WSL:
 
 ```bash
 tar -xzf gputaskman-VERSION-linux-x64.tar.gz
@@ -149,6 +150,66 @@ matched to the right container PIDs with their NVML sizes (1.12, 2.52 and 1.59 G
 An Ollama `qwen3:0.6b` runner was detected and named from Ollama's store with `api+mapped+cmdline`
 evidence, its weights / KV-cache / compute split shown, and the TUI rendered. Bare-metal Linux
 (same PID namespace, no matching needed) is covered by tests but has not been run on hardware.
+
+**AMD GPUs on native Linux** (the `amdgpu` driver) need no ROCm, AMD SMI, or extra package: the
+kernel already exposes what's needed.
+
+| | Source |
+|---|---|
+| Device VRAM, GTT, load, temperature, power, clocks, fan, PCIe link | `/sys/class/drm/card*/device` and its `hwmon` |
+| Per-process VRAM and GTT | `drm-resident-vram` / `drm-resident-gtt` (older kernels: `drm-memory-*`) and `drm-shared-*` in `/proc/<pid>/fdinfo/<fd>` |
+| Per-process engine load (gfx, compute, video) | `drm-engine-*` busy time, sampled twice (`n/a` until a new client has two samples); `n/a` for ROCm/HIP processes (see below) |
+
+GTT is GPU-accessible system RAM, so it fills the SPILL column (and `shared (in system RAM)` for
+the device), like WDDM's non-local usage. On an APU (an integrated GPU, detected by amdgpu not
+reporting a VRAM vendor, a heuristic validated on one APU) GTT is the GPU's normal memory and "VRAM"
+is only a RAM carve-out, so GTT is still shown but never flagged as spill, and an LLM's memory is its
+VRAM plus GTT. The SDMA engine (`dma`) fills the COPY column. Paged stays blank: there is no commit
+counter. VRAM and SPILL are charged to a process only when nothing else can hold its bytes: each of
+its DRM clients has exactly one visible holder, was opened through a render node (`/dev/dri/renderD*`),
+and reports zero bytes in every `drm-shared-*` region. Then its resident VRAM and GTT are its own and add
+up without double counting. Otherwise the process shows VRAM and SPILL as `n/a` (`null` in JSON, with
+`vram_unattributed_reason`) and its bytes stay in *unattributed*:
+
+- **Shared client** (fd passing, fork; 1Password and its crash handler on the test desktop): one set of
+  counters, and nothing says which process uses it. GPU% is `n/a` too.
+- **Shared buffers** (a window a compositor imports, video frames): `drm-shared-*` counts a buffer by
+  where it *prefers* to live, resident or not, while `drm-resident-*` counts where buffers *are*, so
+  resident minus shared is not private memory and is never computed.
+- **Primary node** (`/dev/dri/card*`, typically a compositor): root-owned logind keeps a copy of that
+  fd, which a normal user can't see, so a single holder can't be proven.
+- **Legacy**: older kernels whose amdgpu fdinfo lacks `drm-shared-vram`/`drm-shared-gtt`.
+- **Incomplete**: some of the process's fds or fdinfo could not be read (GPU% is `n/a` too).
+- **Partial scan**: the TUI's 50 ms listing budget ran out this refresh, so a process it skipped might
+  hold the same client (GPU% is `n/a` too). Expected to be rare on a desktop (~9 ms for ~8,000 fds,
+  not yet re-measured with this rule); one-shot output always scans fully.
+
+The inspector and JSON (`vram_resident_bytes`, `gtt_resident_bytes`) still show every buffer the
+process can reach, shared ones included; the same buffer can appear under several processes, so these
+are a reference and are never summed. Unparseable or missing values are unknown (`null`), not 0. amdgpu has no device-wide
+video engine counter, so the device's encode/decode load stays N/A; per-process video load is
+measured. On VCN 4 and later (RDNA3 and newer, including the RX 9070) decode and encode share one
+ring, so it is reported as `video` rather than split. Only processes you can inspect are listed; the header and JSON (`process_status`) say how many could not be, and `sudo` includes other users'. `--gpu 1`
+selects the next card, such as an APU's integrated GPU next to a discrete one. A ROCm/HIP process
+(tagged `HIP`) has its VRAM in fdinfo like any other. Its GPU% is not: HIP submits compute through user-mode queues on `/dev/kfd`, which the kernel
+does not time per process, so a process holding `/dev/kfd` shows engines as `n/a` (`null` in JSON)
+rather than a measured-looking 0. The device's `AMD gfx` load does include that work.
+This path is native-Linux only; under WSL the GPU is `/dev/dxg`, with no DRM driver involved.
+
+Live check, bare-metal Arch-based Linux (kernel 7.2.15, `amdgpu`), Radeon RX 9070-series (Navi 48)
+plus a Radeon 610M iGPU: both cards were found, named, and read; VAAPI HEVC encode and decode with `ffmpeg`
+each showed as a `video` row at ~95-100% video load (on the RX 9070 both were charged to amdgpu's
+unified `enc` ring, hence `video`); desktop processes' VRAM summed
+to less than the card's used VRAM, with the compositor's imported windows listed as shared.
+llama.cpp's ROCm server image (`ghcr.io/ggml-org/llama.cpp:server-rocm`, Qwen3-4B-Instruct-2507
+Q4_K_M, `-ngl 99 -c 8192`, next to a running game) showed as an `LLM` row with `llama.cpp+ggml+HIP`
+and 3.95 GB of VRAM, matching the 2.49 GB of weights plus 1.21 GB of f16 KV cache plus compute
+buffers, and the 4.11 GB KFD reports for the process in `/sys/class/kfd/kfd/proc/<pid>/vram_*`.
+While it generated at 103 tok/s the device read 99% gfx and 339 W, but fdinfo had no engine lines
+for it, which is why ROCm rows show engines as `n/a`. PyTorch-ROCm has not been run on this path.
+That check predates the stricter attribution above (no subtraction of shared bytes; render-node,
+single-holder and complete-scan requirements; per-client timestamps; PID-reuse checks), which is
+covered by unit tests only and **not yet validated on AMD hardware**.
 
 **WSL** is different, because Windows owns the GPU. Linux cannot see how much VRAM its own
 processes use: `nvidia-smi` lists no processes, NVML's per-process samples carry *Windows* PIDs
@@ -501,6 +562,7 @@ Identification is designed to stay cheap. Measured on one Windows machine:
 | GGUF header, model-store manifests | ms, cached | Once per file / every 60 s |
 | Local API probes | ms, local only | llama-server `/v1/models` only when its model path changes |
 | `psutil.open_files()` | 0.6-2.5 s per process | Never |
+| AMD on Linux: DRM fdinfo scan (`readlink` every fd, read fdinfo of `/dev/dri` ones) | ~9 ms for ~8,000 fds (Linux desktop) | Every refresh, only when an amdgpu card is shown; listing fds is bounded to 50 ms in the TUI and resumes next refresh, known GPU fds are still read |
 | macOS: `ioreg` device stats + Metal clients | ~10 ms | Every refresh |
 | macOS: memory-map scan (`proc_pidinfo` region walk) | ~4 ms per process | Same policy as the memory-map scan above |
 | macOS: `footprint` GPU memory | ~70 ms per process, background thread | Busy and new processes every ~2 s, idle ones every 30 s (54 runs in 40 s with 27 GPU processes, M4 Mac mini) |
@@ -627,6 +689,7 @@ downloads are bundled in this repository.
 |---|---|
 | `pdh.py` / `dxgi.py` | Windows counters and adapter enumeration |
 | `linux.py` | Linux backend: NVML adapters and per-process usage, container PID matching, WSL detection, `/dev/dxg` holders |
+| `drm.py` | AMD on native Linux: amdgpu cards and device readings from sysfs, per-process VRAM/GTT/engine time from DRM fdinfo |
 | `wslhost.py` | WSL: interop check, Windows host counter stream, adapter pairing, context matching |
 | `macos.py` | macOS backend: IOKit device stats and per-process GPU time, `footprint` GPU memory poller, libproc memory maps |
 | `nvml.py` | NVIDIA device readings |
@@ -644,7 +707,7 @@ downloads are bundled in this repository.
 - Model identity for non-GGUF runtimes (ONNX Runtime, PyTorch, TensorRT) beyond installed candidates.
 - Explicit provenance and availability for every counter and estimate.
 - Reliable multi-GPU matching and per-device model placement.
-- Bare-metal Linux validation on hardware; AMD and Intel GPUs on Linux through DRM fdinfo.
+- Bare-metal Linux validation on NVIDIA hardware; Intel GPUs (`i915`/`xe`) through the same DRM fdinfo path as AMD.
 - macOS: a portable build, Ollama/llama.cpp/MLX validation, and compressed GPU memory (footprint's
   `swapped`) as the paged column.
 - WSL: per-process GPU load for Linux rows, and Ollama's systemd journal as a log source.

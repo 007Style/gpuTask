@@ -1,4 +1,4 @@
-"""Assembles one Snapshot from Windows counters, NVML, process inspection and LLM introspection."""
+"""Assembles one Snapshot from Windows counters, NVML or DRM, process inspection and LLM introspection."""
 
 from __future__ import annotations
 
@@ -111,9 +111,12 @@ class Snapshot:
     vram_used: int | None  # WDDM adapter-wide dedicated usage
     shared_used: int | None
     procs: list[ProcRow] = field(default_factory=list)
-    backend: str = "wddm"  # wddm (Windows) | nvml (native Linux) | wsl (device-wide only) | metal (macOS)
+    backend: str = "wddm"  # wddm (Windows) | nvml (native Linux, NVIDIA) | drm (native Linux, AMD) | wsl (device-wide only) | metal (macOS)
+    process_status: str = ""  # amdgpu only: what the DRM process scan couldn't cover; empty when it saw everything
     host_status: str = ""  # WSL only: Windows host counters via interop -- ok | starting | off (...) | ...
     wsl_split: str = ""  # WSL only: why Linux rows have no (inferred) VRAM, when they don't
+    # False on an APU (amdgpu iGPU): its GTT is ordinary GPU memory, not spill from a full VRAM.
+    shared_is_spill: bool = True
 
     @property
     def host_data(self) -> bool:
@@ -172,6 +175,11 @@ class Collector:
     DEEP_TOP_N = 25  # memory-map candidates: the top N VRAM users plus anything busy
     _mac_driver = ""  # "macOS 26.3.1" on the metal backend, read once at startup
     SCAN_BUDGET = 0.15  # seconds of memory-map scanning per sample; leftovers wait for the next sample
+    drm_card = None  # the selected GPU's amdgpu card, when it is one (drm.DrmCard)
+
+    @property
+    def backend(self) -> str:
+        return "drm" if self.drm_card is not None else BACKEND
 
     def __init__(self, gpu_index: int = 0, scan_budget: float | None = SCAN_BUDGET, host: bool = True) -> None:
         self.adapters = [a for a in enumerate_adapters() if not a.software]
@@ -181,6 +189,16 @@ class Collector:
         self.amdsmi = AmdSmi(self.adapter, self.adapters)
         self.adl = Adl(self.adapter, self.adapters)
         self._mac_driver = f"macOS {macos_version()}".strip() if BACKEND == "metal" else ""
+        # Native Linux on an AMD GPU: device metrics from amdgpu's sysfs, processes from DRM fdinfo.
+        drm = getattr(self.counters, "drm", None)
+        if drm is not None and self.adapter and self.adapter.vendor_id != VENDOR_NVIDIA:
+            self.drm_card = next((c for c in drm.cards if c.key == self.adapter.luid), None)
+        if drm is not None and self.drm_card is None:
+            self.counters.drm = None  # an NVIDIA GPU is shown: don't walk every process's fds for nothing
+        elif drm is not None:
+            drm.start()  # engine baseline over every process
+            if scan_budget is None:
+                drm.scan_budget = None  # one-shot output sees every process
         self.inspector = ProcInspector()
         self.prober = ServerProber()
         self.scan_budget = scan_budget  # None = scan every candidate now (one-shot output)
@@ -222,6 +240,10 @@ class Collector:
         a = adapters.get(luid)
         if BACKEND == "metal":
             nv = self.counters.device  # IOKit's device stats in the shape the header renders (no NVML on macOS)
+        elif self.drm_card is not None:
+            from .drm import read_device
+
+            nv = read_device(self.drm_card, self.gpu_index)
         else:
             nvs = self.nvml.sample() if self.nvml.ok else []
             nv = select_nv_device(self.adapter, nvs, self.gpu_index, self.adapters)
@@ -232,13 +254,17 @@ class Collector:
         snap = Snapshot(
             taken=time.time(), adapter=self.adapter, adapters=self.adapters, nv=nv,
             driver=self._mac_driver or (self.amdsmi.driver if nv and nv.source == "AMD SMI"
-                                        else self.nvml.driver if nv and nv.source == "NVML" else ""),
+                                        else self.nvml.driver if nv and nv.source == "NVML"
+                                        else f"kernel {os.uname().release}" if nv and nv.source == "AMD sysfs" else ""),
             cuda=self.nvml.cuda_version if nv and nv.source == "NVML" else "", vram_total=total,
             vram_used=int(a.dedicated) if a and a.dedicated is not None else None,
-            shared_used=int(a.shared) if a and a.shared is not None else None, backend=BACKEND,
+            shared_used=int(a.shared) if a and a.shared is not None else None, backend=self.backend,
+            shared_is_spill=not (self.drm_card is not None and self.drm_card.integrated),
         )
 
         snap.host_status = self.host_status
+        if self.drm_card is not None:
+            snap.process_status = self.counters.drm.status
         live = [(pid, g) for pid, g in procs.items() if _is_live(g)]
         live.sort(key=lambda x: -(x[1].shown_vram or 0))
         for pid, g in live:
@@ -280,7 +306,9 @@ class Collector:
             own = self.prober.get(self.inspector.exclusive_ports(row.pid))
             host = self.prober.get(self._parent_ports(row.pid))  # Ollama / LM Studio front-end process
             log = ollama_log_path() if row in ollama_runners and len(ollama_runners) == 1 else None
-            row.llm = build_view(row.detail, row.gpu.shown_vram or 0, row.gpu.shared,
+            # On an APU, GTT is the GPU's ordinary memory (often most of it), not spill: count it as held memory.
+            held = (row.gpu.shown_vram or 0) + (0 if snap.shared_is_spill else row.gpu.shared)
+            row.llm = build_view(row.detail, held, row.gpu.shared if snap.shared_is_spill else 0,
                                  own or host, log, host=host if own else None,
                                  attributed=row.gpu.shown_vram is not None)
 

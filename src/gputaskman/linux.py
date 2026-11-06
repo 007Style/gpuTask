@@ -1,4 +1,4 @@
-"""Linux GPU backend: adapters and per-process usage from NVML, with an honest WSL mode.
+"""Linux GPU backend: adapters and per-process usage from NVML (and DRM fdinfo for AMD), with an honest WSL mode.
 
 Native Linux: NVML attributes VRAM (running compute/graphics processes) and SM/encoder/decoder load
 (process utilization samples) to Linux PIDs, which plays the role the WDDM counters play on Windows.
@@ -69,6 +69,17 @@ def _nvml_devices() -> list[tuple[int, object]]:
 
 
 def enumerate_adapters() -> list[Adapter]:
+    """NVIDIA GPUs through NVML, plus (native Linux only) AMD GPUs through the amdgpu DRM driver."""
+    out = _nvml_adapters()
+    if not is_wsl():
+        from . import drm
+
+        seen = {a.luid for a in out}
+        out += [a for a in drm.adapters(drm.cards()) if a.luid not in seen]
+    return out
+
+
+def _nvml_adapters() -> list[Adapter]:
     if N is None:
         return []
     try:
@@ -215,6 +226,14 @@ class LinuxCounters:
         # {adapter key: {host pid: ProcGpu}}: NVML processes in another PID namespace that couldn't be
         # matched to a local process. Their PIDs must never be looked up in this /proc.
         self.outside: dict[int, dict[int, ProcGpu]] = {}
+        # AMD (amdgpu) GPUs: per-process VRAM, GTT and engine time from DRM fdinfo. Native Linux only;
+        # under WSL the GPU is /dev/dxg and no DRM driver is involved.
+        self.drm = None
+        if not self.wsl:
+            from .drm import DrmCounters
+
+            drm = DrmCounters()  # cheap: only lists cards; the Collector starts it if an AMD GPU is selected
+            self.drm = drm if drm.ok else None
         if N is None:
             return
         try:
@@ -287,6 +306,10 @@ class LinuxCounters:
             for key, _ in self._devices:
                 for pid in users:
                     procs[key][pid] = ProcGpu(attributed=False)
+        if self.drm is not None:
+            drm_procs, drm_adapters = self.drm.sample()
+            procs.update(drm_procs)
+            adapters.update(drm_adapters)
         return procs, adapters
 
     def _resolve_namespaces(self, procs: dict[int, dict[int, ProcGpu]]) -> None:
@@ -323,6 +346,8 @@ class LinuxCounters:
             per.update(moved)
 
     def close(self) -> None:
+        if self.drm is not None:
+            self.drm.close()
         if self.ok:
             try:
                 N.nvmlShutdown()

@@ -15,6 +15,16 @@ from gputaskman.procinfo import ProcDetail, _lib_name, _match_runtimes, classify
 from gputaskman.report import to_dict, to_text
 
 GiB = 1 << 30
+_no_drm = patch("gputaskman.drm.cards", return_value=[])  # keep the test machine's real AMD GPUs out of NVML tests
+
+
+def setUpModule() -> None:
+    _no_drm.start()
+
+
+def tearDownModule() -> None:
+    _no_drm.stop()
+
 NOT_AVAILABLE = (1 << 64) - 1  # NVML_VALUE_NOT_AVAILABLE as an unsigned long long
 
 

@@ -140,6 +140,7 @@ def to_dict(s: Snapshot) -> dict:
         "attributed": s.attributed, "backend": s.backend, "shared_is_spill": s.shared_is_spill,
         "host_status": s.host_status or None,
         "process_status": s.process_status or None,
+        "counter_status": s.counter_status or None, "counter_adapter_matched": s.counter_adapter_matched,
         "wsl_split": s.wsl_split or None, "device": nv, "processes": procs,
     }
 
@@ -168,6 +169,8 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
         out.append(memory)
     if s.backend == "wsl":
         out.append(wsl_note(s))
+    if s.counter_status:
+        out.append(s.counter_status)
     if nv and s.backend != "metal":
         rx = nv.pcie_rx_kbs / 1024 if nv.pcie_rx_kbs is not None else None
         tx = nv.pcie_tx_kbs / 1024 if nv.pcie_tx_kbs is not None else None

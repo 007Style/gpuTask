@@ -11,7 +11,7 @@ import unittest
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from rich.console import Console
 from rich.table import Table
@@ -21,14 +21,14 @@ from gputaskman.amdsmi import AmdSmi
 from gputaskman.adl import Adl, _Metrics
 from gputaskman.app import GpuTaskManager, spark, stacked_bar
 from gputaskman.cli import main
-from gputaskman.collector import ProcRow, Snapshot, select_adapter, select_nv_device
+from gputaskman.collector import Collector, ProcRow, Snapshot, select_adapter, select_nv_device
 from gputaskman.dxgi import Adapter
 from gputaskman.gguf import GgufInfo, read_gguf
 from gputaskman.handy import HandyEvidence, inspect_handy, _log_cache, _settings_cache
 from gputaskman.llm import (LlmView, ServerInfo, build_view, is_gpu_device, llama_server_models, lmstudio_models,
                             parse_flags, parse_load_log, probe_server)
 from gputaskman.nvml import NvDevice, Nvml
-from gputaskman.pdh import GpuCounters, ProcGpu
+from gputaskman.pdh import AdapterGpu, GpuCounters, ProcGpu
 from gputaskman.procinfo import (AI_KINDS, MappedModel, ProcDetail, ProcInspector, _is_model_file, _match_runtimes,
                                 _models_from_cmdline, classify, installed_models, make_model)
 from gputaskman.report import to_dict, to_text
@@ -220,6 +220,67 @@ class DeviceSelectionTests(unittest.TestCase):
 
 
 class MemoryTests(unittest.TestCase):
+    def test_windows_counter_luid_mismatch_is_not_attributed_to_selected_adapter(self):
+        c = Collector.__new__(Collector)
+        c.adapter = Adapter(0x4bb7, "GPU", 0x10DE, 16 * GiB, 0, False)
+        c.adapters = [c.adapter]
+        c.gpu_index, c.scan_budget, c.host, c.host_status = 0, None, None, ""
+        c.nvml = Mock(ok=False)
+        c.counters = Mock(outside={})
+        c.counters.sample.return_value = (
+            {0x4bf1: {4: ProcGpu(dedicated=GiB, engines={"compute": 10})}},
+            {0x4bf1: AdapterGpu(dedicated=GiB, shared=0)})
+        c.inspector, c.prober = Mock(), Mock()
+        with patch("gputaskman.collector.BACKEND", "wddm"):
+            s = c.sample()
+        self.assertIsNone(s.vram_used)
+        self.assertIsNone(s.attributed)
+        self.assertEqual(s.procs, [])
+        self.assertFalse(s.counter_adapter_matched)
+        self.assertIn("could not be matched", s.counter_status)
+        self.assertIn("GPU-PV", to_text(s))
+        data = to_dict(s)
+        self.assertIsNone(data["attributed"])
+        self.assertFalse(data["counter_adapter_matched"])
+        self.assertEqual(data["counter_status"], s.counter_status)
+        output = io.StringIO()
+        Console(file=output, width=160).print(GpuTaskManager().render_device(s))
+        self.assertIn("could not be matched", output.getvalue())
+
+    def test_windows_matching_counter_zero_is_not_unavailable(self):
+        c = Collector.__new__(Collector)
+        c.adapter = Adapter(1, "GPU", 0x10DE, 16 * GiB, 0, False)
+        c.adapters = [c.adapter]
+        c.gpu_index, c.scan_budget, c.host, c.host_status = 0, None, None, ""
+        c.nvml = Mock(ok=False)
+        c.counters = Mock(outside={})
+        c.counters.sample.return_value = (
+            {2: {4: ProcGpu(dedicated=GiB)}},
+            {2: AdapterGpu(dedicated=GiB, shared=GiB), 1: AdapterGpu(dedicated=0, shared=0)})
+        c.inspector, c.prober = Mock(), Mock()
+        with patch("gputaskman.collector.BACKEND", "wddm"):
+            s = c.sample()
+        self.assertEqual((s.vram_used, s.shared_used), (0, 0))
+        self.assertEqual(s.procs, [])
+        self.assertTrue(s.counter_adapter_matched)
+        self.assertEqual(s.counter_status, "")
+
+    def test_windows_missing_adapter_counter_explains_unavailable_memory(self):
+        c = Collector.__new__(Collector)
+        c.adapter = Adapter(1, "GPU", 0x10DE, 16 * GiB, 0, False)
+        c.adapters = [c.adapter]
+        c.gpu_index, c.scan_budget, c.host, c.host_status = 0, None, None, ""
+        c.nvml = Mock(ok=False)
+        c.counters = Mock(outside={})
+        c.counters.sample.return_value = ({1: {}}, {})
+        c.inspector, c.prober = Mock(), Mock()
+        with patch("gputaskman.collector.BACKEND", "wddm"):
+            s = c.sample()
+        self.assertTrue(s.counter_adapter_matched)
+        self.assertIsNone(s.vram_used)
+        self.assertIn("adapter memory counters are unavailable", s.counter_status)
+        self.assertIn("adapter memory counters are unavailable", to_text(s))
+
     def test_failed_collection_does_not_reuse_previous_counters(self):
         counters = GpuCounters.__new__(GpuCounters)
         counters._query = None

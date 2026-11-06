@@ -426,6 +426,20 @@ driver did not expose that reading; it does not by itself indicate a hardware fa
 Missing per-process memory or engine samples likewise show `N/A`/`null`; the paged estimate is
 unavailable when any of its input counters is missing.
 
+On GPU-paravirtualized VMs, including Windows Sandbox, Windows may expose GPU counter LUIDs that
+do not match the selected DXGI adapter. When that happens, the counters cannot safely be assigned
+to the adapter: the process list and usage are unavailable, not zero. The text and TUI explain
+the mismatch; JSON reports it in `counter_status` and sets `counter_adapter_matched` to `false`
+(`null` when the check does not apply).
+GPU-PV guests may also omit adapter memory counters. Counter values that are actually reported as
+zero remain zero; a zero alone does not establish that a counter is unavailable.
+
+Live check: Windows Sandbox on Windows 11 build 26100, hosted by an RTX 4080 SUPER with NVIDIA
+driver 630.20. `D3DKMTEnumAdapters2/3` exposed the PDH LUID `0x4BF1` as a software adapter with a
+different adapter/render GUID from DXGI's `0x4BB7`; it was not a proven alias for the NVIDIA GPU.
+The portable build's `--once` explanation and `--json` unmatched status were verified in the guest.
+Other Hyper-V GPU-PV configurations have not been validated.
+
 ### Comparing snapshots
 
 To see which memory bucket actually grew when you load a model or change the context length, save

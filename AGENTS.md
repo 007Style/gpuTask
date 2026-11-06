@@ -19,7 +19,9 @@ these rules:
    A measured zero stays `0`. Engine availability is independent of VRAM availability.
 3. **Windows per-process memory uses `Local Usage` / `Non Local Usage`**, not `Dedicated Usage`,
    which counts shared surfaces against `dwm.exe`, `csrss.exe`, and the owning app. The adapter
-   counter is the reference total.
+   counter is the reference total. On Linux amdgpu (`drm.py`), a process gets bytes only when all its
+   DRM clients are provably private (one holder, render node, every `drm-shared-*` is 0); never
+   compute resident minus shared, since the two count by different placements.
 4. **Model evidence has a ladder:** `api` > `mapped` > `cmdline` > `installed`. App settings mean
    *selected*. Log events are *timestamped history*, not current residency. Model-store folders only
    supply friendly names. Name-based hints (`kind_hint`, the `decision?` category) never change the

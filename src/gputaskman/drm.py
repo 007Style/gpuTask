@@ -72,18 +72,18 @@ def _int(path: str, base: int = 10) -> int | None:
         return None
 
 
-def parse_size(value: str) -> int:
-    """'2060 KiB' -> bytes; a bare number is bytes; anything unparseable is 0."""
+def parse_size(value: str | None) -> int | None:
+    """'2060 KiB' -> bytes; a bare number is bytes; anything unparseable is None (unknown, not 0)."""
     parts = (value or "").strip().split()
     if not parts:
-        return 0
+        return None
     try:
         number = int(parts[0])
     except ValueError:
-        return 0
+        return None
     unit = parts[1].lower() if len(parts) > 1 else ""
     multiplier = _SIZE_UNITS.get(unit)
-    return number * multiplier if multiplier is not None else 0
+    return number * multiplier if multiplier is not None else None
 
 
 def parse_fdinfo(text: str) -> dict | None:
@@ -100,31 +100,34 @@ def parse_fdinfo(text: str) -> dict | None:
     except ValueError:
         client_id = None
 
-    def memory(resident: str, legacy: str) -> int:
-        return parse_size(fields.get(resident, fields.get(legacy, "0")))
+    def memory(resident: str, legacy: str) -> int | None:
+        return parse_size(fields.get(resident, fields.get(legacy)))
 
-    def shared(name: str) -> int | None:
-        return parse_size(fields[name]) if name in fields else None
+    # drm-shared-<region> counts buffers with more than one handle by their *preferred* region, resident or not,
+    # while drm-resident-<region> counts by where buffers are now, so the two can't be subtracted. The total is
+    # still exact evidence of whether this client shares any buffer at all. None when a region is missing
+    # (older amdgpu, before the generic DRM memory stats) or unparseable: unknown, not 0.
+    shared_keys = [k for k in ("drm-shared-vram", "drm-shared-gtt") if k in fields]
+    shared_values = [parse_size(fields[k]) for k in shared_keys]
+    # Only VRAM and GTT matter here: drm-shared-cpu counts system-memory buffers this tool doesn't charge.
+    shared = sum(shared_values) if len(shared_keys) == 2 and None not in shared_values else None
 
-    engines: dict[str, int] = {}
+    engines: dict[str, int] | None = {}
     for key, value in fields.items():
         if not key.startswith("drm-engine-") or key.startswith("drm-engine-capacity-"):
             continue
-        token = value.split()[0] if value.split() else "0"
         try:
-            engines[key[len("drm-engine-"):]] = int(token)
-        except ValueError:
-            engines[key[len("drm-engine-"):]] = 0
+            engines[key[len("drm-engine-"):]] = int(value.split()[0])
+        except (ValueError, IndexError):
+            engines = None  # a torn or malformed counter: this client's load is unknown, not 0
+            break
     return {
         "driver": fields["drm-driver"],
         "client_id": client_id,
         "pdev": fields.get("drm-pdev", ""),
         "vram": memory("drm-resident-vram", "drm-memory-vram"),
         "gtt": memory("drm-resident-gtt", "drm-memory-gtt"),
-        # Buffers shared with other clients, also counted by every importer. None on older amdgpu
-        # (before the generic DRM memory stats), whose fdinfo can't split private from shared.
-        "shared_vram": shared("drm-shared-vram"),
-        "shared_gtt": shared("drm-shared-gtt"),
+        "shared": shared,
         "cpu": memory("drm-resident-cpu", "drm-memory-cpu"),
         "engines": engines,
     }
@@ -333,8 +336,10 @@ def read_device(card: DrmCard, index: int) -> DeviceTelemetry:
     if hwmon:
         dev.temp = _hwmon_temp(hwmon)
         power = _microwatts(os.path.join(hwmon, "power1_average"))
-        if power is None:
-            power = _microwatts(os.path.join(hwmon, "power1_input"))
+        if not power:  # some parts expose power1_average but leave it at 0
+            input_power = _microwatts(os.path.join(hwmon, "power1_input"))
+            if input_power is not None:
+                power = input_power
         dev.power_w = power
         if power is not None:
             dev.power_kind = _read(os.path.join(hwmon, "power1_label")) or ""  # amdgpu: "PPT" (package power)
@@ -384,8 +389,23 @@ def _engine_key(name: str, unified_video: bool = False) -> str:
     return "other"  # vpe, ...: busy time still counts toward GPU%, like WDDM's unnamed engines
 
 
+_DEFERRED = object()  # _scan_pid: the scan budget ran out partway through this process's fds
+_PRUNE_NS = 60 * 1_000_000_000  # forget engine baselines for clients not seen for a minute
+
+# Why a row's DRM memory is n/a instead of measured (ProcGpu.drm_reason)
+REASON_LEGACY = "legacy"  # older amdgpu: no drm-shared-vram/gtt, so private and shared bytes can't be told apart
+REASON_SHARED_CLIENT = "shared_client"  # one DRM client held by several processes (fd passing, fork)
+REASON_SHARED_BUFFERS = "shared_buffers"  # the client holds buffers shared with other clients (dma-buf)
+REASON_PRIMARY = "primary"  # opened via /dev/dri/card*, whose root-held copies (logind) a normal user can't see
+REASON_INCOMPLETE = "incomplete"  # some of its fds or fdinfo couldn't be read
+REASON_PARTIAL_SCAN = "partial_scan"  # the budget ran out before every process was listed: a holder may be missed
+
+
 class DrmCounters:
-    """Same interface as pdh.GpuCounters: sample() -> ({adapter key: {pid: ProcGpu}}, {adapter key: AdapterGpu})."""
+    """Same interface as pdh.GpuCounters: sample() -> ({adapter key: {pid: ProcGpu}}, {adapter key: AdapterGpu}).
+
+    Call start() once the card is selected: engine load is a rate, so it takes the first (unbudgeted) baseline.
+    """
 
     def __init__(self, found: list[DrmCard] | None = None, proc: str = "/proc",
                  clock=time.monotonic_ns, timer=time.perf_counter) -> None:
@@ -393,16 +413,22 @@ class DrmCounters:
         self.ok = bool(self.cards)
         self._proc = proc
         self._clock = clock
-        self._prev: dict[tuple, dict[str, int]] = {}
-        self._prev_ts: int | None = None
         self._timer = timer
-        self._known: dict[int, tuple[list[str], bool]] = {}
+        self._prev: dict[tuple, tuple[dict[str, int], int]] = {}  # client -> (high-water engine ns, read time)
+        # pid -> (start time, [(fd name, link target)], holds /dev/kfd, every fd and link was readable)
+        self._known: dict[int, tuple[str, list[tuple[str, str]], bool, bool]] = {}
         self._cursor = 0
         self.status = ""  # what the last scan couldn't cover, for the UI and JSON; empty when it saw everything
-        self.scan_budget: float | None = None  # the baseline below covers every process
-        if self.ok:
-            self.sample()  # engine load is a rate: take the baseline now, like the WDDM counters do
-        self.scan_budget = SCAN_BUDGET
+        self.partial = False  # the last scan ran out of budget, so a DRM client's holders may not all be known
+        self.scan_budget: float | None = SCAN_BUDGET
+
+    def start(self) -> None:
+        """Take the engine baseline over every process, like the WDDM counters do at startup."""
+        if not self.ok:
+            return
+        budget, self.scan_budget = self.scan_budget, None
+        self.sample()
+        self.scan_budget = budget
 
     def _adapters(self) -> dict[int, AdapterGpu]:
         out: dict[int, AdapterGpu] = {}
@@ -415,142 +441,223 @@ class DrmCounters:
             )
         return out
 
-    def _scan_pid(self, pid: int) -> tuple[list[str], bool] | None:
-        """(this process's /dev/dri fd names, whether it holds /dev/kfd); None when its fds can't be inspected."""
-        dri: list[str] = []
+    def _start_time(self, pid: int) -> str | None:
+        """Field 22 of /proc/<pid>/stat: tells a reused pid from the process cached under it."""
+        try:
+            with open(os.path.join(self._proc, str(pid), "stat"), encoding="utf-8", errors="replace") as f:
+                fields = f.read().rsplit(")", 1)[1].split()
+            return fields[19]
+        except (OSError, IndexError):
+            return None
+
+    def _scan_pid(self, pid: int, deadline: float | None):
+        """(start time, [(fd name, target)] for /dev/dri, holds /dev/kfd, complete); None when its fds can't be
+        listed; _DEFERRED when the budget ran out partway through."""
+        start = self._start_time(pid)
+        dri: list[tuple[str, str]] = []
         holds_kfd = False
+        complete = True
         try:
             fds = os.scandir(os.path.join(self._proc, str(pid), "fd"))
         except PermissionError:
             return None
         except OSError:
-            return dri, holds_kfd  # gone since /proc was listed
+            return start, dri, holds_kfd, complete  # gone since /proc was listed
         with fds:
-            for fd in fds:
+            for n, fd in enumerate(fds, 1):
+                if deadline is not None and n % 64 == 0 and self._timer() >= deadline:
+                    return _DEFERRED
                 try:
                     target = os.readlink(fd.path)
-                except OSError:
+                except PermissionError:
+                    complete = False
                     continue
+                except OSError:
+                    continue  # closed since the listing
                 if target == "/dev/kfd":
                     holds_kfd = True
                 elif target.startswith("/dev/dri/"):
-                    dri.append(fd.name)
-        return dri, holds_kfd
+                    dri.append((fd.name, target))
+        return start, dri, holds_kfd, complete
 
-    def _clients(self) -> tuple[dict[tuple, tuple[set[int], dict]], set[int]]:
-        """One entry per DRM client: (the pids holding it, fdinfo); plus the pids holding /dev/kfd.
+    def _clients(self):
+        """One entry per DRM client: [pids holding it, fdinfo, via a render node, read time]; plus the pids holding
+        /dev/kfd and the pids whose fds or fdinfo couldn't all be read.
 
-        Listing a process's fds is the costly part, so it is bounded by scan_budget, resuming where the last refresh
-        stopped. Past the budget a process keeps its last known fds, whose fdinfo is still read: rows and counters
-        stay current, and only a GPU client opened since the last pass can show up a refresh or two late.
+        Listing a process's fds is the costly part, so it is bounded by scan_budget: processes not seen before go
+        first, then the rest resume where the last refresh stopped. Past the budget a process keeps its last known
+        fds (dropped if its pid was reused), whose fdinfo is still read: rows and counters stay current, and only an
+        fd handed to an already-running process shows up a refresh or two late.
         """
         by_pdev = {c.pdev: c.key for c in self.cards}
-        clients: dict[tuple, tuple[set[int], dict]] = {}
+        clients: dict[tuple, list] = {}
         kfd: set[int] = set()
+        incomplete: set[int] = set()
         self.status = ""
+        self.partial = False
         try:
             with os.scandir(self._proc) as entries:
                 pids = sorted(int(e.name) for e in entries if e.name.isdigit())
         except OSError:
             self.status = f"{self._proc} is not readable"
-            return clients, kfd
+            return clients, kfd, incomplete
         start = bisect_left(pids, self._cursor)
+        ordered = pids[start:] + pids[:start]
+        ordered = [p for p in ordered if p not in self._known] + [p for p in ordered if p in self._known]
         deadline = None if self.scan_budget is None else self._timer() + self.scan_budget
-        known: dict[int, tuple[list[str], bool]] = {}
-        denied = skipped = 0
-        self._cursor = 0
-        for pid in pids[start:] + pids[:start]:
-            if deadline is not None and (skipped or self._timer() >= deadline):
-                if not skipped:
-                    self._cursor = pid
-                skipped += 1
-                entry = self._known.get(pid)
-            else:
-                entry = self._scan_pid(pid)
-                denied += entry is None
-            if entry is None:
-                continue
+        known: dict[int, tuple] = {}
+        denied = deferred = 0
+        out_of_time = False
+        cursor = None  # first known process not rescanned: where the rotation resumes (new ones go first anyway)
+        scanned = 0
+        for pid in ordered:
+            entry = None
+            if not out_of_time and (deadline is None or self._timer() < deadline):
+                # The first process of a refresh is always listed in full, so one huge fd table can't stall the rotation.
+                entry = self._scan_pid(pid, deadline if scanned else None)
+                scanned += 1
+                if entry is None:
+                    denied += 1
+                    continue
+                if entry is _DEFERRED:
+                    entry = None
+            if entry is None:  # not scanned this refresh: reuse the cached fds if this is still the same process
+                out_of_time = True
+                if cursor is None and pid in self._known:
+                    cursor = pid
+                deferred += 1
+                cached = self._known.get(pid)
+                if cached is None or cached[0] != self._start_time(pid):
+                    continue
+                entry = cached
             known[pid] = entry
-            if entry[1]:
+            _start, dri, holds_kfd, complete = entry
+            if holds_kfd:
                 kfd.add(pid)
-            for name in entry[0]:
+            if not complete:
+                incomplete.add(pid)
+            for name, target in dri:
                 try:
                     with open(os.path.join(self._proc, str(pid), "fdinfo", name),
                               encoding="utf-8", errors="replace") as f:
-                        info = parse_fdinfo(f.read())
-                except OSError:
+                        text = f.read()
+                except PermissionError:
+                    incomplete.add(pid)
                     continue
+                except OSError:
+                    continue  # closed since the listing
+                read_at = self._clock()
+                info = parse_fdinfo(text)
                 if not info or info["driver"] not in DRIVERS or info["pdev"] not in by_pdev:
                     continue
                 client_id = info["client_id"]
                 key = (info["pdev"], client_id) if client_id is not None else (info["pdev"], pid, name)
-                clients.setdefault(key, (set(), info))[0].add(pid)
+                client = clients.setdefault(key, [set(), info, True, read_at])
+                client[0].add(pid)
+                client[2] = client[2] and target.startswith("/dev/dri/renderD")
         self._known = known
+        self.partial = out_of_time
+        if not out_of_time:
+            self._cursor = 0
+        elif cursor is not None:
+            self._cursor = cursor  # else only new processes were deferred: the known ones keep their place
         notes = []
-        if skipped:
-            notes.append(f"scan budget reached, {skipped} processes keep their last known GPU fds this refresh")
+        if out_of_time:
+            notes.append(f"scan budget reached, {deferred} processes not rescanned this refresh (last known GPU fds kept)")
         if denied:
             notes.append(f"{denied} processes not inspectable (other users' or kernel threads; sudo includes them)")
+        if incomplete:
+            notes.append(f"{len(incomplete)} processes whose fds or fdinfo couldn't all be read")
         self.status = "; ".join(notes)
-        return clients, kfd
+        return clients, kfd, incomplete
 
     def sample(self) -> tuple[dict[int, dict[int, ProcGpu]], dict[int, AdapterGpu]]:
-        now = self._clock()
         by_pdev = {c.pdev: c.key for c in self.cards}
         unified = {c.pdev for c in self.cards if c.unified_video}
         procs: dict[int, dict[int, ProcGpu]] = {c.key: {} for c in self.cards}
         adapters = self._adapters()
-        clients, kfd = self._clients()
-        delta = now - self._prev_ts if self._prev_ts is not None else 0
-        previous: dict[tuple, dict[str, int]] = {}
-        for client_key, (owners, info) in clients.items():
-            key = by_pdev[info["pdev"]]
-            previous[client_key] = dict(info["engines"])
-            rows = []
-            for pid in owners:
-                # No commit counter in fdinfo, so Paged stays unavailable rather than 0. ROCm/HIP (a /dev/kfd
-                # holder) submits compute through user-mode KFD queues the kernel doesn't time per process, so
-                # its engine load is unknown, not 0 (AGENTS.md rule 2); its VRAM is still in fdinfo.
-                available = {"dedicated", "shared"} if pid in kfd else {"dedicated", "shared", "engine"}
-                proc = procs[key].setdefault(pid, ProcGpu(attributed=True, available=available))
-                proc.kfd = pid in kfd
-                rows.append(proc)
-            if len(owners) > 1:
-                # One client held by several processes (fd passing, fork): nothing says which of them uses it,
-                # so each is listed without counters instead of charging one by guess (rules 1 and 5). Its bytes
-                # stay in the adapter's unattributed part, like a shared buffer's, so the other rows still add up.
-                for proc in rows:
-                    proc.attributed = False
-                    proc.shared_client = True
-                    proc.available -= {"shared", "engine"}
+        clients, kfd, incomplete = self._clients()
+
+        by_pid: dict[tuple[int, int], list[tuple[tuple, list]]] = {}
+        for client_key, client in clients.items():
+            for pid in client[0]:
+                by_pid.setdefault((by_pdev[client[1]["pdev"]], pid), []).append((client_key, client))
+
+        now = self._clock()
+        current: dict[tuple, tuple[dict[str, int], int]] = {}
+        for client_key, (owners, info, _render, read_at) in clients.items():
+            old = self._prev.get(client_key)
+            if info["engines"] is None:
+                if old is not None:
+                    current[client_key] = old
                 continue
-            proc = rows[0]
-            # A buffer shared between clients is resident in each of them and fdinfo doesn't say which owns it.
-            # Only private bytes are charged (AGENTS.md rule 1); shared ones are reported apart, owner unknown.
-            if info["shared_vram"] is None:
-                # Older amdgpu: resident bytes include every imported buffer, so summing them would count
-                # shared buffers once per importer. Unknown rather than double counted (rules 1 and 9).
+            high = dict(old[0]) if old else {}
+            for name, ns in info["engines"].items():
+                high[name] = max(ns, high.get(name, 0))  # the DRM spec allows a counter to step back briefly
+            current[client_key] = (high, read_at)
+
+        for (key, pid), held in by_pid.items():
+            # No commit counter in fdinfo, so Paged stays unavailable rather than 0. ROCm/HIP (a /dev/kfd holder)
+            # submits compute through user-mode KFD queues the kernel doesn't time per process, so its engine load is
+            # unknown, not 0 (AGENTS.md rule 2); its VRAM is still in fdinfo.
+            proc = ProcGpu(attributed=True, available={"dedicated", "shared", "engine"})
+            proc.kfd = pid in kfd
+            infos = [c[1] for _k, c in held]
+            vram = [i["vram"] for i in infos]
+            gtt = [i["gtt"] for i in infos]
+            # Every buffer this process can reach, shared ones included: a reference, never summed (rule 1).
+            complete = pid not in incomplete  # otherwise any sum would be a partial total that looks whole
+            proc.resident_vram = float(sum(vram)) if complete and None not in vram else None
+            proc.resident_gtt = float(sum(gtt)) if complete and None not in gtt else None
+
+            # Bytes are charged to this process only when nothing else can hold them: one visible holder, reached
+            # through a render node, no shared buffers at all, and every value known. Anything else leaves the whole
+            # process's bytes in the adapter's unattributed part instead of charging one by guess (rules 1 and 5).
+            reason = ""
+            if pid in incomplete:
+                reason = REASON_INCOMPLETE
+            elif any(len(c[0]) > 1 for _k, c in held):
+                reason = REASON_SHARED_CLIENT
+            elif any(i["shared"] is None for i in infos):
+                reason = REASON_LEGACY
+            elif any(i["shared"] for i in infos):
+                reason = REASON_SHARED_BUFFERS
+            elif not all(c[2] for _k, c in held):
+                reason = REASON_PRIMARY
+            elif proc.resident_vram is None or proc.resident_gtt is None:
+                reason = REASON_LEGACY
+            elif self.partial:
+                reason = REASON_PARTIAL_SCAN
+            proc.drm_reason = reason
+            if reason:
                 proc.attributed = False
                 proc.available -= {"dedicated", "shared"}
             else:
-                shared = float(info["shared_vram"])
-                proc.dedicated += max(float(info["vram"]) - shared, 0.0)
-                proc.shared_vram += shared
-                proc.shared += max(float(info["gtt"]) - float(info["shared_gtt"] or 0), 0.0)
-            old = self._prev.get(client_key)
-            if old is None or delta <= 0:
-                proc.available.discard("engine")  # a rate needs two samples: unknown, not 0 (rule 2)
-                continue
+                proc.dedicated = proc.resident_vram
+                proc.shared = proc.resident_gtt
+
             engines: dict[str, float] = {}
-            for name, ns in info["engines"].items():
-                # amdgpu omits an engine until it has run, so a missing earlier value really is 0.
-                pct = min(100.0, max(0.0, 100.0 * (ns - old.get(name, 0)) / delta))
-                engine = _engine_key(name, info["pdev"] in unified)
-                engines[engine] = engines.get(engine, 0.0) + pct
+            for client_key, (owners, info, _render, read_at) in held:
+                old = self._prev.get(client_key)
+                if (proc.kfd or not complete or self.partial or len(owners) > 1 or info["engines"] is None
+                        or old is None or read_at - old[1] <= 0):
+                    engines = {}
+                    proc.available.discard("engine")  # unknown, not 0 (rule 2)
+                    break
+                delta = read_at - old[1]
+                for name, ns in current[client_key][0].items():
+                    # amdgpu omits an engine until it has run, so a missing earlier value really is 0.
+                    pct = min(100.0, max(0.0, 100.0 * (ns - old[0].get(name, 0)) / delta))
+                    engine = _engine_key(name, info["pdev"] in unified)
+                    engines[engine] = min(100.0, engines.get(engine, 0.0) + pct)
             for engine, pct in engines.items():
-                proc.engines[engine] = min(100.0, proc.engines[engine] + pct)
-        self._prev = previous
-        self._prev_ts = now
+                proc.engines[engine] = pct
+            procs[key][pid] = proc
+
+        for client_key, value in self._prev.items():  # keep baselines of clients a deferred scan missed, briefly
+            if client_key not in current and now - value[1] < _PRUNE_NS:
+                current[client_key] = value
+        self._prev = current
         return procs, adapters
 
     def close(self) -> None:

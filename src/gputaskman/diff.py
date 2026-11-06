@@ -13,7 +13,8 @@ from .llm import gb
 
 MiB = 1 << 20
 NOISE = 16 * MiB  # smaller per-process moves are allocator and compositor churn, not a model loading
-MEASURED = ("vram_bytes", "shared_bytes", "committed_bytes", "paged_out_bytes")
+MEASURED = ("vram_bytes", "shared_bytes", "committed_bytes", "paged_out_bytes",
+            "vram_resident_bytes", "gtt_resident_bytes")  # resident: amdgpu, shared buffers included (never summed)
 DEVICE = (("vram_used", "dedicated used"), ("shared_used", "shared used"),
           ("attributed", "attributed to processes"), ("unattributed", "unattributed"))
 SEGMENT_ORDER = ("weights", "kv", "compute", "runtime", "unknown")

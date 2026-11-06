@@ -195,8 +195,10 @@ class Collector:
             self.drm_card = next((c for c in drm.cards if c.key == self.adapter.luid), None)
         if drm is not None and self.drm_card is None:
             self.counters.drm = None  # an NVIDIA GPU is shown: don't walk every process's fds for nothing
-        elif drm is not None and scan_budget is None:
-            drm.scan_budget = None  # one-shot output sees every process
+        elif drm is not None:
+            drm.start()  # engine baseline over every process
+            if scan_budget is None:
+                drm.scan_budget = None  # one-shot output sees every process
         self.inspector = ProcInspector()
         self.prober = ServerProber()
         self.scan_budget = scan_budget  # None = scan every candidate now (one-shot output)

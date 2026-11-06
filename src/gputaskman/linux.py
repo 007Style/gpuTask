@@ -232,7 +232,7 @@ class LinuxCounters:
         if not self.wsl:
             from .drm import DrmCounters
 
-            drm = DrmCounters()
+            drm = DrmCounters()  # cheap: only lists cards; the Collector starts it if an AMD GPU is selected
             self.drm = drm if drm.ok else None
         if N is None:
             return

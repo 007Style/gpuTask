@@ -58,13 +58,26 @@ ORDER_NOTE = ("? order guess: the size is exact but several owners fit, so newer
               "gputaskman runs.")
 
 
-DRM_UNSPLIT_NOTE = ("VRAM n/a: this kernel's amdgpu fdinfo has no drm-shared-* keys, so resident memory includes "
-                    "every buffer imported from other processes and would be counted once per importer. Newer "
-                    "kernels report shared buffers separately.")
+DRM_NOTES = {
+    "legacy": ("VRAM n/a: this kernel's amdgpu fdinfo has no drm-shared-* keys, so resident memory may include "
+               "buffers imported from other processes and would be counted once per importer."),
+    "shared_client": ("VRAM and GPU% n/a: this process holds a DRM client other processes hold too (fd passing, "
+                      "fork). fdinfo counts the client once and doesn't say which of them uses it."),
+    "shared_buffers": ("VRAM n/a: this process's DRM client shares buffers with other clients (dma-buf, e.g. "
+                       "windows and video frames). fdinfo counts shared buffers by where they prefer to live, not "
+                       "where they are, so its private part can't be measured."),
+    "primary": ("VRAM n/a: this process opened the GPU through /dev/dri/card*, which root-owned services such as "
+                "logind may also hold where a normal user can't see them; run as root to check."),
+    "incomplete": "VRAM and GPU% n/a: some of this process's file descriptors or fdinfo couldn't be read.",
+    "partial_scan": ("VRAM and GPU% n/a this refresh: the scan budget ran out before every process's fds were "
+                     "listed, so another holder of this DRM client can't be ruled out."),
+}
+DRM_RESIDENT_NOTE = ("Resident: every buffer the process can reach, shared ones included. The same buffer can "
+                     "appear under several processes, so these are not added up.")
 
 
-DRM_SHARED_CLIENT_NOTE = ("VRAM and GPU% n/a: this process holds a DRM client other processes hold too (fd passing, "
-                          "fork). fdinfo counts the client once and doesn't say which of them uses it.")
+def drm_note(g: ProcGpu) -> str:
+    return DRM_NOTES.get(g.drm_reason, "")
 
 
 def inferred_note(g) -> str:
@@ -87,7 +100,11 @@ def to_dict(s: Snapshot) -> dict:
             "vram_attributed": p.gpu.attributed, "vram_inferred_bytes": p.gpu.inferred,
             "vram_inferred_by": p.gpu.inferred_by or None,
             "vram_bytes": int(p.gpu.dedicated) if p.gpu.attributed and "dedicated" in p.gpu.available else None,
-            "vram_shared_bytes": int(p.gpu.shared_vram) if s.backend == "drm" and not p.host else None,
+            "vram_resident_bytes": (int(p.gpu.resident_vram) if s.backend == "drm" and not p.host
+                                    and p.gpu.resident_vram is not None else None),
+            "gtt_resident_bytes": (int(p.gpu.resident_gtt) if s.backend == "drm" and not p.host
+                                   and p.gpu.resident_gtt is not None else None),
+            "vram_unattributed_reason": p.gpu.drm_reason or None if s.backend == "drm" and not p.host else None,
             "shared_bytes": int(p.gpu.shared) if has_spill_counters(s, p) else None,
             "committed_bytes": int(p.gpu.committed) if wddm and "committed" in p.gpu.available else None,
             "paged_out_bytes": int(p.gpu.paged_out) if wddm and p.gpu.paged_available else None,
@@ -120,7 +137,8 @@ def to_dict(s: Snapshot) -> dict:
         "taken": s.taken, "gpu": s.adapter.name if s.adapter else None, "driver": s.driver, "cuda": s.cuda,
         "adapter": dataclasses.asdict(s.adapter) if s.adapter else None,
         "vram_total": s.vram_total, "vram_used": s.vram_used, "shared_used": s.shared_used,
-        "attributed": s.attributed, "backend": s.backend, "host_status": s.host_status or None,
+        "attributed": s.attributed, "backend": s.backend, "shared_is_spill": s.shared_is_spill,
+        "host_status": s.host_status or None,
         "process_status": s.process_status or None,
         "wsl_split": s.wsl_split or None, "device": nv, "processes": procs,
     }
@@ -173,7 +191,7 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
         wddm = has_wddm_counters(s, p)
         spill = gb(p.gpu.shared) if has_spill_counters(s, p) and p.gpu.shared >= 1 << 20 else ""
         paged = gb(p.gpu.paged_out) if wddm and p.gpu.paged_out >= 1 << 20 else ""
-        if wddm and "shared" not in p.gpu.available:
+        if (wddm or (s.backend == "drm" and not p.host)) and "shared" not in p.gpu.available:
             spill = "N/A"
         if wddm and not p.gpu.paged_available:
             paged = "N/A"
@@ -185,10 +203,10 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
         out.append(INFERRED_NOTE)
     if any(p.gpu.inferred_by == "order" for p in shown):
         out.append(ORDER_NOTE)
-    if s.backend == "drm" and any(not p.host and not p.gpu.attributed and not p.gpu.shared_client for p in shown):
-        out.append(DRM_UNSPLIT_NOTE)
-    if s.backend == "drm" and any(not p.host and p.gpu.shared_client for p in shown):
-        out.append(DRM_SHARED_CLIENT_NOTE)
+    if s.backend == "drm":
+        for note in dict.fromkeys(drm_note(p.gpu) for p in shown if not p.host):
+            if note:
+                out.append(note)
     if s.process_status:
         out.append(f"DRM process scan: {s.process_status}.")
     if s.backend == "wsl" and s.wsl_split and any(not p.host and not p.gpu.attributed and p.gpu.inferred is None

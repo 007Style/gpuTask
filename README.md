@@ -165,16 +165,28 @@ the device), like WDDM's non-local usage. On an APU (an integrated GPU, detected
 reporting a VRAM vendor, a heuristic validated on one APU) GTT is the GPU's normal memory and "VRAM"
 is only a RAM carve-out, so GTT is still shown but never flagged as spill, and an LLM's memory is its
 VRAM plus GTT. The SDMA engine (`dma`) fills the COPY column. Paged stays blank: there is no commit
-counter. A DRM client
-held by several processes (fd passing, fork; 1Password and its crash handler on the test desktop) has one
-set of counters and nothing says which process uses it, so each is listed with VRAM and GPU% `n/a` and the
-bytes stay in *unattributed*. A *buffer* shared
-between clients (a window a compositor imports, for example) is resident in each of them, and fdinfo
-does not say which one owns it. VRAM therefore shows each process's private bytes (resident minus
-shared), which add up without double counting; shared buffers stay in *unattributed* and are listed
-per process, owner unknown, in the inspector and JSON (`vram_shared_bytes`); shared GTT is left out
-of SPILL the same way. Older kernels whose amdgpu fdinfo has no `drm-shared-*` keys can't make that
-split, so per-process VRAM shows `n/a` there instead of double counting. amdgpu has no device-wide
+counter. VRAM and SPILL are charged to a process only when nothing else can hold its bytes: each of
+its DRM clients has exactly one visible holder, was opened through a render node (`/dev/dri/renderD*`),
+and reports zero bytes in every `drm-shared-*` region. Then its resident VRAM and GTT are its own and add
+up without double counting. Otherwise the process shows VRAM and SPILL as `n/a` (`null` in JSON, with
+`vram_unattributed_reason`) and its bytes stay in *unattributed*:
+
+- **Shared client** (fd passing, fork; 1Password and its crash handler on the test desktop): one set of
+  counters, and nothing says which process uses it. GPU% is `n/a` too.
+- **Shared buffers** (a window a compositor imports, video frames): `drm-shared-*` counts a buffer by
+  where it *prefers* to live, resident or not, while `drm-resident-*` counts where buffers *are*, so
+  resident minus shared is not private memory and is never computed.
+- **Primary node** (`/dev/dri/card*`, typically a compositor): root-owned logind keeps a copy of that
+  fd, which a normal user can't see, so a single holder can't be proven.
+- **Legacy**: older kernels whose amdgpu fdinfo lacks `drm-shared-vram`/`drm-shared-gtt`.
+- **Incomplete**: some of the process's fds or fdinfo could not be read (GPU% is `n/a` too).
+- **Partial scan**: the TUI's 50 ms listing budget ran out this refresh, so a process it skipped might
+  hold the same client (GPU% is `n/a` too). Expected to be rare on a desktop (~9 ms for ~8,000 fds,
+  not yet re-measured with this rule); one-shot output always scans fully.
+
+The inspector and JSON (`vram_resident_bytes`, `gtt_resident_bytes`) still show every buffer the
+process can reach, shared ones included; the same buffer can appear under several processes, so these
+are a reference and are never summed. Unparseable or missing values are unknown (`null`), not 0. amdgpu has no device-wide
 video engine counter, so the device's encode/decode load stays N/A; per-process video load is
 measured. On VCN 4 and later (RDNA3 and newer, including the RX 9070) decode and encode share one
 ring, so it is reported as `video` rather than split. Only processes you can inspect are listed; the header and JSON (`process_status`) say how many could not be, and `sudo` includes other users'. `--gpu 1`
@@ -187,14 +199,17 @@ This path is native-Linux only; under WSL the GPU is `/dev/dxg`, with no DRM dri
 Live check, bare-metal Arch-based Linux (kernel 7.2.15, `amdgpu`), Radeon RX 9070-series (Navi 48)
 plus a Radeon 610M iGPU: both cards were found, named, and read; VAAPI HEVC encode and decode with `ffmpeg`
 each showed as a `video` row at ~95-100% video load (on the RX 9070 both were charged to amdgpu's
-unified `enc` ring, hence `video`); desktop processes' private VRAM summed
+unified `enc` ring, hence `video`); desktop processes' VRAM summed
 to less than the card's used VRAM, with the compositor's imported windows listed as shared.
 llama.cpp's ROCm server image (`ghcr.io/ggml-org/llama.cpp:server-rocm`, Qwen3-4B-Instruct-2507
 Q4_K_M, `-ngl 99 -c 8192`, next to a running game) showed as an `LLM` row with `llama.cpp+ggml+HIP`
-and 3.95 GB of private VRAM, matching the 2.49 GB of weights plus 1.21 GB of f16 KV cache plus compute
+and 3.95 GB of VRAM, matching the 2.49 GB of weights plus 1.21 GB of f16 KV cache plus compute
 buffers, and the 4.11 GB KFD reports for the process in `/sys/class/kfd/kfd/proc/<pid>/vram_*`.
 While it generated at 103 tok/s the device read 99% gfx and 339 W, but fdinfo had no engine lines
 for it, which is why ROCm rows show engines as `n/a`. PyTorch-ROCm has not been run on this path.
+That check predates the stricter attribution above (no subtraction of shared bytes; render-node,
+single-holder and complete-scan requirements; per-client timestamps; PID-reuse checks), which is
+covered by unit tests only and **not yet validated on AMD hardware**.
 
 **WSL** is different, because Windows owns the GPU. Linux cannot see how much VRAM its own
 processes use: `nvidia-smi` lists no processes, NVML's per-process samples carry *Windows* PIDs

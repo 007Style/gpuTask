@@ -20,7 +20,7 @@ from textual.worker import get_current_worker
 from .collector import BACKEND, Collector, ProcRow, Snapshot
 from .llm import gb
 from .nvml import NvDevice, format_metric
-from .report import (DRM_SHARED_CLIENT_NOTE, DRM_UNSPLIT_NOTE, METAL_NOTE, WSL_EMPTY, has_engine_counters, has_spill_counters, has_wddm_counters,
+from .report import (DRM_RESIDENT_NOTE, METAL_NOTE, WSL_EMPTY, drm_note, has_engine_counters, has_spill_counters, has_wddm_counters,
                      inferred_note, vram_label, wsl_note)
 
 KIND_STYLE = {
@@ -83,7 +83,9 @@ candidates remain unproven; engine activity is measured per process, not per mod
 (`amdgpu`) use sysfs for the device and DRM fdinfo (`/proc/<pid>/fdinfo`) per process: VRAM,
 GTT (GPU memory in system RAM, shown as SPILL), and gfx/compute/video engine time (`n/a` for a new client's
 first sample and for ROCm/HIP processes: their compute runs on `/dev/kfd` queues the kernel doesn't time per
-process). A client several processes share shows `n/a` for each of them. Only processes you can inspect are
+process). VRAM and SPILL are charged to a process only when its DRM clients are provably private: one holder,
+opened through a render node, and no shared buffers. Otherwise they show `n/a` and the bytes stay unattributed;
+the inspector still shows the resident bytes it can reach (shared buffers included, so not added up). Only processes you can inspect are
 listed, and the header says how many it couldn't; run with `sudo` to see other users'. Under **WSL**, Windows
 charges all Linux GPU memory to the VM (`vmwp.exe`), so VRAM and load are device-wide only; rows
 are Linux processes with `/dev/dxg` open and show `n/a` rather than a made-up share. When WSL
@@ -484,7 +486,7 @@ class GpuTaskManager(App):
                          style="bold red" if r.gpu.shared >= 256 << 20 and r.kind in ("LLM", "AI") and s.shared_is_spill
                          else "yellow")
             paged = Text(gb(r.gpu.paged_out) if wddm and r.gpu.paged_out >= 1 << 20 else "", justify="right", style="grey62")
-            if wddm and "shared" not in r.gpu.available:
+            if (wddm or (s.backend == "drm" and not r.host)) and "shared" not in r.gpu.available:
                 spill = Text("n/a", justify="right", style="grey62")
             if wddm and not r.gpu.paged_available:
                 paged = Text("n/a", justify="right", style="grey62")
@@ -540,15 +542,15 @@ class GpuTaskManager(App):
             elif s.wsl_split:
                 out.append(Text(f"No per-process VRAM: {s.wsl_split}.", style="grey62"))
             elif s.backend == "drm":
-                out.append(Text(DRM_SHARED_CLIENT_NOTE if r.gpu.shared_client else DRM_UNSPLIT_NOTE, style="grey62"))
+                out.append(Text(drm_note(r.gpu), style="grey62"))
             elif s.backend == "metal":
                 out.append(Text("GPU memory n/a: footprint can't read other users' processes without root "
                                 "(or hasn't measured this one yet). GPU% comes from Metal's per-process GPU time.",
                                 style="grey62"))
-        if s.backend == "drm" and r.gpu.shared_vram >= 1 << 20:
-            out.append(Text(f"+ {gb(r.gpu.shared_vram)} in VRAM buffers shared with other processes (e.g. windows a "
-                            "compositor imports), not counted above: the driver doesn't say which process owns a shared "
-                            "buffer, so they stay in 'unattributed'.", style="grey62"))
+        if s.backend == "drm" and not r.host and (r.gpu.resident_vram is not None or r.gpu.resident_gtt is not None):
+            def size(v): return gb(v) if v is not None else "n/a"
+            out.append(Text(f"Resident VRAM {size(r.gpu.resident_vram)}, GTT {size(r.gpu.resident_gtt)}. "
+                            + DRM_RESIDENT_NOTE, style="grey62"))
         if s.backend == "drm" and r.gpu.kfd:
             out.append(Text("Engines n/a: this process uses ROCm/HIP (/dev/kfd), whose compute queues the kernel doesn't "
                             "time per process. The device's AMD gfx load includes its work.", style="grey62"))

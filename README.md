@@ -266,6 +266,39 @@ That is one machine and driver, not a guarantee. A process that started long bef
 the GPU can break the start-order guess, and processes started in the same refresh are ordered by
 guess unless their sizes match.
 
+### NixOS
+
+With flakes enabled, run directly from this checkout:
+
+```bash
+nix run path:.
+nix run path:. -- --list-gpus
+nix run path:. -- --once
+nix run path:. -- --json
+```
+
+Build both `gputaskman` and its `gtm` alias with `nix build path:.` (executables are in
+`result/bin/`). The flake provides packages for `x86_64-linux` and `aarch64-linux`; `flake.lock`
+pins nixpkgs. Dependencies come from nixpkgs, independently of `uv.lock`. No pip installation,
+virtual environment, CUDA Toolkit, or ROCm installation is needed. GPU drivers remain supplied by
+the host, never bundled with the package. NVIDIA's nixpkgs Python binding finds NVML through
+`/run/opengl-driver/lib`; AMD uses kernel sysfs and DRM fdinfo interfaces directly.
+
+For source development and tests:
+
+```bash
+nix develop path:.
+python -m gputaskman --once
+python -m unittest discover -s tests -q
+```
+
+`nix flake check path:.` builds the package and runs the same hardware-independent tests.
+For a flake-based NixOS configuration, add this repository as a `gputaskman` input, then include
+`inputs.gputaskman.packages.${pkgs.stdenv.hostPlatform.system}.default` in
+`environment.systemPackages`. Enable your GPU's normal NixOS driver configuration first.
+The flake was contributed and checked on x86_64 NixOS 26.05; CI does not build it, and ARM64 has
+not been validated.
+
 ## macOS (Apple Silicon)
 
 Run from a clone (`uv run gputaskman`); there is no portable macOS download yet. Apple GPUs share

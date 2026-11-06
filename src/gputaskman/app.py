@@ -20,7 +20,7 @@ from textual.worker import get_current_worker
 from .collector import BACKEND, Collector, ProcRow, Snapshot
 from .llm import gb
 from .nvml import NvDevice, format_metric
-from .report import (DRM_UNSPLIT_NOTE, METAL_NOTE, WSL_EMPTY, has_engine_counters, has_spill_counters, has_wddm_counters,
+from .report import (DRM_SHARED_CLIENT_NOTE, DRM_UNSPLIT_NOTE, METAL_NOTE, WSL_EMPTY, has_engine_counters, has_spill_counters, has_wddm_counters,
                      inferred_note, vram_label, wsl_note)
 
 KIND_STYLE = {
@@ -81,9 +81,10 @@ candidates remain unproven; engine activity is measured per process, not per mod
 **Linux / WSL:** on native Linux, per-process VRAM and SM/encoder/decoder load come from NVML
 (no spill or commit counters exist there, so those columns stay blank). **AMD GPUs on Linux**
 (`amdgpu`) use sysfs for the device and DRM fdinfo (`/proc/<pid>/fdinfo`) per process: VRAM,
-GTT (GPU memory in system RAM, shown as SPILL), and gfx/compute/video engine time (`n/a` for ROCm/HIP
-processes: their compute runs on `/dev/kfd` queues the kernel doesn't time per process). Only processes
-you can inspect are listed; run with `sudo` to see other users'. Under **WSL**, Windows
+GTT (GPU memory in system RAM, shown as SPILL), and gfx/compute/video engine time (`n/a` for a new client's
+first sample and for ROCm/HIP processes: their compute runs on `/dev/kfd` queues the kernel doesn't time per
+process). A client several processes share shows `n/a` for each of them. Only processes you can inspect are
+listed, and the header says how many it couldn't; run with `sudo` to see other users'. Under **WSL**, Windows
 charges all Linux GPU memory to the VM (`vmwp.exe`), so VRAM and load are device-wide only; rows
 are Linux processes with `/dev/dxg` open and show `n/a` rather than a made-up share. When WSL
 interop is enabled, the Windows host's counters are read through `powershell.exe`: **WSL VM**
@@ -353,6 +354,8 @@ class GpuTaskManager(App):
             legend.append("\n     " + wsl_note(s), style="grey62")
         if s.backend == "metal":
             legend.append("\n     " + METAL_NOTE, style="grey62")
+        if s.process_status:
+            legend.append(f"\n     DRM process scan: {s.process_status}.", style="grey62")
 
         lines = [head, vram, legend]
         if nv and s.backend == "metal":
@@ -537,7 +540,7 @@ class GpuTaskManager(App):
             elif s.wsl_split:
                 out.append(Text(f"No per-process VRAM: {s.wsl_split}.", style="grey62"))
             elif s.backend == "drm":
-                out.append(Text(DRM_UNSPLIT_NOTE, style="grey62"))
+                out.append(Text(DRM_SHARED_CLIENT_NOTE if r.gpu.shared_client else DRM_UNSPLIT_NOTE, style="grey62"))
             elif s.backend == "metal":
                 out.append(Text("GPU memory n/a: footprint can't read other users' processes without root "
                                 "(or hasn't measured this one yet). GPU% comes from Metal's per-process GPU time.",
@@ -546,7 +549,7 @@ class GpuTaskManager(App):
             out.append(Text(f"+ {gb(r.gpu.shared_vram)} in VRAM buffers shared with other processes (e.g. windows a "
                             "compositor imports), not counted above: the driver doesn't say which process owns a shared "
                             "buffer, so they stay in 'unattributed'.", style="grey62"))
-        if s.backend == "drm" and "engine" not in r.gpu.available:
+        if s.backend == "drm" and r.gpu.kfd:
             out.append(Text("Engines n/a: this process uses ROCm/HIP (/dev/kfd), whose compute queues the kernel doesn't "
                             "time per process. The device's AMD gfx load includes its work.", style="grey62"))
         if wddm and r.gpu.paged_out >= 64 << 20:

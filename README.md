@@ -158,7 +158,7 @@ kernel already exposes what's needed.
 |---|---|
 | Device VRAM, GTT, load, temperature, power, clocks, fan, PCIe link | `/sys/class/drm/card*/device` and its `hwmon` |
 | Per-process VRAM and GTT | `drm-resident-vram` / `drm-resident-gtt` (older kernels: `drm-memory-*`) and `drm-shared-*` in `/proc/<pid>/fdinfo/<fd>` |
-| Per-process engine load (gfx, compute, video) | `drm-engine-*` busy time, sampled twice; `n/a` for ROCm/HIP processes (see below) |
+| Per-process engine load (gfx, compute, video) | `drm-engine-*` busy time, sampled twice (`n/a` until a new client has two samples); `n/a` for ROCm/HIP processes (see below) |
 
 GTT is GPU-accessible system RAM, so it fills the SPILL column (and `shared (in system RAM)` for
 the device), like WDDM's non-local usage. On an APU (an integrated GPU, detected by amdgpu not
@@ -166,7 +166,9 @@ reporting a VRAM vendor, a heuristic validated on one APU) GTT is the GPU's norm
 is only a RAM carve-out, so GTT is still shown but never flagged as spill, and an LLM's memory is its
 VRAM plus GTT. The SDMA engine (`dma`) fills the COPY column. Paged stays blank: there is no commit
 counter. A DRM client
-shared between processes (fd passing, fork) is counted once, for the lowest PID. A *buffer* shared
+held by several processes (fd passing, fork; 1Password and its crash handler on the test desktop) has one
+set of counters and nothing says which process uses it, so each is listed with VRAM and GPU% `n/a` and the
+bytes stay in *unattributed*. A *buffer* shared
 between clients (a window a compositor imports, for example) is resident in each of them, and fdinfo
 does not say which one owns it. VRAM therefore shows each process's private bytes (resident minus
 shared), which add up without double counting; shared buffers stay in *unattributed* and are listed
@@ -175,7 +177,7 @@ of SPILL the same way. Older kernels whose amdgpu fdinfo has no `drm-shared-*` k
 split, so per-process VRAM shows `n/a` there instead of double counting. amdgpu has no device-wide
 video engine counter, so the device's encode/decode load stays N/A; per-process video load is
 measured. On VCN 4 and later (RDNA3 and newer, including the RX 9070) decode and encode share one
-ring, so it is reported as `video` rather than split. Only processes you can inspect are listed; run with `sudo` to include other users'. `--gpu 1`
+ring, so it is reported as `video` rather than split. Only processes you can inspect are listed; the header and JSON (`process_status`) say how many could not be, and `sudo` includes other users'. `--gpu 1`
 selects the next card, such as an APU's integrated GPU next to a discrete one. A ROCm/HIP process
 (tagged `HIP`) has its VRAM in fdinfo like any other. Its GPU% is not: HIP submits compute through user-mode queues on `/dev/kfd`, which the kernel
 does not time per process, so a process holding `/dev/kfd` shows engines as `n/a` (`null` in JSON)
@@ -545,7 +547,7 @@ Identification is designed to stay cheap. Measured on one Windows machine:
 | GGUF header, model-store manifests | ms, cached | Once per file / every 60 s |
 | Local API probes | ms, local only | llama-server `/v1/models` only when its model path changes |
 | `psutil.open_files()` | 0.6-2.5 s per process | Never |
-| AMD on Linux: DRM fdinfo scan (`readlink` every fd, read fdinfo of `/dev/dri` ones) | ~9 ms for ~8,000 fds (Linux desktop) | Every refresh, only when an amdgpu card is shown |
+| AMD on Linux: DRM fdinfo scan (`readlink` every fd, read fdinfo of `/dev/dri` ones) | ~9 ms for ~8,000 fds (Linux desktop) | Every refresh, only when an amdgpu card is shown; listing fds is bounded to 50 ms in the TUI and resumes next refresh, known GPU fds are still read |
 | macOS: `ioreg` device stats + Metal clients | ~10 ms | Every refresh |
 | macOS: memory-map scan (`proc_pidinfo` region walk) | ~4 ms per process | Same policy as the memory-map scan above |
 | macOS: `footprint` GPU memory | ~70 ms per process, background thread | Busy and new processes every ~2 s, idle ones every 30 s (54 runs in 40 s with 27 GPU processes, M4 Mac mini) |

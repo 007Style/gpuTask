@@ -262,7 +262,6 @@ class DrmCountersTests(unittest.TestCase):
 
             proc = tmp / "proc"
             _write_fd(proc, 100, 10, _fdinfo(26, pdev, gfx=1_000_000_000, vram=3, gtt=2, shared_vram=2))
-            _write_fd(proc, 200, 11, _fdinfo(26, pdev, gfx=1_000_000_000, vram=1, gtt=2))
             _write_fd(proc, 300, 12, _fdinfo(27, "0000:ff:00.0", gfx=9_999_999_999, vram=4))
             # DRM-looking fdinfo behind a non-DRM fd: the /proc/<pid>/fd target rules it out.
             _write_fd(proc, 400, 13, _fdinfo(28, pdev, gfx=9_999_999_999, vram=4), target="socket:[123]")
@@ -274,7 +273,6 @@ class DrmCountersTests(unittest.TestCase):
             procs, adapters = counters.sample()
             self.assertEqual(list(procs), [card.key])
             self.assertIn(100, procs[card.key])
-            self.assertNotIn(200, procs[card.key])  # same client, counted once, on the lowest pid
             self.assertNotIn(300, procs[card.key])  # unknown pdev
             self.assertNotIn(400, procs[card.key])  # non-DRM fd
             self.assertEqual(procs[card.key][100].dedicated, 1024)  # private only: 3 KiB resident - 2 KiB shared
@@ -371,6 +369,109 @@ class DrmEdgeCaseTests(unittest.TestCase):
             (uvd / "major").write_text("5\n")
             self.assertEqual(drm._vcn_major(tmp), 5)
             self.assertEqual(drm._vcn_major(str(Path(tmp) / "none")), 0)
+
+
+class DrmScanTests(unittest.TestCase):
+    PDEV = "0000:03:00.0"
+
+    def _setup(self, tmp, timer=None):
+        dev = tmp / "drm" / "card1" / "device"
+        dev.mkdir(parents=True)
+        card = _card(dev, self.PDEV)
+        proc = tmp / "proc"
+        proc.mkdir()
+        return card, proc, {} if timer is None else {"timer": timer}
+
+    def test_new_client_engine_load_is_unknown_until_two_samples(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            card, proc, kw = self._setup(Path(tmp))
+            _write_fd(proc, 100, 5, _fdinfo(1, self.PDEV, gfx=0, vram=4096))
+            times = iter([0, 1_000_000_000, 2_000_000_000, 3_000_000_000])
+            counters = drm.DrmCounters(found=[card], proc=str(proc), clock=lambda: next(times), **kw)
+            _write_fd(proc, 200, 5, _fdinfo(2, self.PDEV, gfx=500_000_000, vram=4096))
+            procs = counters.sample()[0][card.key]
+            self.assertIn("engine", procs[100].available)  # in the baseline: a real, measured idle
+            self.assertNotIn("engine", procs[200].available)  # first seen now: unknown, not 0
+            self.assertEqual(procs[200].dedicated, 4096 * 1024)  # memory doesn't need two samples
+            self.assertFalse(procs[200].kfd)
+            _write_fd(proc, 200, 5, _fdinfo(2, self.PDEV, gfx=1_000_000_000, vram=4096))
+            self.assertEqual(counters.sample()[0][card.key][200].engines["3d"], 50.0)
+
+    def test_engine_first_reported_counts_from_zero(self):
+        # amdgpu omits an engine until it has run, so its whole counter is new work.
+        text = "drm-driver:\tamdgpu\ndrm-client-id:\t1\ndrm-pdev:\t{}\ndrm-shared-vram:\t0\n{}"
+        with tempfile.TemporaryDirectory() as tmp:
+            card, proc, kw = self._setup(Path(tmp))
+            _write_fd(proc, 100, 5, text.format(self.PDEV, ""))
+            times = iter([0, 1_000_000_000])
+            counters = drm.DrmCounters(found=[card], proc=str(proc), clock=lambda: next(times), **kw)
+            _write_fd(proc, 100, 5, text.format(self.PDEV, "drm-engine-gfx:\t250000000 ns\n"))
+            self.assertEqual(counters.sample()[0][card.key][100].engines["3d"], 25.0)
+
+    def test_client_held_by_several_processes_is_charged_to_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            card, proc, kw = self._setup(Path(tmp))
+            _write_fd(proc, 100, 5, _fdinfo(1, self.PDEV, gfx=0, vram=4096))
+            _write_fd(proc, 200, 9, _fdinfo(1, self.PDEV, gfx=0, vram=4096))
+            _write_fd(proc, 300, 5, _fdinfo(2, self.PDEV, gfx=0, vram=8192))
+            times = iter([0, 1_000_000_000])
+            counters = drm.DrmCounters(found=[card], proc=str(proc), clock=lambda: next(times), **kw)
+            procs = counters.sample()[0][card.key]
+            for pid in (100, 200):
+                self.assertTrue(procs[pid].shared_client)
+                self.assertIsNone(procs[pid].shown_vram)
+                self.assertNotIn("engine", procs[pid].available)
+            self.assertEqual(procs[300].shown_vram, 8192 * 1024)
+            # The other rows still add up: the shared client's bytes are left out, not the whole total.
+            self.assertEqual(sum(g.dedicated for g in procs.values()), 8192 * 1024)
+            self.assertTrue(all("dedicated" in g.available for g in procs.values()))
+
+    def test_uninspectable_processes_are_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            card, proc, kw = self._setup(Path(tmp))
+            _write_fd(proc, 100, 5, _fdinfo(1, self.PDEV, vram=4096))
+            (proc / "200" / "fd").mkdir(parents=True)
+            real = os.scandir
+
+            def scandir(path):
+                if str(path).endswith(os.path.join("200", "fd")):
+                    raise PermissionError(path)
+                return real(path)
+
+            with patch.object(drm.os, "scandir", scandir):
+                counters = drm.DrmCounters(found=[card], proc=str(proc), **kw)
+                self.assertIn(100, counters.sample()[0][card.key])
+            self.assertIn("1 processes not inspectable", counters.status)
+            counters.sample()
+            self.assertEqual(counters.status, "")  # readable now
+
+    def test_scan_budget_keeps_rows_and_resumes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ticks = [0.0]
+
+            def timer():
+                ticks[0] += 1.0
+                return ticks[0]
+
+            card, proc, kw = self._setup(Path(tmp), timer)
+            for pid in (100, 200, 300, 400):
+                _write_fd(proc, pid, 5, _fdinfo(pid, self.PDEV, gfx=0, vram=4096))
+            counters = drm.DrmCounters(found=[card], proc=str(proc), **kw)  # the baseline is never limited
+            self.assertEqual(sorted(counters._known), [100, 200, 300, 400])
+            counters.scan_budget = 2.5  # one process per refresh with this timer
+            _write_fd(proc, 500, 5, _fdinfo(500, self.PDEV, gfx=0, vram=4096))
+            seen = set()
+            for _ in range(6):
+                rows = counters.sample()[0][card.key]
+                self.assertTrue({100, 200, 300, 400} <= set(rows))  # no row flickers while the scan is partial
+                seen |= set(rows)
+                if 500 in rows:
+                    break
+            self.assertIn(500, seen)  # a new client is found once the scan comes round to it
+            self.assertIn("scan budget reached", counters.status)
+            counters.scan_budget = None
+            counters.sample()
+            self.assertEqual(counters.status, "")
 
 
 class EngineAndSelectionTests(unittest.TestCase):

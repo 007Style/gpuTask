@@ -112,6 +112,7 @@ class Snapshot:
     shared_used: int | None
     procs: list[ProcRow] = field(default_factory=list)
     backend: str = "wddm"  # wddm (Windows) | nvml (native Linux, NVIDIA) | drm (native Linux, AMD) | wsl (device-wide only) | metal (macOS)
+    process_status: str = ""  # amdgpu only: what the DRM process scan couldn't cover; empty when it saw everything
     host_status: str = ""  # WSL only: Windows host counters via interop -- ok | starting | off (...) | ...
     wsl_split: str = ""  # WSL only: why Linux rows have no (inferred) VRAM, when they don't
     # False on an APU (amdgpu iGPU): its GTT is ordinary GPU memory, not spill from a full VRAM.
@@ -194,6 +195,8 @@ class Collector:
             self.drm_card = next((c for c in drm.cards if c.key == self.adapter.luid), None)
         if drm is not None and self.drm_card is None:
             self.counters.drm = None  # an NVIDIA GPU is shown: don't walk every process's fds for nothing
+        elif drm is not None and scan_budget is None:
+            drm.scan_budget = None  # one-shot output sees every process
         self.inspector = ProcInspector()
         self.prober = ServerProber()
         self.scan_budget = scan_budget  # None = scan every candidate now (one-shot output)
@@ -258,6 +261,8 @@ class Collector:
         )
 
         snap.host_status = self.host_status
+        if self.drm_card is not None:
+            snap.process_status = self.counters.drm.status
         live = [(pid, g) for pid, g in procs.items() if _is_live(g)]
         live.sort(key=lambda x: -(x[1].shown_vram or 0))
         for pid, g in live:

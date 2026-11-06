@@ -87,6 +87,8 @@ class ProcGpu:
     # amdgpu (DRM fdinfo): resident VRAM in buffers shared with other DRM clients, kept out of `dedicated`. fdinfo
     # can't say which client owns a shared buffer, so it is shown apart and left in the adapter's unattributed part.
     shared_vram: float = 0.0
+    kfd: bool = False  # amdgpu: holds /dev/kfd (ROCm/HIP), whose compute isn't timed per process
+    shared_client: bool = False  # amdgpu: holds a DRM client other processes hold too, so its counters have no one owner
 
     @property
     def shown_vram(self) -> float | None:

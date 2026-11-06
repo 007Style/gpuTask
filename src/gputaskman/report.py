@@ -63,6 +63,10 @@ DRM_UNSPLIT_NOTE = ("VRAM n/a: this kernel's amdgpu fdinfo has no drm-shared-* k
                     "kernels report shared buffers separately.")
 
 
+DRM_SHARED_CLIENT_NOTE = ("VRAM and GPU% n/a: this process holds a DRM client other processes hold too (fd passing, "
+                          "fork). fdinfo counts the client once and doesn't say which of them uses it.")
+
+
 def inferred_note(g) -> str:
     return ORDER_NOTE if g.inferred_by == "order" else INFERRED_NOTE
 
@@ -117,6 +121,7 @@ def to_dict(s: Snapshot) -> dict:
         "adapter": dataclasses.asdict(s.adapter) if s.adapter else None,
         "vram_total": s.vram_total, "vram_used": s.vram_used, "shared_used": s.shared_used,
         "attributed": s.attributed, "backend": s.backend, "host_status": s.host_status or None,
+        "process_status": s.process_status or None,
         "wsl_split": s.wsl_split or None, "device": nv, "processes": procs,
     }
 
@@ -180,8 +185,12 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
         out.append(INFERRED_NOTE)
     if any(p.gpu.inferred_by == "order" for p in shown):
         out.append(ORDER_NOTE)
-    if s.backend == "drm" and any(not p.host and not p.gpu.attributed for p in shown):
+    if s.backend == "drm" and any(not p.host and not p.gpu.attributed and not p.gpu.shared_client for p in shown):
         out.append(DRM_UNSPLIT_NOTE)
+    if s.backend == "drm" and any(not p.host and p.gpu.shared_client for p in shown):
+        out.append(DRM_SHARED_CLIENT_NOTE)
+    if s.process_status:
+        out.append(f"DRM process scan: {s.process_status}.")
     if s.backend == "wsl" and s.wsl_split and any(not p.host and not p.gpu.attributed and p.gpu.inferred is None
                                                   for p in s.procs):
         out.append(f"Linux VRAM split: {s.wsl_split}")

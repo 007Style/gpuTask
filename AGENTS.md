@@ -115,6 +115,12 @@ each extracted executable without Python, and publishes them together with check
 notes. The build fails if the tag does not match `project.version`. A manual `workflow_dispatch`
 run builds artifacts without publishing.
 
+The same workflow builds a wheel and source distribution, then publishes them to PyPI after all
+builds succeed on a tag. Trusted Publishing uses GitHub OIDC in the `pypi` environment; no API
+token is stored. The PyPI publisher must match owner `shanselman`, repository `gputaskman`,
+workflow `release.yml`, and environment `pypi`. Only the isolated publishing job has
+`id-token: write`; build jobs must not receive it.
+
 ## Contributor pull requests
 
 - CI for fork PRs waits for approval:

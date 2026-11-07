@@ -719,7 +719,19 @@ The **Portable release** GitHub Actions workflow builds on `windows-2022` (x64),
 oldest supported Ubuntu because the frozen binary needs the build machine's glibc or newer. A manual run produces downloadable workflow artifacts without publishing
 a release. A pushed `vVERSION` tag must match `project.version` in `pyproject.toml`; once all builds
 pass, the workflow publishes all four archives and checksums together with generated release notes.
-Build jobs have read-only permissions; only the tag-triggered publish job can write releases.
+The workflow also builds a Python wheel and source distribution. On tags, after all builds
+succeed, a separate job publishes them to PyPI using Trusted Publishing (GitHub OIDC), with no
+stored API token. Manual runs produce artifacts only and publish neither a GitHub release nor
+a PyPI package.
+
+Before the first PyPI publication, configure a pending publisher for project `gputaskman` on
+PyPI: owner `shanselman`, repository `gputaskman`, workflow `release.yml`, environment `pypi`.
+The workflow uses that exact GitHub environment; any environment approval rules must be satisfied
+before publishing. The first successful tagged publication creates the PyPI project. Once
+published, install with `uv tool install gputaskman` or `pipx install gputaskman` (Python 3.11+).
+
+Build jobs have read-only permissions; only the tag-triggered GitHub release job can write releases,
+and only the PyPI publishing job has `id-token: write`.
 CI checks the extracted executable's `--help` outside the checkout with Python removed from `PATH`;
 interactive rendering and real GPU snapshots require local hardware testing.
 

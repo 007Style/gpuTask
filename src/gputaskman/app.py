@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import os
-import time
 from collections import deque
+from contextlib import ExitStack
 
 from rich.console import Group
 from rich.table import Table
@@ -17,7 +17,7 @@ from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Markdown, Select, Static
 from textual.worker import get_current_worker
 
-from .collector import BACKEND, Collector, ProcRow, Snapshot
+from .collector import BACKEND, Collector, ProcRow, Snapshot, enumerate_adapters, ordered_adapters
 from .llm import gb
 from .nvml import NvDevice, format_metric
 from .report import (DRM_RESIDENT_NOTE, METAL_NOTE, WSL_EMPTY, drm_note, has_engine_counters, has_spill_counters, has_wddm_counters,
@@ -174,6 +174,7 @@ class GpuTaskManager(App):
     #chart-controls { height: 1; }
     #chart-label { width: 8; text-style: bold; }
     #chart-mode { width: 24; }
+    #chart-mode SelectOverlay { border: solid $accent; padding: 0 1; }
     #chart-hint { width: 1fr; color: $text-muted; }
     #charts { height: auto; }
     #chart-note { height: auto; color: $text-muted; }
@@ -203,12 +204,15 @@ class GpuTaskManager(App):
     }
     CHARTS = tuple(CHART_COLORS)
 
-    def __init__(self, gpu_index: int = 0, interval: float = 1.0, host: bool = True) -> None:
+    def __init__(self, gpu_index: int | None = None, interval: float = 1.0, host: bool = True) -> None:
         super().__init__()
         self.gpu_index = gpu_index
         self.interval = interval
         self.host = host
         self.snap: Snapshot | None = None
+        self.snapshots: list[Snapshot] = []
+        self._histories: dict[int, dict[str, deque]] = {}
+        self._row_snapshots: dict[str, Snapshot] = {}
         self.selected_key: str | None = None  # ProcRow.key: Linux and Windows host PIDs can collide
         self.sort_idx = 0
         self.show_all = False
@@ -228,7 +232,8 @@ class GpuTaskManager(App):
     def selected_pid(self) -> int | None:
         """PID of the selected local process; None for Windows (W:) and outside (H:) rows."""
         key = self.selected_key
-        return int(key) if key and key.isdigit() else None
+        pid = key.rsplit(":", 1)[-1] if key else ""
+        return int(pid) if pid.isdigit() else None
 
     @selected_pid.setter
     def selected_pid(self, pid: int | None) -> None:
@@ -262,31 +267,70 @@ class GpuTaskManager(App):
     @work(thread=True, exclusive=True)
     def poll(self) -> None:
         worker = get_current_worker()
-        collector = Collector(self.gpu_index, host=self.host)
-        time.sleep(0.5)
-        try:
+        indices = ([self.gpu_index] if self.gpu_index is not None else
+                   list(range(len(ordered_adapters(enumerate_adapters())))) or [0])
+        with ExitStack() as stack:
+            collectors = []
+            for index in indices:
+                collector = Collector(index, scan_budget=Collector.SCAN_BUDGET / len(indices),
+                                      host=self.host and not (BACKEND == "wsl" and len(indices) > 1))
+                if BACKEND == "wsl" and len(indices) > 1 and self.host:
+                    collector.host_status = "off (multi-GPU WSL host matching is not validated; use --gpu N)"
+                stack.callback(collector.close)
+                collectors.append(collector)
+            worker.cancelled_event.wait(0.5)
             while not worker.is_cancelled:
                 if not self.paused:
-                    snap = collector.sample()
-                    self.call_from_thread(self.apply, snap)
-                time.sleep(self.interval)
-        finally:
-            collector.close()
+                    snapshots = [collector.sample() for collector in collectors]
+                    if not worker.is_cancelled:
+                        self.call_from_thread(self.apply_all, snapshots)
+                worker.cancelled_event.wait(self.interval)
 
     # ------------------------------------------------------------------ rendering
 
     def apply(self, snap: Snapshot) -> None:
+        self.apply_all([snap])
+
+    def apply_all(self, snapshots: list[Snapshot]) -> None:
+        if not self.is_running:
+            return  # A worker may finish sampling after shutdown has removed the widgets.
+        self.snapshots = snapshots
+        multi = len(snapshots) > 1
+        table = self.query_one("#procs", DataTable)
+        if multi and "GPU" not in table.columns:
+            table.add_column("GPU", key="GPU")
+        elif not multi and "GPU" in table.columns:
+            table.remove_column("GPU")
+        self._row_snapshots = {}
+        for index, snap in enumerate(snapshots):
+            for row in snap.procs:
+                row.gpu_index = index if multi else None
+                self._row_snapshots[row.key] = snap
+            self._use_history(index)
+            self._record_sample(snap)
+        self._use_history(0)
+        self.snap = snapshots[0]
+        if not self._auto_selected:
+            llm = next((r for r in sorted(
+                (r for s in snapshots for r in s.procs), key=self.SORTS[0][1]) if r.llm), None)
+            if llm:
+                self.selected_key = llm.key
+            self._auto_selected = True
+        self.render_dashboard()
+        self.render_table(self.snap)
+        self.render_inspector()
+
+    def _use_history(self, index: int) -> None:
+        names = ("util", "clock", "bw", "vram", "temp", "power", "enc", "dec")
+        if index not in self._histories:
+            self._histories[index] = {name: deque(maxlen=60) for name in names}
+        for name, history in self._histories[index].items():
+            setattr(self, f"hist_{name}", history)
+
+    def _record_sample(self, snap: Snapshot) -> None:
         self.snap = snap
         nv = snap.nv
         amd = bool(snap.adapter and snap.adapter.vendor_id == 0x1002)
-        if getattr(self, "_amd_chart_labels", None) != amd:
-            self._amd_chart_labels = amd
-            selector = self.query_one("#chart-mode", Select)
-            selected = selector.value
-            selector.set_options([("All charts", -1), *(
-                ("GFX clock" if amd and self.CHARTS[index] == "SM clock" else self.CHARTS[index], index)
-                for index in self.available_charts)])  # macOS offers only the charts IOKit has data for
-            selector.value = selected
         if nv:
             self.hist_util.append(nv.util_gpu)
             self.hist_clock.append(nv.gfx_clock if amd else nv.sm_clock)
@@ -301,15 +345,27 @@ class GpuTaskManager(App):
                 history.append(None)
         self.hist_vram.append(100 * snap.vram_used / snap.vram_total
                               if snap.vram_total and snap.vram_used is not None else None)
-        if not self._auto_selected:
-            llm = next((r for r in sorted(snap.procs, key=self.SORTS[0][1]) if r.llm), None)
-            if llm:
-                self.selected_key = llm.key
-            self._auto_selected = True
-        self.query_one("#device", Static).update(self.render_device(snap))
+
+    def render_dashboard(self) -> None:
+        amd = bool(self.snapshots[0].adapter and self.snapshots[0].adapter.vendor_id == 0x1002)
+        clock_label = "SM/GFX clock" if len(self.snapshots) > 1 else "GFX clock" if amd else "SM clock"
+        if getattr(self, "_clock_label", None) != clock_label:
+            self._clock_label = clock_label
+            selector = self.query_one("#chart-mode", Select)
+            selected = selector.value
+            selector.set_options([("All charts", -1), *(
+                (clock_label if self.CHARTS[index] == "SM clock" else self.CHARTS[index], index)
+                for index in self.available_charts)])
+            selector.value = selected
+        self._amd_chart_labels = amd
+        devices = []
+        for index, snap in enumerate(self.snapshots):
+            if len(self.snapshots) > 1:
+                devices.append(Text(f"GPU {index}", style="bold"))
+            devices.append(self.render_device(snap))
+        self.query_one("#device", Static).update(
+            Group(*devices) if len(self.snapshots) > 1 else devices[0])
         self.render_charts()
-        self.render_table(snap)
-        self.render_inspector()
 
     def render_device(self, s: Snapshot) -> Group:
         nv = s.nv
@@ -415,9 +471,28 @@ class GpuTaskManager(App):
         return self.hist_dec, 100, "%", color
 
     def render_charts(self) -> None:
-        if self.snap is None:
+        if len(self.snapshots) > 1:
+            charts = []
+            notes = []
+            for index, snap in enumerate(self.snapshots):
+                self.snap = snap
+                self._use_history(index)
+                self._amd_chart_labels = bool(snap.adapter and snap.adapter.vendor_id == 0x1002)
+                grid, note = self._chart_content()
+                charts.extend([Text(f"GPU {index}", style="bold"), grid])
+                notes.append(f"GPU {index}: {note}")
+            self.query_one("#charts", Static).update(Group(*charts))
+            self.query_one("#chart-note", Static).update("\n".join(notes))
+            self.snap = self.snapshots[0]
+            self._use_history(0)
+            self._amd_chart_labels = bool(self.snap.adapter and self.snap.adapter.vendor_id == 0x1002)
             return
-        widget = self.query_one("#charts", Static)
+        if self.snap is not None:
+            grid, note = self._chart_content()
+            self.query_one("#charts", Static).update(grid)
+            self.query_one("#chart-note", Static).update(note)
+
+    def _chart_content(self) -> tuple[Table, str]:
         # Reserve the border, padding, and scrollbar even before child resize events arrive.
         width = max(1, self.size.width - 6)
         indices = list(self.available_charts) if self.chart_idx == -1 else [self.chart_idx]
@@ -439,19 +514,18 @@ class GpuTaskManager(App):
             cells.append(cell)
         for start in range(0, len(cells), columns):
             grid.add_row(*cells[start:start + columns])
-        widget.update(grid)
         _, power_scale, _, _ = self.chart_series(self.CHARTS.index("Power"), self.snap.nv)
         _, clock_scale, _, _ = self.chart_series(self.CHARTS.index("SM clock"), self.snap.nv)
-        self.query_one("#chart-note", Static).update(
+        note = (
             "Recent samples · blank = no reading" if self.snap.backend == "metal" else
             f"Recent samples · blank = no reading · power 0–{power_scale:.0f} W · "
             f"{'GFX' if getattr(self, '_amd_chart_labels', False) else 'SM'} clock 0–{clock_scale:.0f} MHz"
         )
+        return grid, note
 
     def on_resize(self) -> None:
         if self.is_mounted and self.snap is not None:
-            self.query_one("#device", Static).update(self.render_device(self.snap))
-            self.call_after_refresh(self.render_charts)
+            self.call_after_refresh(self.render_dashboard)
 
     def visible_rows(self, s: Snapshot) -> list[ProcRow]:
         rows = s.procs
@@ -470,7 +544,12 @@ class GpuTaskManager(App):
 
     def render_table(self, s: Snapshot) -> None:
         t = self.query_one("#procs", DataTable)
-        rows = self.visible_rows(s)
+        rows = [r for snap in self.snapshots for r in self.visible_rows(snap)] if len(self.snapshots) > 1 else self.visible_rows(s)
+        if len(self.snapshots) > 1:
+            rows = [r for r in rows if not (
+                self._row_snapshots[r.key].backend == "wsl" and not r.host and r.gpu_index != 0)]
+        if len(self.snapshots) > 1 and not any(snap.backend == "wsl" for snap in self.snapshots):
+            rows.sort(key=self.SORTS[self.sort_idx][1])
         keep = self.selected_key
         t.clear()
 
@@ -480,6 +559,7 @@ class GpuTaskManager(App):
             return Text(f"{v:.0f}" if v >= 0.5 else "", justify="right", style="bold" if v >= 20 else "")
 
         for r in rows:
+            s = self._row_snapshots.get(r.key, s)
             e = r.gpu.engines
             wddm = has_wddm_counters(s, r)
             engines = has_engine_counters(s, r)
@@ -503,6 +583,8 @@ class GpuTaskManager(App):
                 pct(e.get("copy", 0) if split else None),
                 pct(e.get("decode", 0) + e.get("encode", 0) + e.get("video", 0) if split else None),
                 Text(r.inside, style="magenta" if r.llm else "grey62", overflow="ellipsis", no_wrap=True),
+                *([Text("?" if s.backend == "wsl" and not r.host else str(r.gpu_index))]
+                  if len(self.snapshots) > 1 else []),
                 key=r.key,
             )
         if keep is not None:
@@ -516,13 +598,15 @@ class GpuTaskManager(App):
 
     def render_inspector(self) -> None:
         panel = self.query_one("#inspector", Static)
-        s = self.snap
+        s = self._row_snapshots.get(self.selected_key, self.snap)
         r = next((x for x in s.procs if x.key == self.selected_key), None) if s else None
         if r is None:
             panel.update(Text("Select a process (↑/↓) to see what's inside its GPU memory.  Press ? to learn what's knowable.", style="grey62"))
             return
         where = {"windows": "Windows PID ", "outside": "host PID "}.get(r.origin, "") if r.host else ""
         panel.border_title = f"{r.name} ({where}{r.pid}) - {r.kind}"
+        if r.gpu_index is not None:
+            panel.border_title += " - GPU unknown" if s.backend == "wsl" and not r.host else f" - GPU {r.gpu_index}"
         out: list = []
         e = r.gpu.engines
         wddm = has_wddm_counters(s, r)
@@ -571,6 +655,9 @@ class GpuTaskManager(App):
 
         v = r.llm
         if v:
+            if r.gpu_index is not None:
+                out.append(Text("Model files, launch flags and runtime buffer logs can span GPUs. "
+                                "The breakdown below is not a measured per-device model placement.", style="grey70"))
             width = max(min(self.size.width - 8, 100), 20)
             total = max(r.gpu.shown_vram or 0, sum(x.bytes for x in v.segments), 1)
             out.append(stacked_bar([(x.bytes, SEG_STYLE[x.kind]) for x in v.segments], total, width))
@@ -669,7 +756,7 @@ class GpuTaskManager(App):
     def action_pause(self) -> None:
         self.paused = not self.paused
         if self.snap:
-            self.query_one("#device", Static).update(self.render_device(self.snap))
+            self.render_dashboard()
 
     def action_help(self) -> None:
         self.push_screen(HelpScreen())

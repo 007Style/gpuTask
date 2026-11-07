@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import contextlib
+import asyncio
 import ctypes
 import io
 import json
 import os
 from types import SimpleNamespace
 import tempfile
+import threading
 import unittest
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -1032,6 +1034,9 @@ class UiTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.click("#chart-mode", offset=(2, 0))
                 selector = app.query_one("#chart-mode", Select)
                 self.assertTrue(selector.expanded)
+                overlay = selector.query_one("SelectOverlay")
+                self.assertEqual(overlay.styles.border_top[0], "solid")
+                self.assertEqual(overlay.styles.padding.left, 1)
                 await pilot.press("down", "down", "enter")
                 await pilot.pause()
                 self.assertEqual(selector.value, 1)
@@ -1042,6 +1047,103 @@ class UiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(selector.value, -1)
                 for name in app.CHARTS:
                     self.assertIn(name, self.chart_text(app))
+
+    async def test_multi_gpu_rows_histories_and_selection_stay_separate(self):
+        with patch.object(GpuTaskManager, "poll"):
+            app = GpuTaskManager()
+            async with app.run_test(size=(140, 42)) as pilot:
+                first, second = snapshot(), snapshot()
+                first.nv = NvDevice(index=0, util_gpu=10)
+                second.nv = NvDevice(index=1, util_gpu=80)
+                second.procs[0].gpu.dedicated = 3 * GiB
+                second.procs[0].gpu.available = {"dedicated"}
+                app.apply_all([first, second])
+                await pilot.pause()
+                table = app.query_one("#procs")
+                self.assertEqual(table.row_count, 4)
+                self.assertEqual(table.get_cell("0:10", "GPU").plain, "0")
+                self.assertEqual(table.get_cell("1:10", "GPU").plain, "1")
+                self.assertEqual(table.get_cell("1:10", "VRAM").plain, "3.00 GB")
+                self.assertEqual(table.get_cell("1:10", "GPU%").plain, "n/a")
+                self.assertEqual(list(app._histories[0]["util"]), [10])
+                self.assertEqual(list(app._histories[1]["util"]), [80])
+                self.assertIn("GPU 0", self.chart_text(app))
+                self.assertIn("GPU 1", self.chart_text(app))
+                app.selected_key = "1:10"
+                app.render_inspector()
+                self.assertEqual(app.selected_pid, 10)
+                self.assertIn("GPU 1", str(app.query_one("#inspector").border_title))
+                app.apply_all([first, second])
+                await pilot.pause()
+                self.assertEqual(app.selected_key, "1:10")
+                await pilot.press("c", "p")
+                await pilot.pause()
+                await pilot.resize_terminal(80, 24)
+                await pilot.pause()
+                self.assertIn("GPU 1", self.chart_text(app))
+                self.assertEqual(list(app._histories[1]["util"]), [80, 80])
+                self.assertGreaterEqual(table.region.height, 4)
+                app.apply(first)
+                await pilot.pause()
+                self.assertNotIn("GPU", table.columns)
+                self.assertEqual(table.row_count, 2)
+
+    async def test_poll_collects_all_adapters_and_closes_each_collector(self):
+        adapters = [Adapter(1, "first", 0x10DE, 16 * GiB, 0, False),
+                    Adapter(2, "second", 0x10DE, 8 * GiB, 0, False)]
+        with patch("gputaskman.app.enumerate_adapters", return_value=adapters), \
+                patch("gputaskman.app.Collector") as factory:
+            factory.SCAN_BUDGET = 0.15
+            collectors = [Mock(), Mock()]
+            closed = [threading.Event(), threading.Event()]
+            for collector, event in zip(collectors, closed):
+                collector.sample.side_effect = snapshot
+                collector.close.side_effect = event.set
+            factory.side_effect = collectors
+            app = GpuTaskManager(interval=0.05)
+            async with app.run_test(size=(140, 42)) as pilot:
+                await pilot.pause(0.8)
+                self.assertEqual(len(app.snapshots), 2)
+                self.assertEqual(factory.call_args_list[0].args, (0,))
+                self.assertEqual(factory.call_args_list[1].args, (1,))
+                self.assertEqual(factory.call_args_list[0].kwargs["scan_budget"], 0.075)
+            for collector, event in zip(collectors, closed):
+                self.assertTrue(await asyncio.to_thread(event.wait, 2))
+                collector.close.assert_called_once()
+
+    async def test_explicit_gpu_keeps_single_device_layout(self):
+        with patch("gputaskman.app.Collector") as factory:
+            factory.SCAN_BUDGET = 0.15
+            factory.return_value.sample.side_effect = snapshot
+            closed = threading.Event()
+            factory.return_value.close.side_effect = closed.set
+            app = GpuTaskManager(gpu_index=1, interval=0.05)
+            async with app.run_test(size=(140, 42)) as pilot:
+                await pilot.pause(0.8)
+                self.assertEqual(len(app.snapshots), 1)
+                self.assertNotIn("GPU", app.query_one("#procs").columns)
+                self.assertEqual(factory.call_args.args, (1,))
+            self.assertTrue(await asyncio.to_thread(closed.wait, 2))
+            factory.return_value.close.assert_called_once()
+
+    async def test_multi_gpu_wsl_does_not_claim_process_device_ownership(self):
+        with patch.object(GpuTaskManager, "poll"):
+            app = GpuTaskManager()
+            async with app.run_test(size=(140, 42)) as pilot:
+                first, second = snapshot(), snapshot()
+                for s in (first, second):
+                    s.backend = "wsl"
+                    for row in s.procs:
+                        row.gpu = ProcGpu(attributed=False)
+                app.apply_all([first, second])
+                await pilot.pause()
+                table = app.query_one("#procs")
+                self.assertEqual(table.row_count, 2)
+                self.assertEqual(table.get_cell("0:10", "GPU").plain, "?")
+                self.assertEqual(table.get_cell("0:10", "VRAM").plain, "n/a")
+                app.selected_key = "0:10"
+                app.render_inspector()
+                self.assertIn("GPU unknown", str(app.query_one("#inspector").border_title))
 
     async def test_chart_layout_reflows_while_paused_and_keeps_processes_visible(self):
         with patch.object(GpuTaskManager, "poll"):

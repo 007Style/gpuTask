@@ -51,11 +51,13 @@ class ProcRow:
     handy: HandyEvidence | None = None
     host: bool = False  # pid is from another PID namespace, never a local one (see origin)
     origin: str = ""  # with host: "windows" (a Windows process seen from WSL) | "outside" (outside this container)
+    gpu_index: int | None = None
 
     @property
     def key(self) -> str:
         """Unique row id: PIDs from other namespaces and local PIDs can collide."""
-        return f"{self.origin[0]}{self.pid}" if self.host else str(self.pid)
+        pid = f"{self.origin[0]}{self.pid}" if self.host else str(self.pid)
+        return f"{self.gpu_index}:{pid}" if self.gpu_index is not None else pid
 
     @property
     def pid_label(self) -> str:

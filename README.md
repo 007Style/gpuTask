@@ -420,12 +420,24 @@ scale, temperature uses 0–120°C, and the power and clock scales are displayed
 The dashboard and inspector scroll independently in short terminals so the process list stays usable.
 Model/runtime discovery is throttled, so newly loaded models may take about 15 seconds to appear.
 
+On multi-GPU systems, the TUI stacks a header and trend charts for each GPU and adds a **GPU**
+column to the combined process list. A process using two GPUs has a separate row for each;
+selecting a row inspects its memory on that GPU. Single-GPU layouts are unchanged.
+Memory totals and histories stay separate per device; model files and runtime buffer logs
+can span devices and do not prove per-device model placement. Discovery's 150 ms scan budget
+is divided across GPUs, though each GPU has its own counter and telemetry queries.
+This layout is covered by synthetic tests, **not yet validated on multi-GPU hardware**.
+Under multi-GPU WSL, host attribution is disabled with a reason rather than risking matching
+two devices by memory usage; Linux processes are listed once with GPU `?`, because `/dev/dxg`
+does not identify their GPU. `--gpu N` retains the existing single-device host matching.
+
 `--list-gpus` lists selectable hardware adapters with their vendor and LUID. `--gpu N` selects
 one of these adapters: NVIDIA adapters are listed first, followed by other vendors, with each
 group ordered by dedicated memory. An out-of-range
 index is rejected rather than silently selecting another device. Compute-only devices such as an
 NPU are not graphics adapters. AMD and NVIDIA hardware coverage is described below; configurations
-with multiple GPUs and mixed vendors need further validation.
+with multiple GPUs and mixed vendors need further hardware validation. `--once` and `--json`
+still default to GPU 0; use `--gpu N` to collect another device without changing the snapshot format.
 Device telemetry is matched to WDDM adapters by PCI location, not display name or enumeration order.
 If a unique match cannot be established, telemetry is unavailable; buffer logs can still span devices,
 so model-buffer attribution across GPUs is not yet reliable. This conservative matching also applies

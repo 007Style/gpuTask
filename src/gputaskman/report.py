@@ -59,8 +59,8 @@ ORDER_NOTE = ("? order guess: the size is exact but several owners fit, so newer
 
 
 DRM_NOTES = {
-    "legacy": ("VRAM n/a: this kernel's amdgpu fdinfo has no drm-shared-* keys, so resident memory may include "
-               "buffers imported from other processes and would be counted once per importer."),
+    "legacy": ("VRAM n/a: this kernel's amdgpu fdinfo has incomplete or unparseable drm-shared-* stats, so resident "
+               "memory may include buffers imported from other processes and would be counted once per importer."),
     "shared_client": ("VRAM and GPU% n/a: this process holds a DRM client other processes hold too (fd passing, "
                       "fork). fdinfo counts the client once and doesn't say which of them uses it."),
     "shared_buffers": ("VRAM n/a: this process's DRM client shares buffers with other clients (dma-buf, e.g. "

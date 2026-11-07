@@ -104,13 +104,14 @@ def parse_fdinfo(text: str) -> dict | None:
         return parse_size(fields.get(resident, fields.get(legacy)))
 
     # drm-shared-<region> counts buffers with more than one handle by their *preferred* region, resident or not,
-    # while drm-resident-<region> counts by where buffers are now, so the two can't be subtracted. The total is
-    # still exact evidence of whether this client shares any buffer at all. None when a region is missing
-    # (older amdgpu, before the generic DRM memory stats) or unparseable: unknown, not 0.
-    shared_keys = [k for k in ("drm-shared-vram", "drm-shared-gtt") if k in fields]
+    # while drm-resident-<region> counts by where buffers are now, so the two can't be subtracted. A shared
+    # system-memory buffer can therefore be resident in GTT. Count every reported shared region, including CPU;
+    # missing or unparseable standard regions mean unknown, not 0.
+    required_shared_keys = ("drm-shared-vram", "drm-shared-gtt", "drm-shared-cpu")
+    shared_keys = [k for k in fields if k.startswith("drm-shared-")]
     shared_values = [parse_size(fields[k]) for k in shared_keys]
-    # Only VRAM and GTT matter here: drm-shared-cpu counts system-memory buffers this tool doesn't charge.
-    shared = sum(shared_values) if len(shared_keys) == 2 and None not in shared_values else None
+    shared = (sum(shared_values) if all(k in fields for k in required_shared_keys)
+              and shared_keys and None not in shared_values else None)
 
     engines: dict[str, int] | None = {}
     for key, value in fields.items():
@@ -393,7 +394,7 @@ _DEFERRED = object()  # _scan_pid: the scan budget ran out partway through this 
 _PRUNE_NS = 60 * 1_000_000_000  # forget engine baselines for clients not seen for a minute
 
 # Why a row's DRM memory is n/a instead of measured (ProcGpu.drm_reason)
-REASON_LEGACY = "legacy"  # older amdgpu: no drm-shared-vram/gtt, so private and shared bytes can't be told apart
+REASON_LEGACY = "legacy"  # missing or unparseable shared stats: private and shared bytes can't be told apart
 REASON_SHARED_CLIENT = "shared_client"  # one DRM client held by several processes (fd passing, fork)
 REASON_SHARED_BUFFERS = "shared_buffers"  # the client holds buffers shared with other clients (dma-buf)
 REASON_PRIMARY = "primary"  # opened via /dev/dri/card*, whose root-held copies (logind) a normal user can't see

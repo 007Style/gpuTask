@@ -79,7 +79,7 @@ def _write_fd(proc: Path, pid, fd, text, target="/dev/dri/renderD128") -> None:
         os.symlink(target, link)
 
 
-def _fdinfo(client, pdev, gfx=0, vram=0, gtt=0, shared_vram=0, shared_gtt=0) -> str:
+def _fdinfo(client, pdev, gfx=0, vram=0, gtt=0, shared_vram=0, shared_gtt=0, shared_cpu=0) -> str:
     return (
         "pos:\t0\n"
         "drm-driver:\tamdgpu\n"
@@ -89,7 +89,7 @@ def _fdinfo(client, pdev, gfx=0, vram=0, gtt=0, shared_vram=0, shared_gtt=0) -> 
         f"drm-resident-vram:\t{vram} KiB\n"
         f"drm-shared-gtt:\t{shared_gtt} KiB\n"
         f"drm-resident-gtt:\t{gtt} KiB\n"
-        "drm-shared-cpu:\t0\n"
+        f"drm-shared-cpu:\t{shared_cpu} KiB\n"
         "drm-resident-cpu:\t0\n"
         f"drm-engine-gfx:\t{gfx} ns\n"
         f"drm-engine-capacity-gfx:\t1\n"
@@ -153,21 +153,23 @@ class ParseTests(unittest.TestCase):
 
     def test_parse_fdinfo_prefers_resident_keys(self):
         info = drm.parse_fdinfo("drm-driver:\tamdgpu\ndrm-resident-vram:\t8 KiB\ndrm-memory-vram:\t9 KiB\n"
-                                "drm-shared-vram:\t0\ndrm-shared-gtt:\t4 KiB\n")
+                                "drm-shared-vram:\t0\ndrm-shared-gtt:\t4 KiB\ndrm-shared-cpu:\t0\n")
         self.assertEqual(info["vram"], 8 * 1024)
         self.assertEqual(info["shared"], 4 * 1024)
 
-    def test_parse_fdinfo_shared_needs_vram_and_gtt(self):
+    def test_parse_fdinfo_shared_needs_all_memory_regions(self):
         info = drm.parse_fdinfo("drm-driver:\tamdgpu\ndrm-memory-vram:\t300 MiB\ndrm-shared-vram:\t0\n")
         self.assertIsNone(info["shared"])  # no drm-shared-gtt: whether GTT buffers are shared is unknown
+        info = drm.parse_fdinfo("drm-driver:\tamdgpu\ndrm-shared-vram:\t0\ndrm-shared-gtt:\t0\n")
+        self.assertIsNone(info["shared"])  # no drm-shared-cpu: a shared CPU-preferred buffer may be resident in GTT
 
-    def test_parse_fdinfo_shared_cpu_is_ignored(self):
+    def test_parse_fdinfo_shared_cpu_counts_toward_private_gate(self):
         info = drm.parse_fdinfo("drm-driver:\tamdgpu\ndrm-shared-vram:\t0\ndrm-shared-gtt:\t0\n"
                                 "drm-shared-cpu:\t64 KiB\n")
-        self.assertEqual(info["shared"], 0)  # a shared system-memory buffer doesn't make VRAM/GTT unprivate
+        self.assertEqual(info["shared"], 64 * 1024)
         info = drm.parse_fdinfo("drm-driver:\tamdgpu\ndrm-shared-vram:\t0\ndrm-shared-gtt:\t0\n"
                                 "drm-shared-cpu:\tlots\n")
-        self.assertEqual(info["shared"], 0)
+        self.assertIsNone(info["shared"])
 
     def test_parse_fdinfo_unparseable_is_unknown(self):
         info = drm.parse_fdinfo("drm-driver:\tamdgpu\ndrm-resident-vram:\tlots\ndrm-shared-vram:\t0\n"
@@ -394,7 +396,7 @@ class DrmEdgeCaseTests(unittest.TestCase):
     def test_any_shared_buffer_leaves_the_process_unattributed(self):
         # drm-shared-* counts by preferred placement and drm-resident-* by current placement, so resident minus
         # shared is not this process's private memory. Any sharing at all: n/a, never a subtraction.
-        for extra in ({"shared_vram": 2}, {"shared_gtt": 4}):
+        for extra in ({"shared_vram": 2}, {"shared_gtt": 4}, {"shared_cpu": 6}):
             with self.subTest(extra), tempfile.TemporaryDirectory() as tmp:
                 card, _, counters = self._counters(Path(tmp), [(100, 5, _fdinfo(7, "PDEV", vram=3, gtt=10, **extra))])
                 g = counters.sample()[0][card.key][100]

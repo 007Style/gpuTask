@@ -22,12 +22,33 @@ CPU-only, NPU-only, and cloud workloads are out of scope.
 > Early, experimental software. Device and process counters are measurements; classifications
 > and GGUF-derived breakdowns are estimates. This does not dump VRAM or enumerate a game's textures.
 
+## Install from PyPI
+
+[gputaskman is on PyPI](https://pypi.org/project/gputaskman/). No repository clone is needed:
+
+```powershell
+uv tool install gputaskman
+gputaskman
+```
+
+Or, with [pipx](https://pipx.pypa.io/):
+
+```powershell
+pipx install gputaskman
+gputaskman
+```
+
+Works on Windows, Linux/WSL, and macOS with Python 3.11+ and the supported GPU/driver
+configuration described below. Both installers keep the app in an isolated environment.
+The shorter `gtm` command is also available. Upgrade with `uv tool upgrade gputaskman`
+or `pipx upgrade gputaskman`. For Windows without Python, use the portable download below.
+
 ## Portable Windows download
 
 The [Releases page](https://github.com/shanselman/gputaskman/releases) is where tagged builds
 publish two portable ZIPs: `gputaskman-VERSION-windows-x64.zip` for Intel/AMD Windows PCs, and
 `gputaskman-VERSION-windows-arm64.zip` for native Windows ARM64. These are separate native builds,
-not a universal executable. If no release is published yet, use the source instructions below.
+not a universal executable.
 
 Extract the **entire ZIP**, keeping `_internal` beside `gputaskman.exe`. Open Windows Terminal
 or PowerShell in the extracted folder:

@@ -117,6 +117,8 @@ class Snapshot:
     wsl_split: str = ""  # WSL only: why Linux rows have no (inferred) VRAM, when they don't
     # False on an APU (amdgpu iGPU): its GTT is ordinary GPU memory, not spill from a full VRAM.
     shared_is_spill: bool = True
+    counter_status: str = ""  # Windows counter availability or adapter matching problem
+    counter_adapter_matched: bool | None = None  # Windows PDH LUID matched the selected DXGI adapter
 
     @property
     def host_data(self) -> bool:
@@ -124,7 +126,7 @@ class Snapshot:
 
     @property
     def attributed(self) -> int | None:
-        if any("dedicated" not in p.gpu.available for p in self.procs):
+        if self.counter_adapter_matched is False or any("dedicated" not in p.gpu.available for p in self.procs):
             return None
         return int(sum(p.gpu.dedicated for p in self.procs))
 
@@ -263,6 +265,14 @@ class Collector:
         )
 
         snap.host_status = self.host_status
+        if BACKEND == "wddm" and self.adapter:
+            snap.counter_adapter_matched = luid in per_luid or luid in adapters
+            if not snap.counter_adapter_matched:
+                snap.counter_status = ("Windows GPU counters could not be matched to the selected adapter; "
+                                       "VRAM and processes are unavailable. This can occur in GPU-PV VMs.")
+            elif a is None or a.dedicated is None or a.shared is None:
+                snap.counter_status = ("Some Windows adapter memory counters are unavailable; "
+                                       "GPU-PV VMs may not expose them.")
         if self.drm_card is not None:
             snap.process_status = self.counters.drm.status
         live = [(pid, g) for pid, g in procs.items() if _is_live(g)]

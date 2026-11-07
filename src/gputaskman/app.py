@@ -356,6 +356,8 @@ class GpuTaskManager(App):
             legend.append("\n     " + wsl_note(s), style="grey62")
         if s.backend == "metal":
             legend.append("\n     " + METAL_NOTE, style="grey62")
+        if s.counter_status:
+            legend.append("\n     " + s.counter_status, style="grey62")
         if s.process_status:
             legend.append(f"\n     DRM process scan: {s.process_status}.", style="grey62")
 

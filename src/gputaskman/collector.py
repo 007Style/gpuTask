@@ -179,7 +179,7 @@ class Collector:
     DEEP_TOP_N = 25  # memory-map candidates: the top N VRAM users plus anything busy
     _mac_driver = ""  # "macOS 26.3.1" on the metal backend, read once at startup
     SCAN_BUDGET = 0.15  # seconds of memory-map scanning per sample; leftovers wait for the next sample
-    drm_card = None  # the selected GPU's amdgpu card, when it is one (drm.DrmCard)
+    drm_card = None  # the selected GPU's AMD or Intel card, when it is one (drm.DrmCard)
 
     @property
     def backend(self) -> str:
@@ -193,7 +193,8 @@ class Collector:
         self.amdsmi = AmdSmi(self.adapter, self.adapters)
         self.adl = Adl(self.adapter, self.adapters)
         self._mac_driver = f"macOS {macos_version()}".strip() if BACKEND == "metal" else ""
-        # Native Linux on an AMD GPU: device metrics from amdgpu's sysfs, processes from DRM fdinfo.
+        # Native Linux on an AMD or Intel GPU: device metrics from the driver's sysfs (Intel's are
+        # partial and get their fdinfo-derived used-memory stamp), processes from DRM fdinfo.
         drm = getattr(self.counters, "drm", None)
         if drm is not None and self.adapter and self.adapter.vendor_id != VENDOR_NVIDIA:
             self.drm_card = next((c for c in drm.cards if c.key == self.adapter.luid), None)

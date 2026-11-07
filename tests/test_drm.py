@@ -788,16 +788,96 @@ class EngineAndSelectionTests(unittest.TestCase):
         self.assertEqual(drm._engine_key("vpe"), "other")
         self.assertEqual(drm._engine_key("enc", unified_video=True), "video")
         self.assertEqual(drm._engine_key("gfx", unified_video=True), "3d")
+        self.assertEqual(drm._engine_key("rcs0", intel=True), "3d")
+        self.assertEqual(drm._engine_key("ccs0", intel=True), "compute")
+        self.assertEqual(drm._engine_key("bcs0", intel=True), "copy")
+        self.assertEqual(drm._engine_key("vcs0", intel=True), "video")
+        self.assertEqual(drm._engine_key("vecs0", intel=True), "encode")
+        self.assertEqual(drm._engine_key("rcs0", intel=False), "other")  # Intel-only prefix on AMD
 
-    def test_amd_selectable_next_to_nvidia_on_linux(self):
+    def test_intel_selectable_next_to_nvidia_on_linux(self):
         from gputaskman import collector
         from gputaskman.dxgi import Adapter
 
         nvidia = Adapter(1, "NVIDIA GPU", 0x10DE, 8 * GiB, 0, False)
-        amd = Adapter(2, "AMD Radeon 610M", 0x1002, 2 * GiB, 0, False)
+        intel = Adapter(2, "Intel Arc A770", 0x8086, 16 * GiB, 0, False)
         with patch.object(collector, "BACKEND", "nvml"):
-            self.assertIs(collector.select_adapter([amd, nvidia], 0), nvidia)
-            self.assertIs(collector.select_adapter([amd, nvidia], 1), amd)
+            self.assertIs(collector.select_adapter([intel, nvidia], 0), nvidia)
+            self.assertIs(collector.select_adapter([intel, nvidia], 1), intel)
+
+
+class IntelCardTests(unittest.TestCase):
+    """Intel (i915/xe) cards through the same DRM fdinfo backend, from a synthetic sysfs tree."""
+
+    INTEL = drm.DrmCard(key=12288, pdev="0000:03:00.0", sysfs="/x/card2/device", driver="i915",
+                        vendor_id=0x8086, device_id=0x56A0, name="Intel Arc A770",
+                        vram_total=16 * GiB, integrated=False, intel=True)
+    IGPU = drm.DrmCard(key=32, pdev="0000:00:02.0", sysfs="/x/card1/device", driver="i915",
+                       vendor_id=0x8086, device_id=0xA782, name="Intel UHD Graphics",
+                       vram_total=0, integrated=True, intel=True)
+    AMD = drm.DrmCard(key=0, pdev="0000:43:00.0", sysfs="/x/amd/device", driver="amdgpu",
+                      vendor_id=0x1002, device_id=0x7480, name="AMD GPU", vram_total=8 * GiB,
+                      integrated=False)
+
+    def make(self, cards):
+        return drm.DrmCounters(found=cards)
+
+    def test_intel_engine_names(self):
+        self.assertEqual(drm._engine_key("rcs0", intel=True), "3d")
+        self.assertEqual(drm._engine_key("ccs0", intel=True), "compute")
+        self.assertEqual(drm._engine_key("bcs0", intel=True), "copy")
+        self.assertEqual(drm._engine_key("vcs0", intel=True), "video")
+        self.assertEqual(drm._engine_key("vecs0", intel=True), "encode")
+        self.assertEqual(drm._engine_key("rcs0", intel=False), "other")
+
+    def test_intel_card_is_recognized_and_amd_unchanged(self):
+        counters = self.make([self.INTEL])
+        self.assertTrue(counters.ok)
+        self.assertEqual([c.pdev for c in counters.cards], ["0000:03:00.0"])
+        self.assertTrue(counters.cards[0].intel)
+
+    def test_intel_fdinfo_fields_parse(self):
+        text = ("drm-driver:\ti915\n"
+                "drm-client-id:\t99\n"
+                "drm-pdev:\t0000:03:00.0\n"
+                "drm-engine-rcs0:\t1200000000 ns\n"
+                "drm-engine-bcs0:\t400000000 ns\n"
+                "drm-engine-ccs0:\t800000000 ns\n"
+                "drm-engine-vcs0:\t200000000 ns\n"
+                "drm-engine-vecs0:\t100000000 ns\n"
+                "drm-resident-local0:\t1073741824\n"
+                "drm-resident-stolen-local0:\t1048576\n"
+                "drm-resident-system0:\t268435456\n")
+        fields = drm.parse_fdinfo(text)
+        self.assertEqual(fields["driver"], "i915")
+        self.assertEqual(fields["pdev"], "0000:03:00.0")
+        self.assertEqual(fields["client_id"], 99)
+        self.assertEqual(fields["engines"], {"rcs0": 1_200_000_000, "bcs0": 400_000_000,
+                                             "ccs0": 800_000_000, "vcs0": 200_000_000,
+                                             "vecs0": 100_000_000})
+        self.assertEqual(fields["vram"], GiB + 1_048_576)  # local0 + stolen-local0
+        self.assertEqual(fields["gtt"], 268_435_456)  # system0
+        self.assertIsNone(fields["shared"])  # shared gate needs both Intel shared regions
+
+    def test_intel_missing_regions_stay_unknown_not_zero(self):
+        text = ("drm-driver:\txe\n"
+                "drm-client-id:\t7\n"
+                "drm-engine-rcs0:\t1000 ns\n")
+        fields = drm.parse_fdinfo(text)
+        self.assertIsNone(fields["vram"])  # an iGPU has no local0: unknown, not 0
+        self.assertIsNone(fields["gtt"])
+
+    def test_intel_adapters_trust_the_client_stamp(self):
+        self.INTEL.vram_used = 15 * GiB
+        counters = self.make([self.INTEL])
+        out = counters._adapters()
+        self.assertEqual(out[self.INTEL.key].dedicated, float(15 * GiB))
+        self.assertIsNone(out[self.INTEL.key].shared)  # no device-wide shared counter on Intel
+        self.IGPU.vram_used = None
+        counters = self.make([self.IGPU])
+        out = counters._adapters()
+        self.assertIsNone(out[self.IGPU.key].dedicated)
+        self.assertIsNone(out[self.IGPU.key].shared)
 
 
 if __name__ == "__main__":

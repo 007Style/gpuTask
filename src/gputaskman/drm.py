@@ -1,9 +1,11 @@
-"""Linux AMD GPU backend: cards from sysfs and per-process memory/engine use from DRM fdinfo.
+"""Linux AMD and Intel GPU backend: cards from sysfs and per-process memory/engine use from DRM fdinfo.
 
-The amdgpu driver exposes device-wide numbers (VRAM, clocks, temperature, power) through sysfs and charges
-each DRM client's resident memory and accumulated engine time to the fds that hold the render node open.
-/proc/<pid>/fdinfo lists those clients, so a process can be attributed its VRAM and the engine time that
-elapsed between two samples -- the Linux stand-in for WDDM's per-process counters.
+The amdgpu and i915/xe drivers charge each DRM client's resident memory and accumulated engine time to
+the fds that hold a render node open. /proc/<pid>/fdinfo lists those clients, so a process can be
+attributed its VRAM and the engine time that elapsed between two samples -- the Linux stand-in for
+WDDM's per-process counters. Device-wide numbers come from sysfs: amdgpu reports VRAM, clocks,
+temperature and power directly; i915/xe expose temperature (hwmon), frequency (gt nodes) and an energy
+counter, and have no per-process or device-wide memory sysfs beyond a discrete card's resizable BAR.
 """
 
 from __future__ import annotations
@@ -20,7 +22,11 @@ from .linux import pci_key
 from .telemetry import DeviceTelemetry
 from .pdh import AdapterGpu, ProcGpu
 
-DRIVERS = ("amdgpu",)
+# Intel cards use resizable BARs for local memory (no mem_info_vram_total); a system-memory BAR of 256MB
+# is the UHD 730's window, a multi-GB BAR is a discrete card's local VRAM. Check before trusting.
+_LOCAL_BAR_MIN = 1 << 30  # 1 GiB: smallest real local-memory BAR we accept (Arc A310 is 4 GiB)
+
+DRIVERS = ("amdgpu", "i915", "xe")
 SCAN_BUDGET = 0.05  # seconds per refresh for listing process fds (one-shot output: no limit)
 
 _SIZE_UNITS = {
@@ -51,6 +57,12 @@ class DrmCard:
     # VCN 4+ (RDNA3 and later) runs decode and encode on one unified ring that fdinfo reports as "enc",
     # so its busy time is video work of either kind, not encode.
     unified_video: bool = False
+    # Intel (i915/xe): no device-wide memory sysfs exists. vram_total holds the local-memory (resizable
+    # BAR) window for discrete cards, 0 for integrated ones; per-process bytes still come from fdinfo.
+    intel: bool = False
+    # Intel only: used local memory, stamped in each DrmCounters.sample() as the sum of the card's
+    # clients' local bytes (shared buffers can double-count); None = no readable client, unknown.
+    vram_used: int | None = None
 
 
 def _read(path: str) -> str | None:
@@ -103,6 +115,15 @@ def parse_fdinfo(text: str) -> dict | None:
     def memory(resident: str, legacy: str) -> int | None:
         return parse_size(fields.get(resident, fields.get(legacy)))
 
+    def intel_resident(*keys: str) -> int | None:
+        """Resident bytes of an Intel logical region: the sum of its memory placements. A placement key
+        that is absent counts as 0 (older kernels don't report stolen); all keys absent means the card
+        has no such region (an iGPU has no local0) and returns None -- unknown, not 0."""
+        values = [parse_size(fields.get(k)) for k in keys]
+        if all(v is None for v in values):
+            return None
+        return sum(v for v in values if v is not None)
+
     # drm-shared-<region> counts buffers with more than one handle by their *preferred* region, resident or not,
     # while drm-resident-<region> counts by where buffers are now, so the two can't be subtracted. A shared
     # system-memory buffer can therefore be resident in GTT. Count every reported shared region, including CPU;
@@ -122,6 +143,23 @@ def parse_fdinfo(text: str) -> dict | None:
         except (ValueError, IndexError):
             engines = None  # a torn or malformed counter: this client's load is unknown, not 0
             break
+    if fields.get("drm-driver") in ("i915", "xe"):
+        # Intel's logical regions are local0 (device memory; the local/stolen pair covers memory that
+        # shrunk out of local into system) and system0 (GPU-placed system memory, the GTT equivalent).
+        # There is no separate CPU-only region: system0 feeds the shared/spill slot instead.
+        return {
+            "driver": fields["drm-driver"],
+            "client_id": client_id,
+            "pdev": fields.get("drm-pdev", ""),
+            # The shared-buffer gate needs every shared region present and parseable: any ambiguity keeps
+            # the gate closed (None) instead of risking shared buffers being charged as private.
+            "shared": (sum(shared_values) if shared_keys and None not in shared_values
+                       and all(k in fields for k in ("drm-shared-local0", "drm-shared-system0")) else None),
+            "vram": intel_resident("drm-resident-local0", "drm-resident-stolen-local0"),
+            "gtt": intel_resident("drm-resident-system0", "drm-resident-stolen-system0"),
+            "cpu": None,
+            "engines": engines,
+        }
     return {
         "driver": fields["drm-driver"],
         "client_id": client_id,
@@ -241,7 +279,19 @@ def cards(root: str = "/sys/class/drm", pci_ids: str | None = None) -> list[DrmC
         seen.add(pdev)
         vendor_id = _hex_id(os.path.join(device, "vendor"))
         device_id = _hex_id(os.path.join(device, "device"))
+        intel = vendor_id == 0x8086 and driver in ("i915", "xe")
         vram_total = _int(os.path.join(device, "mem_info_vram_total")) or 0
+        if intel and not vram_total:
+            # i915/xe expose no VRAM sysfs. The resource2 file IS the local-memory BAR, so its size is
+            # the window (the file is binary -- its contents are not a number): >= 1 GiB marks a
+            # discrete card's local VRAM, ~256 MB is an iGPU's system-memory window.
+            try:
+                bar = os.path.getsize(os.path.join(device, "resource2_wc"))
+                if bar <= 0:
+                    bar = os.path.getsize(os.path.join(device, "resource2"))
+            except OSError:
+                bar = 0
+            vram_total = bar if bar >= _LOCAL_BAR_MIN else 0
         found.append(DrmCard(
             key=pci_key(pdev),
             pdev=pdev,
@@ -251,23 +301,27 @@ def cards(root: str = "/sys/class/drm", pci_ids: str | None = None) -> list[DrmC
             device_id=device_id,
             name=_card_name(device, vendor_id, device_id, pci_ids),
             vram_total=vram_total,
-            # amdgpu reports the VRAM chips' vendor only for a discrete card; an APU's "VRAM" is a RAM carve-out.
-            integrated=not os.path.exists(os.path.join(device, "mem_info_vram_vendor")),
+            # amdgpu reports the VRAM chips' vendor only for a discrete card; an APU's "VRAM" is a RAM
+            # carve-out. Intel reports no vendor node at all: a card with a local-memory BAR is discrete.
+            integrated=(vram_total == 0) if intel else not os.path.exists(os.path.join(device, "mem_info_vram_vendor")),
             unified_video=_vcn_major(device) >= 4,
+            intel=intel,
         ))
     found.sort(key=lambda c: (c.integrated, -c.vram_total))
     return found
 
 
 def adapters(found: list[DrmCard]) -> list[Adapter]:
-    """AMD cards as bare adapters (per-process data comes from DrmCounters)."""
+    """AMD and Intel cards as bare adapters (per-process data comes from DrmCounters)."""
     return [
         Adapter(
             luid=c.key,
             name=c.name,
             vendor_id=c.vendor_id,
+            # Intel: the local-memory BAR for discrete cards, 0 for an integrated GPU (its carve-out size
+            # is not exposed; totals stay unknown rather than invented).
             dedicated_vram=c.vram_total,
-            shared_system=_int(os.path.join(c.sysfs, "mem_info_gtt_total")) or 0,
+            shared_system=_int(os.path.join(c.sysfs, "mem_info_gtt_total")) or 0 if not c.intel else 0,
             software=False,
         )
         for c in found
@@ -320,7 +374,7 @@ _PCIE_GEN = {2.5: 1, 5.0: 2, 8.0: 3, 16.0: 4, 32.0: 5, 64.0: 6}
 
 
 def read_device(card: DrmCard, index: int) -> DeviceTelemetry:
-    """NVIDIA-shaped device metrics for one AMD card, read from sysfs."""
+    """NVIDIA-shaped device metrics for one AMD or Intel card, read from sysfs."""
     d = card.sysfs
     hwmon = _hwmon_dir(d)
     dev = DeviceTelemetry(
@@ -328,40 +382,81 @@ def read_device(card: DrmCard, index: int) -> DeviceTelemetry:
         name=card.name,
         pci_bus=card.pdev,
         driver_model=card.driver,
-        source="AMD sysfs",
-        mem_total=_int(os.path.join(d, "mem_info_vram_total")),
-        mem_used=_int(os.path.join(d, "mem_info_vram_used")),
-        util_gpu=_int(os.path.join(d, "gpu_busy_percent")),
-        util_mem=_int(os.path.join(d, "mem_busy_percent")),
+        source="AMD sysfs" if not card.intel else "Intel sysfs",
+        mem_total=_int(os.path.join(d, "mem_info_vram_total")) if not card.intel else (card.vram_total or None),
+        mem_used=_int(os.path.join(d, "mem_info_vram_used")) if not card.intel else card.vram_used,
+        util_gpu=_int(os.path.join(d, "gpu_busy_percent")) if not card.intel else None,
+        # i915/xe have no gpu_busy_percent, engine busy nodes, or memory sysfs: card-level GPU% stays
+        # unknown (per-process engine deltas are the live signal); used memory is stamped in by
+        # DrmCounters (sum of the card's clients' local bytes).
+        util_mem=None if card.intel else _int(os.path.join(d, "mem_busy_percent")),
     )
     if hwmon:
         dev.temp = _hwmon_temp(hwmon)
-        power = _microwatts(os.path.join(hwmon, "power1_average"))
-        if not power:  # some parts expose power1_average but leave it at 0
-            input_power = _microwatts(os.path.join(hwmon, "power1_input"))
-            if input_power is not None:
-                power = input_power
-        dev.power_w = power
-        if power is not None:
-            dev.power_kind = _read(os.path.join(hwmon, "power1_label")) or ""  # amdgpu: "PPT" (package power)
-        dev.power_limit_w = _microwatts(os.path.join(hwmon, "power1_cap"))
+        if card.intel:
+            # Intel hwmon has no instantaneous power node, but energy1_input is a cumulative uJ counter;
+            # its rate over the interval between samples is the card's average power draw.
+            dev.power_w = _intel_power_w(hwmon)
+            dev.power_kind = "Board" if dev.power_w is not None else ""
+        else:
+            power = _microwatts(os.path.join(hwmon, "power1_average"))
+            if not power:  # some parts expose power1_average but leave it at 0
+                input_power = _microwatts(os.path.join(hwmon, "power1_input"))
+                if input_power is not None:
+                    power = input_power
+            dev.power_w = power
+            if power is not None:
+                dev.power_kind = _read(os.path.join(hwmon, "power1_label")) or ""  # amdgpu: "PPT" (package power)
+            dev.power_limit_w = _microwatts(os.path.join(hwmon, "power1_cap"))
         fan_input = _int(os.path.join(hwmon, "fan1_input"))
         fan_max = _int(os.path.join(hwmon, "fan1_max"))
         if fan_input is not None and fan_max is not None and fan_max > 0:
             dev.fan = int(round(100 * fan_input / fan_max))
         dev.gfx_clock = _hwmon_clock(hwmon, "sclk")
         dev.mem_clock = _hwmon_clock(hwmon, "mclk")
-    text = _read(os.path.join(d, "pp_dpm_sclk")) or ""
-    clocks = [int(v) for v in re.findall(r"(\d+)\s*Mhz", text, re.IGNORECASE)]
-    dev.sm_clock_max = max(clocks) if clocks else None
-    speed = _read(os.path.join(d, "current_link_speed"))
-    if speed:
-        try:
-            dev.pcie_gen = _PCIE_GEN.get(round(float(speed.split()[0]), 1))
-        except (ValueError, IndexError):
-            pass
-    dev.pcie_width = _int(os.path.join(d, "current_link_width"))
+    if card.intel:
+        # The gt nodes hang off the DRM card itself (/sys/class/drm/cardN/gt/gt0), not the PCI device.
+        gt = os.path.join(os.path.dirname(d), "gt", "gt0")
+        cur = _int(os.path.join(gt, "rps_cur_freq_mhz"))
+        if cur is not None:
+            dev.gfx_clock = cur  # engine frequency from the gt node (hwmon has no sclk on Intel)
+        dev.sm_clock_max = _int(os.path.join(gt, "rps_RP0_freq_mhz"))
+        # sysfs current_link_* on i915/xe can report the power-on default instead of the live link
+        # (2.5 GT/s x1 shown while a measured DMA transfer ran at ~19 GB/s), so both stay unset:
+        # unknown beats a confidently wrong number.
+    else:
+        text = _read(os.path.join(d, "pp_dpm_sclk")) or ""
+        clocks = [int(v) for v in re.findall(r"(\d+)\s*Mhz", text, re.IGNORECASE)]
+        dev.sm_clock_max = dev.sm_clock_max or (max(clocks) if clocks else None)
+        speed = _read(os.path.join(d, "current_link_speed"))
+        if speed:
+            try:
+                dev.pcie_gen = _PCIE_GEN.get(round(float(speed.split()[0]), 1))
+            except (ValueError, IndexError):
+                pass
+        dev.pcie_width = _int(os.path.join(d, "current_link_width"))
     return dev
+
+
+def _intel_power_w(hwmon: str) -> float | None:
+    """Average watts since the previous sample, from Intel's cumulative hwmon energy counter (uJ)."""
+    energy = _int(os.path.join(hwmon, "energy1_input"))
+    if energy is None:
+        return None
+    now = time.perf_counter()
+    prev = _INTEL_ENERGY_STATE.get(hwmon)
+    _INTEL_ENERGY_STATE[hwmon] = (energy, now)
+    if prev is None:
+        return None  # first sample: the rate needs an interval
+    before, at = prev
+    seconds = now - at
+    if seconds <= 0:
+        return None
+    watts = (energy - before) / 1e6 / seconds
+    return watts if watts >= 0 else None  # counter wrapped or card reset: unknown, not negative
+
+
+_INTEL_ENERGY_STATE: dict[str, tuple[int, float]] = {}  # hwmon path -> (last uJ, last read time); per card
 
 
 def _vcn_major(device: str) -> int:
@@ -369,7 +464,28 @@ def _vcn_major(device: str) -> int:
     return _int(os.path.join(device, "ip_discovery", "die", "0", "UVD", "0", "major")) or 0
 
 
-def _engine_key(name: str, unified_video: bool = False) -> str:
+def _engine_key(name: str, unified_video: bool = False, intel: bool = False) -> str:
+    if intel:
+        lowered = name.lower()
+        # i915/xe engine class-instance names: rcs0 render/3D, ccs0 compute,
+        # bcs0 blitter (copies), vcs0 video decode, vecs0 video encode.
+        if lowered.startswith("rcs"):
+            return "3d"
+        if lowered.startswith("ccs"):
+            return "compute"
+        if lowered.startswith("bcs"):
+            return "copy"
+        if lowered.startswith("vcs"):
+            return "video"
+        if lowered.startswith("vecs"):
+            return "encode"
+        if lowered == "compute":
+            return "compute"
+        if lowered == "copy":
+            return "copy"
+        if lowered.startswith("video"):
+            return "video"  # video / video-enhance: decode and encode can't be told apart
+        return "other"  # any other class instance: busy time still counts toward GPU%
     lowered = name.lower()
     if unified_video and ("enc" in lowered or "dec" in lowered):
         return "video"  # one ring for both: decode and encode can't be told apart
@@ -434,6 +550,14 @@ class DrmCounters:
     def _adapters(self) -> dict[int, AdapterGpu]:
         out: dict[int, AdapterGpu] = {}
         for card in self.cards:
+            if card.intel:
+                # No device-wide sysfs: used memory is the client sum stamped in _stamp_intel_memory
+                # (None stays None); no device-wide system-memory counter exists at all.
+                out[card.key] = AdapterGpu(
+                    dedicated=float(card.vram_used) if card.vram_used is not None else None,
+                    shared=None,
+                )
+                continue
             vram = _int(os.path.join(card.sysfs, "mem_info_vram_used"))
             gtt = _int(os.path.join(card.sysfs, "mem_info_gtt_used"))
             out[card.key] = AdapterGpu(  # an unreadable counter stays None (unknown), not 0
@@ -441,6 +565,17 @@ class DrmCounters:
                 shared=float(gtt) if gtt is not None else None,
             )
         return out
+
+    def _stamp_intel_memory(self, clients: dict[tuple, list]) -> None:
+        """Intel cards expose no device-wide memory sysfs: used local memory is the sum of the card's
+        clients' resident local bytes, counted once per client even when several processes share it
+        (buffers shared between clients can double-count; the status note says so). With no readable
+        client the sum is None -- unknown, not 0."""
+        for card in self.cards:
+            if not card.intel:
+                continue
+            used = [c[1]["vram"] for _key, c in clients.items() if c[1]["pdev"] == card.pdev]
+            card.vram_used = sum(used) if used and None not in used else None
 
     def _start_time(self, pid: int) -> str | None:
         """Field 22 of /proc/<pid>/stat: tells a reused pid from the process cached under it."""
@@ -575,9 +710,11 @@ class DrmCounters:
     def sample(self) -> tuple[dict[int, dict[int, ProcGpu]], dict[int, AdapterGpu]]:
         by_pdev = {c.pdev: c.key for c in self.cards}
         unified = {c.pdev for c in self.cards if c.unified_video}
+        intel_pdevs = {c.pdev for c in self.cards if c.intel}
         procs: dict[int, dict[int, ProcGpu]] = {c.key: {} for c in self.cards}
-        adapters = self._adapters()
         clients, kfd, incomplete = self._clients()
+        self._stamp_intel_memory(clients)
+        adapters = self._adapters()
 
         by_pid: dict[tuple[int, int], list[tuple[tuple, list]]] = {}
         for client_key, client in clients.items():
@@ -649,7 +786,7 @@ class DrmCounters:
                 for name, ns in current[client_key][0].items():
                     # amdgpu omits an engine until it has run, so a missing earlier value really is 0.
                     pct = min(100.0, max(0.0, 100.0 * (ns - old[0].get(name, 0)) / delta))
-                    engine = _engine_key(name, info["pdev"] in unified)
+                    engine = _engine_key(name, info["pdev"] in unified, info["pdev"] in intel_pdevs)
                     engines[engine] = min(100.0, engines.get(engine, 0.0) + pct)
             for engine, pct in engines.items():
                 proc.engines[engine] = pct

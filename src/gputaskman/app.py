@@ -58,6 +58,11 @@ EXPLAIN = {
 HELP_MD = """\
 # What can be known about GPU memory?
 
+Press **m** (or click **Slim/Full** in the footer) to switch between full diagnostics
+and slim monitoring. Slim hides hardware identifiers and secondary telemetry details;
+live readings, charts, processes, inspection, and provenance/availability warnings stay visible.
+This display-only choice applies to all GPUs and resets to full when the app restarts.
+
 | Layer | Source | Works for |
 |---|---|---|
 | **Device** telemetry | NVML, AMD ADL, or optional AMD SMI; amdgpu sysfs on Linux | availability varies by GPU and driver |
@@ -186,6 +191,7 @@ class GpuTaskManager(App):
         Binding("s", "cycle_sort", "Sort"),
         Binding("c", "cycle_chart", "Chart"),
         Binding("a", "toggle_all", "All/Top"),
+        Binding("m", "toggle_monitoring", "Slim/Full"),
         Binding("p", "pause", "Pause"),
         Binding("question_mark", "help", "Explain"),
     ]
@@ -217,6 +223,7 @@ class GpuTaskManager(App):
         self.sort_idx = 0
         self.show_all = False
         self.paused = False
+        self.monitoring = False
         self.hist_util: deque = deque(maxlen=60)
         self.hist_clock: deque = deque(maxlen=60)
         self.hist_bw: deque = deque(maxlen=60)
@@ -363,14 +370,18 @@ class GpuTaskManager(App):
             if len(self.snapshots) > 1:
                 devices.append(Text(f"GPU {index}", style="bold"))
             devices.append(self.render_device(snap))
-        self.query_one("#device", Static).update(
+        device = self.query_one("#device", Static)
+        device.border_title = "Slim monitoring" if self.monitoring else "Full diagnostics"
+        device.update(
             Group(*devices) if len(self.snapshots) > 1 else devices[0])
         self.render_charts()
 
     def render_device(self, s: Snapshot) -> Group:
         nv = s.nv
         name = s.adapter.name if s.adapter else (nv.name if nv else "GPU")
-        if s.backend == "metal":
+        if self.monitoring:
+            head = Text(name, style="bold")
+        elif s.backend == "metal":
             head = Text.assemble((name, "bold"), f"   {s.driver}  ", ("Metal", "bold yellow"), "  unified memory")
         else:
             info = (f"   driver {s.driver}" if s.driver else "") + (f"  CUDA {s.cuda}" if s.cuda else "")
@@ -436,12 +447,19 @@ class GpuTaskManager(App):
             clock_label = (f"gfx {format_metric(nv.gfx_clock)} MHz" if nv.source.startswith("AMD ") else
                            f"SM {format_metric(nv.sm_clock)}/{format_metric(nv.sm_clock_max)} MHz")
             power_kind = f" {nv.power_kind}" if nv.power_kind else ""
-            st = Text(f"{format_metric(nv.temp, unit='°C')}  {format_metric(nv.power_w, '.0f')}/"
-                      f"{format_metric(nv.power_limit_w, '.0f')} W{power_kind}  {pstate}  "
-                      f"{clock_label}  "
-                      f"mem {format_metric(nv.mem_clock)} MHz  video {format_metric(nv.video_clock)} MHz  "
-                      f"PCIe gen{format_metric(nv.pcie_gen)} x{format_metric(nv.pcie_width)}  "
-                      + (f"CC {nv.compute_cap or 'N/A'}" if nv.source == "NVML" else nv.source), style="grey70")
+            if self.monitoring:
+                clock = nv.gfx_clock if nv.source.startswith("AMD ") else nv.sm_clock
+                label = "gfx" if nv.source.startswith("AMD ") else "SM"
+                st = Text(f"{format_metric(nv.temp, unit='°C')}  "
+                          f"{format_metric(nv.power_w, '.0f')} W{power_kind}  "
+                          f"{label} {format_metric(clock)} MHz", style="grey70")
+            else:
+                st = Text(f"{format_metric(nv.temp, unit='°C')}  {format_metric(nv.power_w, '.0f')}/"
+                          f"{format_metric(nv.power_limit_w, '.0f')} W{power_kind}  {pstate}  "
+                          f"{clock_label}  "
+                          f"mem {format_metric(nv.mem_clock)} MHz  video {format_metric(nv.video_clock)} MHz  "
+                          f"PCIe gen{format_metric(nv.pcie_gen)} x{format_metric(nv.pcie_width)}  "
+                          + (f"CC {nv.compute_cap or 'N/A'}" if nv.source == "NVML" else nv.source), style="grey70")
             if nv.throttle:
                 st.append("  throttle: " + ",".join(nv.throttle), style="yellow")
             lines.append(st)
@@ -755,6 +773,11 @@ class GpuTaskManager(App):
 
     def action_pause(self) -> None:
         self.paused = not self.paused
+        if self.snap:
+            self.render_dashboard()
+
+    def action_toggle_monitoring(self) -> None:
+        self.monitoring = not self.monitoring
         if self.snap:
             self.render_dashboard()
 

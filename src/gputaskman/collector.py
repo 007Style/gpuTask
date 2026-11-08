@@ -6,6 +6,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass, field
+from contextlib import ExitStack
 
 import psutil
 
@@ -172,7 +173,8 @@ def select_nv_device(adapter: Adapter | None, devices: list[NvDevice], gpu_index
         if len(matches) == 1:
             return matches[0]
         return None
-    return devices[gpu_index] if gpu_index < len(devices) else None
+    matches = [d for d in devices if d.index == gpu_index]
+    return matches[0] if len(matches) == 1 else None
 
 
 class Collector:
@@ -185,13 +187,20 @@ class Collector:
     def backend(self) -> str:
         return "drm" if self.drm_card is not None else BACKEND
 
-    def __init__(self, gpu_index: int = 0, scan_budget: float | None = SCAN_BUDGET, host: bool = True) -> None:
-        self.adapters = [a for a in enumerate_adapters() if not a.software]
+    def __init__(self, gpu_index: int = 0, scan_budget: float | None = SCAN_BUDGET, host: bool = True,
+                 adapters: list[Adapter] | None = None) -> None:
+        self.adapters = [a for a in (enumerate_adapters() if adapters is None else adapters) if not a.software]
         self.adapter = select_adapter(self.adapters, gpu_index)
-        self.counters = GpuCounters()
-        self.nvml = Nvml()
-        self.amdsmi = AmdSmi(self.adapter, self.adapters)
-        self.adl = Adl(self.adapter, self.adapters)
+        with ExitStack() as resources:
+            self.counters = GpuCounters()
+            resources.callback(self.counters.close)
+            self.nvml = Nvml()
+            resources.callback(self.nvml.close)
+            self.amdsmi = AmdSmi(self.adapter, self.adapters)
+            resources.callback(self.amdsmi.close)
+            self.adl = Adl(self.adapter, self.adapters)
+            resources.callback(self.adl.close)
+            resources.pop_all()
         self._mac_driver = f"macOS {macos_version()}".strip() if BACKEND == "metal" else ""
         # Native Linux on an AMD GPU: device metrics from amdgpu's sysfs, processes from DRM fdinfo.
         drm = getattr(self.counters, "drm", None)
@@ -271,7 +280,8 @@ class Collector:
             snap.counter_adapter_matched = luid in per_luid or luid in adapters
             if not snap.counter_adapter_matched:
                 snap.counter_status = ("Windows GPU counters could not be matched to the selected adapter; "
-                                       "VRAM and processes are unavailable. This can occur in GPU-PV VMs.")
+                                       "VRAM and processes are unavailable. The adapter may be temporarily "
+                                       "unavailable, or GPU-PV VMs may not expose these counters.")
             elif a is None or a.dedicated is None or a.shared is None:
                 snap.counter_status = ("Some Windows adapter memory counters are unavailable; "
                                        "GPU-PV VMs may not expose them.")
@@ -386,9 +396,10 @@ class Collector:
                 r.gpu.inferred, r.gpu.inferred_by = g.bytes, g.confidence
 
     def close(self) -> None:
-        self.counters.close()
-        self.nvml.close()
-        self.amdsmi.close()
-        self.adl.close()
-        if self.host is not None:
-            self.host.close()
+        with ExitStack() as resources:
+            if self.host is not None:
+                resources.callback(self.host.close)
+            resources.callback(self.adl.close)
+            resources.callback(self.amdsmi.close)
+            resources.callback(self.nvml.close)
+            resources.callback(self.counters.close)

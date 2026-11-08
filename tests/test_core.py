@@ -240,6 +240,7 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(s.procs, [])
         self.assertFalse(s.counter_adapter_matched)
         self.assertIn("could not be matched", s.counter_status)
+        self.assertIn("temporarily unavailable", s.counter_status)
         self.assertIn("GPU-PV", to_text(s))
         data = to_dict(s)
         self.assertIsNone(data["attributed"])
@@ -1238,7 +1239,10 @@ class UiTests(unittest.IsolatedAsyncioTestCase):
                 collector.close.assert_called_once()
 
     async def test_explicit_gpu_keeps_single_device_layout(self):
-        with patch("gputaskman.app.Collector") as factory:
+        adapters = [Adapter(1, "first", 0x10DE, 16 * GiB, 0, False),
+                    Adapter(2, "second", 0x10DE, 8 * GiB, 0, False)]
+        with patch("gputaskman.app.enumerate_adapters", return_value=adapters), \
+                patch("gputaskman.app.Collector") as factory:
             factory.SCAN_BUDGET = 0.15
             factory.return_value.sample.side_effect = snapshot
             closed = threading.Event()

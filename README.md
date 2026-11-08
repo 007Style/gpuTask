@@ -437,6 +437,24 @@ Memory totals and histories stay separate per device; model files and runtime bu
 can span devices and do not prove per-device model placement. Discovery's 150 ms scan budget
 is divided across GPUs, though each GPU has its own counter and telemetry queries.
 This layout is covered by synthetic tests, **not yet validated on multi-GPU hardware**.
+On Windows, the live TUI checks DXGI adapter topology every five seconds in the existing
+sampling worker (or on the next sample with a longer interval). Removed adapters retain their
+session GPU number with unavailable readings; surviving adapters keep their collectors and
+histories, and newly discovered adapters are appended. Re-enabling an adapter rebuilds its
+providers. LUIDs identify adapters; if a LUID changes, only a unique PCI location **and**
+matching vendor/description can reconnect the old slot. Without that evidence, the old slot
+remains unavailable rather than transferring its history or process ownership to another GPU.
+`--gpu N` pins the adapter selected at startup, not whichever adapter later occupies index N;
+it does not start monitoring other newly discovered devices. Session GPU numbers therefore
+need not match a fresh `--list-gpus` after a topology change.
+NVML handles are reacquired at the same low-frequency cadence; missing counters, lost telemetry
+or sampling errors trigger provider reconstruction at the next successful discovery. Persistent
+failures back off to at most one reconstruction per minute; a reappearing or changed adapter retries immediately.
+Discovery errors retain the last known topology with a warning, not invented zero usage.
+Pausing suspends discovery as well as sampling; resume performs an overdue check.
+This recovery is covered by mocks, **not validated with hardware disable/re-enable** on the
+reporter's hybrid AMD/NVIDIA laptop or locally. It is not a claim of physical hot-swap support.
+Other backends and one-shot output retain startup-only discovery.
 Under multi-GPU WSL, host attribution is disabled with a reason rather than risking matching
 two devices by memory usage; Linux processes are listed once with GPU `?`, because `/dev/dxg`
 does not identify their GPU. `--gpu N` retains the existing single-device host matching.
@@ -648,6 +666,8 @@ Identification is designed to stay cheap. Measured on one Windows machine:
 | Probe | Cost | Used |
 |---|---|---|
 | Process list, command line, listening ports | under 1 ms | Once per process / every 5 s |
+| Windows adapter discovery (DXGI + PCI location, no telemetry sample) | ~0.40 ms median; first/cold call up to 14.1 ms in 30 reads (Windows 11 build 26340, RTX 4080 SUPER, NVIDIA 630.20) | TUI only, every 5 s; synchronous OS calls, not a hard latency bound. Other drivers/multi-GPU laptops unmeasured; provider reconstruction after changes/errors has additional driver-dependent cost |
+| Windows NVML handle reacquisition (no telemetry sample) | ~8.7 ms median, 9.3 ms max in 30 reads on the same machine | Every 5 s per active collector; retries initialization after NVML session-loss errors. Other drivers unmeasured |
 | Memory-map scan (DLLs + mapped files) | 1-50 ms per process | New processes, a 64 MiB / 10% memory change, or every 2 min; at most 150 ms per refresh |
 | GGUF header, model-store manifests | ms, cached | Once per file / every 60 s |
 | Local API probes | ms, local only | llama-server `/v1/models` only when its model path changes |

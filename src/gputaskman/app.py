@@ -759,7 +759,7 @@ class GpuTaskManager(App):
     # ------------------------------------------------------------------ events/actions
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
-        if event.row_key is not None and event.row_key.value is not None:
+        if self.is_running and event.row_key is not None and event.row_key.value is not None:
             self.selected_key = str(event.row_key.value)
             self.render_inspector()
 

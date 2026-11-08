@@ -485,6 +485,12 @@ class CollectorResourceTests(TestCase):
 
 
 class RecoveryUiTests(IsolatedAsyncioTestCase):
+    def test_queued_row_highlight_is_ignored_after_shutdown(self):
+        app = GpuTaskManager()
+        event = SimpleNamespace(row_key=SimpleNamespace(value="10"))
+        app.on_data_table_row_highlighted(event)
+        self.assertIsNone(app.selected_key)
+
     async def test_histories_and_row_ownership_stay_in_stable_slots_across_recovery(self):
         first, second = adapter(1), adapter(2, 0x1002, 2)
         topology = [first, second]

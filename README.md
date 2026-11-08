@@ -406,12 +406,22 @@ uv run --locked gputaskman --help
 | `s` | Cycle sort: VRAM, GPU%, spill, paged, name |
 | `c` | Cycle all charts or a single metric (also available in the **Charts** dropdown) |
 | `a` | Switch between top and all collected processes |
+| `m` | Toggle full diagnostics / slim monitoring |
 | `p` | Pause / resume collection |
 | `?` | Explain the counters and their limits |
 | Escape | Close help |
 | `q` | Quit |
 
 A wide terminal (roughly 140 columns or more) makes the full table easier to read.
+The TUI starts in **Full diagnostics** mode. Press `m` (or click **Slim/Full** in the
+footer) for **Slim monitoring**: each GPU header hides driver/CUDA versions, PCI bus
+address, driver model, PCIe generation/width, compute capability, power/clock limits,
+performance state, and secondary memory/video clocks. GPU identity, memory bars and
+provenance/availability warnings, utilization, PCIe throughput, temperature, current power
+and SM/GFX clock, throttling alerts, charts, processes, and process inspection remain.
+The header border names the active mode; press `m` again to restore the full details.
+This is a session-only display toggle, applies to every GPU, and does not change collection
+or one-shot text/JSON output.
 All eight history charts are shown by default: GPU, SM clock (GFX clock on AMD), VRAM, memory activity,
 temperature, power, encoder, and decoder. They stack in narrow terminals and share rows as
 the window widens. Click the **Charts** dropdown to focus on one metric or return to **All charts**.

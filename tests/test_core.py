@@ -249,6 +249,27 @@ class MemoryTests(unittest.TestCase):
         Console(file=output, width=160).print(GpuTaskManager().render_device(s))
         self.assertIn("could not be matched", output.getvalue())
 
+    def test_nvml_is_swept_only_for_an_nvidia_adapter(self):
+        amd_telemetry = NvDevice(index=0, source="AMD ADL", util_gpu=5)
+        for vendor, swept, expected in ((0x1002, False, amd_telemetry), (0x8086, False, None),
+                                        (0x10DE, True, None)):
+            with self.subTest(vendor=hex(vendor)):
+                c = Collector.__new__(Collector)
+                c.adapter = Adapter(1, "GPU", vendor, 16 * GiB, 0, False, (1, 0, 0))
+                c.adapters = [c.adapter]
+                c.gpu_index, c.scan_budget, c.host, c.host_status = 0, None, None, ""
+                c.nvml = Mock(ok=True)
+                c.nvml.sample.return_value = []
+                c.adl, c.amdsmi = Mock(), Mock()
+                c.adl.sample.return_value = amd_telemetry
+                c.counters = Mock(outside={})
+                c.counters.sample.return_value = ({1: {}}, {1: AdapterGpu(dedicated=0, shared=0)})
+                c.inspector, c.prober = Mock(), Mock()
+                with patch("gputaskman.collector.BACKEND", "wddm"):
+                    s = c.sample()
+                self.assertEqual(c.nvml.sample.called, swept)
+                self.assertIs(s.nv, expected)
+
     def test_windows_matching_counter_zero_is_not_unavailable(self):
         c = Collector.__new__(Collector)
         c.adapter = Adapter(1, "GPU", 0x10DE, 16 * GiB, 0, False)

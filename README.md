@@ -289,11 +289,11 @@ guess unless their sizes match.
 
 ### NixOS
 
-With flakes enabled, run directly from this checkout:
+With flakes enabled, run the published flake or a checkout:
 
 ```bash
-nix run path:.
-nix run path:. -- --list-gpus
+nix run github:shanselman/gputaskman
+nix run github:shanselman/gputaskman -- --list-gpus
 nix run path:. -- --once
 nix run path:. -- --json
 ```
@@ -303,7 +303,9 @@ Build both `gputaskman` and its `gtm` alias with `nix build path:.` (executables
 pins nixpkgs. Dependencies come from nixpkgs, independently of `uv.lock`. No pip installation,
 virtual environment, CUDA Toolkit, or ROCm installation is needed. GPU drivers remain supplied by
 the host, never bundled with the package. NVIDIA's nixpkgs Python binding finds NVML through
-`/run/opengl-driver/lib`; AMD uses kernel sysfs and DRM fdinfo interfaces directly.
+`/run/opengl-driver/lib`; AMD uses kernel sysfs and DRM fdinfo interfaces directly. On WSL2 the
+host driver lives in `/usr/lib/wsl/lib` instead, and the wrappers add that directory to
+`LD_LIBRARY_PATH` (it is ignored when absent, so NixOS is unaffected).
 
 For source development and tests:
 

@@ -395,10 +395,13 @@ def _cpu_package_temp(hwmon_root: str = "/sys/class/hwmon") -> int | None:
         for name in names:
             if name.startswith("temp") and name.endswith("_label"):
                 label = _read(os.path.join(path, name))
+                value = _milli(os.path.join(path, f"{name[:-len('_label')]}_input"))
+                if value is None:
+                    continue  # torn or unparseable reading: try the other sensors
                 if label == "Package id 0":
-                    return _milli(os.path.join(path, f"{name[:-len('_label')]}_input"))
-                if label and label.startswith("Package id") and fallback is None:
-                    fallback = _milli(os.path.join(path, f"{name[:-len('_label')]}_input"))
+                    return value
+                if label is not None and label.startswith("Package id") and fallback is None:
+                    fallback = value
     return fallback
 
 
@@ -481,10 +484,10 @@ def read_device(card: DrmCard, index: int) -> DeviceTelemetry:
             except (ValueError, IndexError):
                 pass
         dev.pcie_width = _int(os.path.join(d, "current_link_width"))
-    if card.intel and dev.temp is None:
-        # No GPU temperature sensor (an integrated GPU has no hwmon of its own, and a discrete card's
-        # hwmon may still lack one): the CPU package shares the die, so its temperature stands in,
-        # labelled as such (temp_kind), never presented as the GPU's own reading.
+    if card.intel and card.integrated and dev.temp is None:
+        # No GPU temperature sensor (an integrated GPU has no hwmon of its own): the CPU package shares
+        # the die, so its temperature stands in, labelled as such (temp_kind), never presented as the
+        # GPU's own reading. A discrete card keeps N/A: the package is not its temperature.
         package = _cpu_package_temp()
         if package is not None:
             dev.temp = package

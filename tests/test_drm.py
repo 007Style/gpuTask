@@ -448,6 +448,18 @@ class ReadDeviceTests(unittest.TestCase):
             self.assertIsNone(drm._cpu_package_temp(str(root)))
             self.assertIsNone(drm._cpu_package_temp(str(root / "no-such-dir")))
 
+    def test_cpu_package_temp_skips_torn_readings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cpu = root / "hwmon0"
+            cpu.mkdir()
+            (cpu / "name").write_text("coretemp\n")
+            (cpu / "temp1_label").write_text("Package id 0\n")
+            (cpu / "temp1_input").write_text("lots\n")  # torn: try the other sensors
+            (cpu / "temp2_label").write_text("Package id 1\n")
+            (cpu / "temp2_input").write_text("48000\n")
+            self.assertEqual(drm._cpu_package_temp(str(root)), 48)
+
     def test_read_device_intel_falls_back_to_cpu_package_temp(self):
         with tempfile.TemporaryDirectory() as tmp:
             card_sysfs = Path(tmp) / "card1"
@@ -475,6 +487,20 @@ class ReadDeviceTests(unittest.TestCase):
             with patch.object(drm, "_cpu_package_temp", return_value=55):
                 d = drm.read_device(card, 0)
             self.assertEqual((d.temp, d.temp_kind), (61, ""))
+
+    def test_read_device_discrete_intel_without_sensor_stays_unknown(self):
+        # The CPU package shares a die with an integrated GPU only; on a discrete card it is
+        # not the GPU's temperature, so there is no fallback.
+        with tempfile.TemporaryDirectory() as tmp:
+            card_sysfs = Path(tmp) / "card1"
+            dev = card_sysfs / "device"
+            dev.mkdir(parents=True)
+            card = drm.DrmCard(key=12288, pdev="0000:03:00.0", sysfs=str(dev), driver="i915",
+                               vendor_id=0x8086, device_id=0x56A0, name="Intel Arc A770",
+                               vram_total=16 * GiB, integrated=False, intel=True)
+            with patch.object(drm, "_cpu_package_temp", return_value=55):
+                d = drm.read_device(card, 0)
+            self.assertEqual((d.temp, d.temp_kind), (None, ""))
 
 
 class DrmCountersTests(unittest.TestCase):

@@ -1122,6 +1122,18 @@ class UiTests(unittest.IsolatedAsyncioTestCase):
                 app.hist_clock.clear()
                 self.assertEqual(app.chart_series(index, None)[1], 1)
 
+    async def test_row_highlight_after_the_inspector_is_gone_is_ignored(self):
+        # During teardown a queued RowHighlighted can arrive after the inspector was removed
+        # (observed on Windows 3.11 CI). It must not raise NoMatches out of run_test.
+        with patch.object(GpuTaskManager, "poll"):
+            app = GpuTaskManager()
+            async with app.run_test(size=(140, 42)) as pilot:
+                app.apply(snapshot())
+                await pilot.pause()
+                app.query_one("#inspector").remove()
+                await pilot.pause()
+                app.render_inspector()
+
     async def test_unavailable_device_metrics_render_as_na(self):
         with patch.object(GpuTaskManager, "poll"):
             app = GpuTaskManager()

@@ -35,7 +35,8 @@ def has_wddm_counters(s: Snapshot, row: ProcRow) -> bool:
 
 
 def has_spill_counters(s: Snapshot, row: ProcRow) -> bool:
-    """Per-process GPU memory in system RAM: WDDM's non-local usage, or amdgpu's GTT on Linux."""
+    """Per-process GPU memory in system RAM: WDDM's non-local usage, or a DRM client's GTT (amdgpu) or
+    system0 (Intel) bytes on Linux."""
     return (has_wddm_counters(s, row) or (s.backend == "drm" and not row.host)) and "shared" in row.gpu.available
 
 
@@ -59,8 +60,9 @@ ORDER_NOTE = ("? order guess: the size is exact but several owners fit, so newer
 
 
 DRM_NOTES = {
-    "legacy": ("VRAM n/a: this kernel's amdgpu fdinfo has incomplete or unparseable drm-shared-* stats, so resident "
-               "memory may include buffers imported from other processes and would be counted once per importer."),
+    "legacy": ("VRAM n/a: this driver's fdinfo has missing or unparseable drm-shared-* stats (older amdgpu kernels, "
+               "Intel integrated GPUs, xe), so resident memory may include buffers imported from other processes "
+               "and would be counted once per importer."),
     "shared_client": ("VRAM and GPU% n/a: this process holds a DRM client other processes hold too (fd passing, "
                       "fork). fdinfo counts the client once and doesn't say which of them uses it."),
     "shared_buffers": ("VRAM n/a: this process's DRM client shares buffers with other clients (dma-buf, e.g. "
@@ -87,6 +89,15 @@ def inferred_note(g) -> str:
 METAL_NOTE = ("macOS: unified memory, so GPU memory is part of system RAM. Rows show each process's graphics "
               "footprint; other users' processes (WindowServer, daemons) show GPU% only, since reading their "
               "memory needs root.")
+INTEL_MEMORY_NOTE = ("Intel VRAM used is the sum of local memory resident in the processes gputaskman can inspect "
+                     "(the driver has no device-wide counter): buffers shared between processes can be counted "
+                     "twice, and processes it can't inspect are missing.")
+
+
+def intel_memory_note(s: Snapshot) -> str:
+    """Intel's device VRAM used is a sum over visible DRM clients, not a device counter."""
+    return INTEL_MEMORY_NOTE if (s.backend == "drm" and s.nv and s.nv.source == "Intel sysfs"
+                                 and s.vram_used is not None) else ""
 
 
 def to_dict(s: Snapshot) -> dict:
@@ -169,6 +180,8 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
         out.append(memory)
     if s.backend == "wsl":
         out.append(wsl_note(s))
+    if intel_memory_note(s):
+        out.append(intel_memory_note(s))
     if s.counter_status:
         out.append(s.counter_status)
     if nv and s.backend != "metal":

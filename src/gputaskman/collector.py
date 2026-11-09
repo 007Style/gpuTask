@@ -115,8 +115,8 @@ class Snapshot:
     vram_used: int | None  # WDDM adapter-wide dedicated usage
     shared_used: int | None
     procs: list[ProcRow] = field(default_factory=list)
-    backend: str = "wddm"  # wddm (Windows) | nvml (native Linux, NVIDIA) | drm (native Linux, AMD) | wsl (device-wide only) | metal (macOS)
-    process_status: str = ""  # amdgpu only: what the DRM process scan couldn't cover; empty when it saw everything
+    backend: str = "wddm"  # wddm (Windows) | nvml (native Linux, NVIDIA) | drm (native Linux, AMD or Intel) | wsl (device-wide only) | metal (macOS)
+    process_status: str = ""  # drm backend only: what the DRM process scan couldn't cover; empty when it saw everything
     host_status: str = ""  # WSL only: Windows host counters via interop -- ok | starting | off (...) | ...
     wsl_split: str = ""  # WSL only: why Linux rows have no (inferred) VRAM, when they don't
     # False on an APU (amdgpu iGPU): its GTT is ordinary GPU memory, not spill from a full VRAM.

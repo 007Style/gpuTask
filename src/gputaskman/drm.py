@@ -144,9 +144,15 @@ def parse_fdinfo(text: str) -> dict | None:
             engines = None  # a torn or malformed counter: this client's load is unknown, not 0
             break
     if fields.get("drm-driver") in ("i915", "xe"):
+        if not engines:
+            # i915 (gen8+) prints a drm-engine-<class> line for each engine class the device has, even at 0 ns;
+            # xe reports drm-cycles-* instead and gen7 i915 nothing. No such line means the load is unknown, not 0
+            # (AGENTS.md rule 2).
+            engines = None
         # Intel's logical regions are local0 (device memory; the local/stolen pair covers memory that
         # shrunk out of local into system) and system0 (GPU-placed system memory, the GTT equivalent).
-        # There is no separate CPU-only region: system0 feeds the shared/spill slot instead.
+        # There is no separate CPU-only region: system0 feeds the shared/spill slot instead. These are
+        # i915's names; xe calls them vram0/gtt/system, so its memory stays unknown until validated.
         return {
             "driver": fields["drm-driver"],
             "client_id": client_id,
@@ -467,25 +473,18 @@ def _vcn_major(device: str) -> int:
 def _engine_key(name: str, unified_video: bool = False, intel: bool = False) -> str:
     if intel:
         lowered = name.lower()
-        # i915/xe engine class-instance names: rcs0 render/3D, ccs0 compute,
-        # bcs0 blitter (copies), vcs0 video decode, vecs0 video encode.
-        if lowered.startswith("rcs"):
+        # i915's fdinfo names whole engine classes: render, copy, video, video-enhance, compute. The command-streamer
+        # names (rcs, ccs, bcs, vcs, vecs, optionally with an instance number) are how xe and the engine tables spell
+        # the same classes. Video-enhance (VECS) is post-processing, not encode, so it counts as video.
+        if lowered == "render" or lowered.startswith("rcs"):
             return "3d"
-        if lowered.startswith("ccs"):
+        if lowered == "compute" or lowered.startswith("ccs"):
             return "compute"
-        if lowered.startswith("bcs"):
+        if lowered == "copy" or lowered.startswith("bcs"):
             return "copy"
-        if lowered.startswith("vcs"):
-            return "video"
-        if lowered.startswith("vecs"):
-            return "encode"
-        if lowered == "compute":
-            return "compute"
-        if lowered == "copy":
-            return "copy"
-        if lowered.startswith("video"):
-            return "video"  # video / video-enhance: decode and encode can't be told apart
-        return "other"  # any other class instance: busy time still counts toward GPU%
+        if lowered.startswith(("video", "vcs", "vecs")):
+            return "video"  # decode and encode can't be told apart
+        return "other"  # any other class: busy time still counts toward GPU%
     lowered = name.lower()
     if unified_video and ("enc" in lowered or "dec" in lowered):
         return "video"  # one ring for both: decode and encode can't be told apart
@@ -569,8 +568,8 @@ class DrmCounters:
     def _stamp_intel_memory(self, clients: dict[tuple, list]) -> None:
         """Intel cards expose no device-wide memory sysfs: used local memory is the sum of the card's
         clients' resident local bytes, counted once per client even when several processes share it
-        (buffers shared between clients can double-count; the status note says so). With no readable
-        client the sum is None -- unknown, not 0."""
+        (buffers shared between clients can double-count, and clients that can't be inspected are missing;
+        report.INTEL_MEMORY_NOTE says so). With no readable client the sum is None -- unknown, not 0."""
         for card in self.cards:
             if not card.intel:
                 continue

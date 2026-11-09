@@ -2,7 +2,7 @@
 
 **An `htop` for what's inside your GPU, not just how full it is.**
 
-Windows + NVIDIA/AMD, with Linux and WSL support (NVIDIA everywhere, AMD on native Linux; see
+Windows + NVIDIA/AMD, with Linux and WSL support (NVIDIA everywhere, AMD and Intel on native Linux; see
 [Linux and WSL](#linux-and-wsl)) and macOS on Apple Silicon (see [macOS](#macos-apple-silicon)). A terminal UI
 that connects per-process GPU memory and engine activity with loaded runtimes, model files, and
 LLM buffer breakdowns.
@@ -118,7 +118,7 @@ skips the consistency check, so do not use it after changing dependencies.
 
 Tagged releases include portable Linux builds: `gputaskman-VERSION-linux-x64.tar.gz` and
 `gputaskman-VERSION-linux-arm64.tar.gz`. They need glibc 2.35 or newer (Ubuntu 22.04, Debian 12,
-or newer) and an NVIDIA driver (or, on native Linux, an AMD GPU on the `amdgpu` driver), and work
+or newer) and an NVIDIA driver (or, on native Linux, an AMD GPU on the `amdgpu` driver or an Intel GPU on `i915`), and work
 natively, in containers, and in WSL:
 
 ```bash
@@ -199,7 +199,8 @@ up without double counting. Otherwise the process shows VRAM and SPILL as `n/a` 
   resident minus shared is not private memory and is never computed.
 - **Primary node** (`/dev/dri/card*`, typically a compositor): root-owned logind keeps a copy of that
   fd, which a normal user can't see, so a single holder can't be proven.
-- **Legacy**: older kernels whose amdgpu fdinfo lacks `drm-shared-vram`/`drm-shared-gtt`.
+- **Legacy**: older kernels whose amdgpu fdinfo lacks `drm-shared-vram`/`drm-shared-gtt`, and Intel integrated GPUs
+  and `xe` (below).
 - **Incomplete**: some of the process's fds or fdinfo could not be read (GPU% is `n/a` too).
 - **Partial scan**: the TUI's 50 ms listing budget ran out this refresh, so a process it skipped might
   hold the same client (GPU% is `n/a` too). Expected to be rare on a desktop (~9 ms for ~8,000 fds,
@@ -231,6 +232,27 @@ for it, which is why ROCm rows show engines as `n/a`. PyTorch-ROCm has not been 
 That check predates the stricter attribution above (no subtraction of shared bytes; render-node,
 single-holder and complete-scan requirements; per-client timestamps; PID-reuse checks), which is
 covered by unit tests only and **not yet validated on AMD hardware**.
+
+**Intel GPUs on native Linux** (the `i915` driver) use the same DRM fdinfo path, with these differences:
+
+| | Source |
+|---|---|
+| Device temperature, power, GT clock | `hwmon` and `gt/gt0` under `/sys/class/drm/card*`. Power is the rate of the cumulative energy counter between two refreshes, so it is `n/a` on the first |
+| Device VRAM total | Size of the local-memory BAR (`resource2`). A card whose window is under 1 GiB (an integrated GPU, or a discrete one without resizable BAR) is treated as integrated and has no total |
+| Device VRAM used | The sum of its clients' resident local memory: i915 has no device-wide counter, so buffers shared between processes can be counted twice and processes gputaskman can't inspect are missing (the UI and `--once` say so). `n/a` when any client's local memory is unknown |
+| Per-process VRAM and SPILL | `drm-resident-local0` and `drm-resident-system0`, plus their `stolen-` regions, under the same private-client rules as AMD. Both `drm-shared-local0` and `drm-shared-system0` must be present to charge a process, so an integrated GPU (no `local0`) shows `n/a` (`legacy`) |
+| Per-process engine load (3d, compute, copy, video) | `drm-engine-render`, `-compute`, `-copy`, `-video`, `-video-enhance` busy time, sampled twice. `n/a` where the driver reports none (before Gen 8). A class with several identical engines (`drm-engine-capacity-*`, such as video on an Arc) is not divided by its capacity, so one busy engine reads 100% |
+
+Device GPU load, memory bandwidth, and the PCIe link are `n/a`: i915 has no device-wide busy counter, and its
+sysfs link fields can report the power-on default instead of the live link. The GT clock is read but not shown yet.
+`xe` cards are detected, but its fdinfo uses other keys (`drm-cycles-*`, `drm-resident-vram0`/`-gtt`), so its
+per-process rows show `n/a` until they are decoded on hardware.
+
+Live check, reported by the contributor and not repeated by the maintainer: Linux 6.12, an Arc A770 (discrete, 16 GiB
+BAR) and a UHD 730 (integrated) on `i915`. Both cards were found, named, and selectable with `--gpu`; the Arc showed
+per-process VRAM and engine load, and the TUI rendered both. The fdinfo formats of both drivers, taken from the kernel
+sources, are covered by unit tests. **Not validated on hardware:** `xe`, Arc cards without resizable BAR, and
+multi-GPU systems other than that pair.
 
 **WSL** is different, because Windows owns the GPU. Linux cannot see how much VRAM its own
 processes use: `nvidia-smi` lists no processes, NVML's per-process samples carry *Windows* PIDs
@@ -303,7 +325,7 @@ Build both `gputaskman` and its `gtm` alias with `nix build path:.` (executables
 pins nixpkgs. Dependencies come from nixpkgs, independently of `uv.lock`. No pip installation,
 virtual environment, CUDA Toolkit, or ROCm installation is needed. GPU drivers remain supplied by
 the host, never bundled with the package. NVIDIA's nixpkgs Python binding finds NVML through
-`/run/opengl-driver/lib`; AMD uses kernel sysfs and DRM fdinfo interfaces directly. On WSL2 the
+`/run/opengl-driver/lib`; AMD and Intel use kernel sysfs and DRM fdinfo interfaces directly. On WSL2 the
 host driver lives in `/usr/lib/wsl/lib` instead, and the wrappers add that directory to
 `LD_LIBRARY_PATH` (it is ignored when absent, so NixOS is unaffected).
 
@@ -681,7 +703,7 @@ Identification is designed to stay cheap. Measured on one Windows machine:
 | GGUF header, model-store manifests | ms, cached | Once per file / every 60 s |
 | Local API probes | ms, local only | llama-server `/v1/models` only when its model path changes |
 | `psutil.open_files()` | 0.6-2.5 s per process | Never |
-| AMD on Linux: DRM fdinfo scan (`readlink` every fd, read fdinfo of `/dev/dri` ones) | ~9 ms for ~8,000 fds (Linux desktop) | Every refresh, only when an amdgpu card is shown; listing fds is bounded to 50 ms in the TUI and resumes next refresh, known GPU fds are still read |
+| AMD and Intel on Linux: DRM fdinfo scan (`readlink` every fd, read fdinfo of `/dev/dri` ones) | ~9 ms for ~8,000 fds (AMD, Linux desktop; Intel not measured) | Every refresh, only when an amdgpu or Intel card is shown; listing fds is bounded to 50 ms in the TUI and resumes next refresh, known GPU fds are still read |
 | macOS: `ioreg` device stats + Metal clients | ~10 ms | Every refresh |
 | macOS: memory-map scan (`proc_pidinfo` region walk) | ~4 ms per process | Same policy as the memory-map scan above |
 | macOS: `footprint` GPU memory | ~70 ms per process, background thread | Busy and new processes every ~2 s, idle ones every 30 s (54 runs in 40 s with 27 GPU processes, M4 Mac mini) |
@@ -820,7 +842,7 @@ downloads are bundled in this repository.
 |---|---|
 | `pdh.py` / `dxgi.py` | Windows counters and adapter enumeration |
 | `linux.py` | Linux backend: NVML adapters and per-process usage, container PID matching, WSL detection, `/dev/dxg` holders |
-| `drm.py` | AMD on native Linux: amdgpu cards and device readings from sysfs, per-process VRAM/GTT/engine time from DRM fdinfo |
+| `drm.py` | AMD and Intel on native Linux: amdgpu and i915 cards and device readings from sysfs, per-process VRAM/GTT/engine time from DRM fdinfo |
 | `wslhost.py` | WSL: interop check, Windows host counter stream, adapter pairing, context matching |
 | `macos.py` | macOS backend: IOKit device stats and per-process GPU time, `footprint` GPU memory poller, libproc memory maps |
 | `nvml.py` | NVIDIA device readings |
@@ -838,7 +860,8 @@ downloads are bundled in this repository.
 - Model identity for non-GGUF runtimes (ONNX Runtime, PyTorch, TensorRT) beyond installed candidates.
 - Explicit provenance and availability for every counter and estimate.
 - Reliable multi-GPU matching and per-device model placement.
-- Bare-metal Linux validation on NVIDIA hardware; Intel GPUs (`i915`/`xe`) through the same DRM fdinfo path as AMD.
+- Bare-metal Linux validation on NVIDIA hardware; Intel `xe` per-process memory and load (`drm-cycles-*`), the Intel GT
+  clock in the device panel, and Intel validation beyond the Arc A770 / UHD 730 pair.
 - macOS: a portable build, Ollama/llama.cpp/MLX validation, and compressed GPU memory (footprint's
   `swapped`) as the paged column.
 - WSL: per-process GPU load for Linux rows, and Ollama's systemd journal as a log source.

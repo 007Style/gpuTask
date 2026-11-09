@@ -34,7 +34,7 @@ from gputaskman.llm import (LlmView, ServerInfo, ServerProber, _get, api_key, bu
 from gputaskman.nvml import NvDevice, Nvml
 from gputaskman.pdh import AdapterGpu, GpuCounters, ProcGpu
 from gputaskman.procinfo import (AI_KINDS, MappedModel, ProcDetail, ProcInspector, _is_model_file, _match_runtimes,
-                                _models_from_cmdline, classify, installed_models, make_model)
+                                _models_from_cmdline, classify, file_key, installed_models, make_model)
 from gputaskman.report import to_dict, to_text
 from gputaskman.stores import store_name
 from tools.capture_screenshots import for_publication
@@ -893,6 +893,55 @@ class IdentityTests(unittest.TestCase):
                 ProcInspector().scan(detail)
         self.assertEqual(len(detail.models), 1)
         self.assertEqual(detail.models[0].sources, ["cmdline"])
+
+    def assert_one_model_under_two_spellings(self, mapped_path, launch_path):
+        detail = ProcDetail(6, "llama-server", cmdline=["server", "-m", launch_path])
+        with patch("gputaskman.procinfo._memory_maps", return_value=[SimpleNamespace(path=mapped_path, rss=0)]):
+            ProcInspector().scan(detail)
+        self.assertEqual([m.sources for m in detail.models], [["mapped", "cmdline"]])
+        server = ServerInfo("llama-server", "http://127.0.0.1:1", model_path=launch_path)
+        v = build_view(detail, 4 * MiB, 0, server)
+        self.assertEqual([f.sources for f in v.files + v.other_files], [["mapped", "cmdline", "api"]])
+
+    @unittest.skipUnless(os.name == "nt", "\\\\?\\ paths are Windows syntax")
+    def test_extended_length_launch_path_does_not_duplicate_the_mapped_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "model.gguf")
+            Path(path).write_bytes(bytes(4 * MiB))
+            self.assert_one_model_under_two_spellings(path, "\\\\?\\" + path)
+
+    def test_a_second_name_for_the_same_file_does_not_duplicate_the_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path, alias = str(Path(directory) / "model.gguf"), str(Path(directory) / "alias.gguf")
+            Path(path).write_bytes(bytes(4 * MiB))
+            try:
+                os.link(path, alias)
+            except OSError as error:
+                self.skipTest(f"hard links are unavailable here: {error}")
+            self.assert_one_model_under_two_spellings(path, alias)
+
+    def test_different_files_are_not_merged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first, second = str(Path(directory) / "a.gguf"), str(Path(directory) / "b.gguf")
+            for path in (first, second):
+                Path(path).write_bytes(bytes(4 * MiB))  # same size and bytes, still two files
+            detail = ProcDetail(6, "llama-server", cmdline=["server", "-m", second])
+            with patch("gputaskman.procinfo._memory_maps", return_value=[SimpleNamespace(path=first, rss=0)]):
+                ProcInspector().scan(detail)
+        self.assertEqual(sorted(m.sources for m in detail.models), [["cmdline"], ["mapped"]])
+
+    def test_file_key_is_the_file_and_falls_back_to_the_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            a, b = os.path.join(directory, "a.gguf"), os.path.join(directory, "b.gguf")
+            for path in (a, b):
+                Path(path).write_bytes(b"x")
+            self.assertEqual(file_key(a), file_key(os.path.join(directory, ".", "a.gguf")))
+            self.assertNotEqual(file_key(a), file_key(b))
+            missing = os.path.join(directory, "missing.gguf")
+            self.assertEqual(file_key(missing), os.path.normcase(os.path.abspath(missing)))  # unreadable: the path
+            self.assertEqual(file_key("model\0.gguf"), os.path.normcase(os.path.abspath("model\0.gguf")))  # odd API data
+            with patch("gputaskman.procinfo.os.stat", return_value=SimpleNamespace(st_ino=0, st_dev=7)):
+                self.assertEqual(file_key(a), os.path.normcase(os.path.abspath(a)))  # no file id: the path
 
     def test_ambiguous_extensions_need_size_or_store(self):
         self.assertFalse(_is_model_file(".bin", 10 * MiB, False, None))  # e.g. a Start menu tile cache

@@ -69,7 +69,7 @@ def _nvml_devices() -> list[tuple[int, object]]:
 
 
 def enumerate_adapters() -> list[Adapter]:
-    """NVIDIA GPUs through NVML, plus (native Linux only) AMD GPUs through the amdgpu DRM driver."""
+    """NVIDIA GPUs through NVML, plus (native Linux only) AMD and Intel GPUs through DRM."""
     out = _nvml_adapters()
     if not is_wsl():
         from . import drm
@@ -226,7 +226,8 @@ class LinuxCounters:
         # {adapter key: {host pid: ProcGpu}}: NVML processes in another PID namespace that couldn't be
         # matched to a local process. Their PIDs must never be looked up in this /proc.
         self.outside: dict[int, dict[int, ProcGpu]] = {}
-        # AMD (amdgpu) GPUs: per-process VRAM, GTT and engine time from DRM fdinfo. Native Linux only;
+        # AMD (amdgpu) and Intel (i915/xe) GPUs: per-process VRAM/GTT and engine time from DRM
+        # fdinfo. Native Linux only;
         # under WSL the GPU is /dev/dxg and no DRM driver is involved.
         self.drm = None
         if not self.wsl:

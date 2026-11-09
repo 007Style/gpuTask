@@ -8,11 +8,13 @@ the process has the file, not that it is resident in GPU memory.
 from __future__ import annotations
 
 import json
+import math
 
 from .llm import gb
 
 MiB = 1 << 20
 NOISE = 16 * MiB  # smaller per-process moves are allocator and compositor churn, not a model loading
+SAME_PROCESS_SECS = 2.0  # one process's start time can move this much between runs (Linux boot-time rounding, clock steps)
 MEASURED = ("vram_bytes", "shared_bytes", "committed_bytes", "paged_out_bytes",
             "vram_resident_bytes", "gtt_resident_bytes")  # resident: amdgpu, shared buffers included (never summed)
 DEVICE = (("vram_used", "dedicated used"), ("shared_used", "shared used"),
@@ -52,10 +54,26 @@ def _named(p: dict) -> bool:
     return p.get("host") != "outside" and p.get("name") not in PLACEHOLDER_NAMES
 
 
+def _started(p: dict) -> float | None:
+    v = p.get("started_at")
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v > 0 else None
+
+
+def _recycled(b: dict, a: dict) -> bool:
+    """One PID with two different start times is two processes: the PID was reused in between.
+
+    Unknown or malformed start times (older snapshots, protected processes) never conflict. Rows are only
+    ever paired within one host, so the PID needs no namespace check here."""
+    sb, sa = _started(b), _started(a)
+    return (b.get("pid") is not None and b.get("pid") == a.get("pid") and sb is not None and sa is not None
+            and abs(sb - sa) > SAME_PROCESS_SECS)
+
+
 def match(before: list[dict], after: list[dict]) -> list[tuple[dict | None, dict | None, str]]:
     """Pair rows by PID, then by name and ports, then by name, when each pairing is unambiguous.
 
     A model reload often restarts the server under a new PID. WSL host rows have their own PID space.
+    A PID that comes back with a different start time is another process and is never paired, by any rule.
     Every row comes back exactly once: paired, new, or gone.
     """
     keys = [(p.get("host"), p.get("pid")) for p in before]
@@ -66,7 +84,7 @@ def match(before: list[dict], after: list[dict]) -> list[tuple[dict | None, dict
     rest: list[dict] = []
     for a in after:
         i = by_pid.get((a.get("host"), a.get("pid")))
-        if i is not None and i in left and left[i].get("name") == a.get("name"):
+        if i is not None and i in left and left[i].get("name") == a.get("name") and not _recycled(left[i], a):
             pairs.append((left.pop(i), a, "pid"))
         else:
             rest.append(a)
@@ -86,8 +104,10 @@ def match(before: list[dict], after: list[dict]) -> list[tuple[dict | None, dict
             news.setdefault(key(a), []).append(a)
         for k, found in news.items():
             if k is not None and len(found) == 1 and len(olds.get(k, [])) == 1:
-                pairs.append((left.pop(olds[k][0]), found[0], how))
-                rest.remove(found[0])
+                i = olds[k][0]
+                if not _recycled(left[i], found[0]):
+                    pairs.append((left.pop(i), found[0], how))
+                    rest.remove(found[0])
     pairs += [(None, a, "new") for a in rest]
     pairs += [(b, None, "gone") for b in left.values()]
     return pairs

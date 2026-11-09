@@ -15,11 +15,16 @@ GiB = 1 << 30
 MiB = 1 << 20
 
 
-def proc(pid, name, vram=None, shared=0, host=None, ports=(), llm=None, files=(), inferred=None):
+def proc(pid, name, vram=None, shared=0, host=None, ports=(), llm=None, files=(), inferred=None, started=...):
     return {"pid": pid, "host": host, "name": name, "vram_bytes": vram, "shared_bytes": shared,
             "committed_bytes": None, "paged_out_bytes": None, "vram_inferred_bytes": inferred,
             "ports": list(ports), "model_files": [{"path": f, "sources": ["mapped"]} for f in files],
+            **({} if started is ... else {"started_at": started}),  # absent: a snapshot from before started_at existed
             **({"llm": llm} if llm else {})}
+
+
+def pairs(before, after):
+    return {(b and b["pid"], a and a["pid"], how) for b, a, how in match(before, after)}
 
 
 def snap(procs, used, attributed, taken=100.0, gpu="RTX", backend="wddm", adapter=...):
@@ -63,6 +68,51 @@ class MatchTests(unittest.TestCase):
         d = diff(snap(before, 0, 0), snap(after, 0, 0))
         self.assertIn("H:9", to_text(d))
         self.assertIn("W:41", to_text(d))
+
+
+class PidReuseTests(unittest.TestCase):
+    """A PID that comes back with a different start time is another process, however alike the rows look."""
+
+    def test_a_reused_pid_is_gone_and_new_with_or_without_ports(self):
+        for ports in ([8080], []):  # name+ports and unique-name fallbacks must not pair them either
+            with self.subTest(ports=ports):
+                before = [proc(42, "llama-server", ports=ports, started=100.0)]
+                after = [proc(42, "llama-server", ports=ports, started=200.0)]
+                self.assertEqual(pairs(before, after), {(None, 42, "new"), (42, None, "gone")})
+
+    def test_one_lifetime_still_pairs_by_pid_within_the_rounding_tolerance(self):
+        for later in (100.0, 101.9, 102.0, 98.0):
+            with self.subTest(later=later):
+                self.assertEqual(pairs([proc(42, "a.exe", started=100.0)], [proc(42, "a.exe", started=later)]),
+                                 {(42, 42, "pid")})
+        self.assertEqual(pairs([proc(42, "a.exe", started=100.0)], [proc(42, "a.exe", started=102.5)]),
+                         {(None, 42, "new"), (42, None, "gone")})
+
+    def test_unknown_or_malformed_start_times_keep_the_old_heuristic_pairing(self):
+        # ... means the key is absent (an older snapshot); the rest are values a snapshot could carry
+        for before_value, after_value in ((..., 200.0), (100.0, ...), (None, None), (None, 200.0), (0.0, 200.0),
+                                          (-5.0, 200.0), (True, 200.0), ("100", 200.0), ([100.0], 200.0),
+                                          (float("nan"), 200.0), (float("inf"), 200.0)):
+            with self.subTest(before=before_value, after=after_value):
+                before = [proc(42, "a.exe", started=before_value)]
+                after = [proc(42, "a.exe", started=after_value)]
+                self.assertEqual(pairs(before, after), {(42, 42, "pid")})
+        # no PID means no reuse to speak of: rows without one are still paired by name alone
+        self.assertEqual({how for _, _, how in match([proc(None, "a", started=100.0)], [proc(None, "a", started=200.0)])},
+                         {"name"})
+        before = [proc(42, "llama-server", ports=[8080], started=100.0), proc(50, "solo.exe", started=100.0)]
+        after = [proc(77, "llama-server", ports=[8080], started=200.0), proc(60, "solo.exe", started=200.0)]
+        self.assertEqual(pairs(before, after), {(42, 77, "name+ports"), (50, 60, "name")})
+
+    def test_a_refused_pair_does_not_make_the_other_rows_less_ambiguous(self):
+        before = [proc(42, "llama-server", started=100.0)]
+        after = [proc(42, "llama-server", started=200.0), proc(77, "llama-server", started=300.0)]
+        self.assertEqual(pairs(before, after), {(None, 42, "new"), (None, 77, "new"), (42, None, "gone")})
+
+    def test_reuse_is_judged_inside_one_pid_namespace(self):
+        before = [proc(42, "x", started=100.0), proc(42, "x", host="windows")]
+        after = [proc(42, "x", started=200.0), proc(42, "x", host="windows")]
+        self.assertEqual(pairs(before, after), {(None, 42, "new"), (42, None, "gone"), (42, 42, "pid")})
 
 
 class DiffTests(unittest.TestCase):
@@ -129,6 +179,17 @@ class DiffTests(unittest.TestCase):
         d = diff(snap([server(GiB)], 3 * GiB, 2 * GiB), snap([server(GiB + 4096)], 3 * GiB, 2 * GiB))
         self.assertIn("(no process changed by 16 MB or more)", to_text(d))
         self.assertNotIn("llama (1)", to_text(d))
+
+    def test_a_reused_pid_keeps_the_device_change_but_makes_no_process_delta(self):
+        before = snap([proc(42, "llama-server", vram=4 * GiB, ports=[8080], started=100.0)], 5 * GiB, 4 * GiB)
+        after = snap([proc(42, "llama-server", vram=8 * GiB, ports=[8080], started=200.0)], 9 * GiB, 8 * GiB)
+        d = diff(before, after)
+        self.assertEqual(d["device"]["vram_used"]["delta"], 4 * GiB)  # the device-wide change is still measured
+        self.assertEqual(sorted(p["match"] for p in d["processes"]), ["gone", "new"])
+        self.assertTrue(all(p["measured"]["vram_bytes"]["delta"] is None for p in d["processes"]))
+        rows = [line for line in to_text(d).splitlines() if line.startswith("llama-server")]
+        self.assertEqual(len(rows), 2)  # one row per lifetime, each absent from the other snapshot
+        self.assertTrue(all("not listed" in row for row in rows))
 
 
 class AdapterGuardTests(unittest.TestCase):

@@ -360,6 +360,15 @@ class MemoryTests(unittest.TestCase):
         s.procs[0].gpu.available.clear()
         self.assertIsNone(to_dict(s)["attributed"])
 
+    def test_started_at_is_the_creation_time_and_unknown_is_null(self):
+        s = snapshot()
+        s.procs[0].detail.create_time = 1762680123.4567891
+        s.procs.append(ProcRow(30, "browser.exe", "browser", ProcGpu(dedicated=GiB), ProcDetail(30, "browser.exe"),
+                               host=True, origin="windows"))
+        rows = to_dict(s)["processes"]
+        self.assertEqual(rows[0]["started_at"], 1762680123.457)
+        self.assertEqual([r["started_at"] for r in rows[1:]], [None, None])  # no creation time (0.0) is unknown, not 1970
+
     def test_missing_adapter_memory_is_not_reported_as_zero(self):
         s = snapshot()
         s.vram_used = None

@@ -116,6 +116,7 @@ def to_dict(s: Snapshot) -> dict:
         engines = has_engine_counters(s, p)
         item = {
             "pid": p.pid, "host": p.origin if p.host else None, "name": p.name, "kind": p.kind, "runtimes": p.detail.runtimes,
+            "started_at": round(p.detail.create_time, 3) or None,  # unknown (protected process, WSL host row) is null
             "vram_attributed": p.gpu.attributed, "vram_inferred_bytes": p.gpu.inferred,
             "vram_inferred_by": p.gpu.inferred_by or None,
             "vram_bytes": int(p.gpu.dedicated) if p.gpu.attributed and "dedicated" in p.gpu.available else None,

@@ -101,6 +101,23 @@ class SystemUiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(table.get_cell(foreign.key, "CPU%").plain, "n/a")
                 self.assertEqual(table.get_cell("10", "RAM").plain, "6.00 GB")
 
+    async def test_a_pid_that_now_belongs_to_another_process_shows_n_a(self):
+        s = snapshot()
+        s.procs[0].detail.create_time = 1000.0  # llama-server as the GPU sample saw it
+        s.procs[1].detail.create_time = 2000.0
+        sample = host_sample(procs=[HostProc(10, "other.exe", 6 * GiB, 5 * GiB, 12.0, created=1500.0),  # pid 10 reused
+                                    HostProc(20, "dwm.exe", 300 * MiB, 200 * MiB, 3.0, created=2000.0)])
+        with patch.object(GpuTaskManager, "poll"):
+            app = GpuTaskManager()
+            async with app.run_test(size=(140, 42)) as pilot:
+                app.apply_all([s], sample)
+                await pilot.pause()
+                table = app.query_one("#procs")
+                self.assertEqual(table.get_cell("10", "RAM").plain, "n/a")
+                self.assertEqual(table.get_cell("10", "CPU%").plain, "n/a")
+                self.assertEqual(table.get_cell("20", "RAM").plain, "300 MB")  # the same process still reads
+                self.assertEqual(table.get_cell("20", "CPU%").plain, "3")
+
     async def test_processes_the_os_would_not_describe_show_n_a(self):
         s = snapshot()
         s.procs.append(row(30, "protected.exe"))  # not in the host sample
@@ -136,13 +153,15 @@ class SystemUiTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 self.assertEqual(table.get_cell("10", "RAM").plain, "6.00 GB")
 
-    async def test_a_sampler_that_cannot_start_says_why(self):
-        self.sampler.side_effect = OSError("layout not recognised")
+    async def test_a_sampler_that_cannot_start_says_why_and_is_tried_again(self):
+        self.sampler.side_effect = [OSError("layout not recognised"), self.sampler.return_value]
         with patch.object(GpuTaskManager, "poll"):
             app = GpuTaskManager()
             async with app.run_test(size=(140, 42)):
                 self.assertIsNone(app._sample_host())
                 self.assertEqual(app.host_error, "OSError: layout not recognised")
+                self.assertIsNotNone(app._sample_host())  # the failure was not cached
+                self.assertIsNone(app.host_error)
 
     async def test_no_system_removes_the_panel_columns_and_sorts(self):
         with patch.object(GpuTaskManager, "poll"):
@@ -160,18 +179,39 @@ class SystemUiTests(unittest.IsolatedAsyncioTestCase):
     async def test_ram_and_cpu_sorts_rank_unknown_last(self):
         s = snapshot()
         s.procs.insert(0, row(30, "protected.exe"))  # not in the host sample
+        s.procs.append(row(40, "idle.exe"))  # measured: nothing resident, no CPU time. That is not unknown
+        sample = host_sample(procs=[HostProc(10, "llama-server.exe", 6 * GiB, 5 * GiB, 12.0),
+                                    HostProc(20, "dwm.exe", 300 * MiB, 200 * MiB, None),
+                                    HostProc(40, "idle.exe", 0, 0, 0.0)])
         with patch.object(GpuTaskManager, "poll"):
             app = GpuTaskManager()
             async with app.run_test(size=(140, 42)) as pilot:
-                app.apply_all([s], host_sample())
+                app.apply_all([s], sample)
                 await pilot.pause()
                 for _ in GpuTaskManager.SORTS:
                     await pilot.press("s")
                 self.assertEqual(app.query_one("#procs").border_subtitle.split("  ·")[0], "sort: RAM")
-                self.assertEqual([r.pid for r in app.visible_rows(s)], [10, 20, 30])
+                self.assertEqual([r.pid for r in app.visible_rows(s)], [10, 20, 40, 30])
                 await pilot.press("s")
                 self.assertEqual(app.query_one("#procs").border_subtitle.split("  ·")[0], "sort: CPU%")
-                self.assertEqual(app.visible_rows(s)[0].pid, 10)
+                self.assertEqual([r.pid for r in app.visible_rows(s)], [10, 40, 30, 20])
+
+    async def test_cpu_below_half_a_percent_is_blank_and_unknown_is_not(self):
+        s = snapshot()
+        s.procs += [row(40, "quiet.exe"), row(50, "busy.exe")]
+        sample = host_sample(procs=[HostProc(10, "llama-server.exe", 6 * GiB, 5 * GiB, 12.0),
+                                    HostProc(20, "dwm.exe", 300 * MiB, 200 * MiB, None),
+                                    HostProc(40, "quiet.exe", 10 * MiB, MiB, 0.49),
+                                    HostProc(50, "busy.exe", 10 * MiB, MiB, 0.6)])
+        with patch.object(GpuTaskManager, "poll"):
+            app = GpuTaskManager()
+            async with app.run_test(size=(140, 42)) as pilot:
+                app.apply_all([s], sample)
+                await pilot.pause()
+                table = app.query_one("#procs")
+                self.assertEqual(table.get_cell("40", "CPU%").plain, "")
+                self.assertEqual(table.get_cell("50", "CPU%").plain, "1")
+                self.assertEqual(table.get_cell("20", "CPU%").plain, "…")
 
     async def test_panel_title_says_when_it_describes_the_wsl_vm(self):
         with patch.object(GpuTaskManager, "poll"), patch("gputaskman.app.BACKEND", "wsl"):

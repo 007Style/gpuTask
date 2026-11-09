@@ -542,7 +542,7 @@ Other Hyper-V GPU-PV configurations have not been validated.
 A **System** panel under the GPU header, and **RAM** and **CPU%** columns in the process table, show what
 each process costs the *machine*, as the OS reports it. The numbers come from psutil; on Windows the process
 list comes from `NtQuerySystemInformation`, because psutil's per-process calls take about 6 s per pass for
-~1,000 processes there. `s` sorts by them. Full diagnostics also shows a per-thread strip, 60-sample CPU and
+~1,000 processes there. `s` sorts by them, unknown values last. Full diagnostics also shows a per-thread strip, 60-sample CPU and
 RAM histories, and the top processes by RAM and CPU; slim monitoring keeps two lines (the RAM and CPU bars).
 `--no-system` removes the panel, the columns and the sampling.
 
@@ -554,8 +554,9 @@ These are system-memory figures, never GPU bytes. They are not added to any GPU 
 - **CPU%** is a share of the whole machine, like Task Manager: one busy thread on a 32-thread machine is about
   3%. It is a rate between two samples, so a new process (or one whose PID was reused) shows `…` for one
   refresh. Below 0.5% it is blank.
-- **`n/a`** means the OS would not say (a protected process), or the row is a Windows process listed from WSL,
-  whose PID is not a Linux PID.
+- **`n/a`** means the OS would not say (a protected process), the PID now belongs to a different process than the
+  one the GPU row describes (compared by creation time when both are known), or the row is a Windows process
+  listed from WSL, whose PID is not a Linux PID.
 - Inside WSL the panel describes the Linux VM, and its border says so.
 - When the numbers cannot be read, the panel, `--once` and `--json` say why, and the GPU view is unaffected.
   That covers 32-bit Python on Windows and a Windows build whose process-list layout does not match: the layout

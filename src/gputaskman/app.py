@@ -213,7 +213,8 @@ class GpuTaskManager(App):
     SORTS = [("VRAM", lambda r: -(r.gpu.shown_vram or 0)), ("GPU%", lambda r: -r.gpu.gpu_pct),
              ("spill", lambda r: -r.gpu.shared), ("paged", lambda r: -r.gpu.paged_out),
              ("name", lambda r: r.name.lower())]
-    SYSTEM_SORTS = [("RAM", lambda r: -(r.ram or 0)), ("CPU%", lambda r: -(r.cpu or 0))]
+    SYSTEM_SORTS = [("RAM", lambda r: (r.ram is None, -(r.ram or 0))),  # unknown last; a measured 0 is not unknown
+                    ("CPU%", lambda r: (r.cpu is None, -(r.cpu or 0)))]
     CHART_COLORS = {
         "GPU": "#4ade80",
         "SM clock": "#fb923c",
@@ -365,7 +366,7 @@ class GpuTaskManager(App):
         self.hist_ram.append(100 * host.ram_used / host.ram_total if host and host.ram_total else None)
         for snap in snapshots:
             for row in snap.procs:  # Windows (W:) / outside (H:) rows have no local pid: RAM/CPU stay unknown
-                hp = host.proc(row.pid) if host and not row.host else None
+                hp = host.proc(row.pid, row.detail.create_time) if host and not row.host else None
                 row.ram, row.cpu = (hp.rss, hp.cpu_pct) if hp else (None, None)
         multi = len(snapshots) > 1
         if self.snapshots and multi != (len(self.snapshots) > 1) and self.selected_key is not None:

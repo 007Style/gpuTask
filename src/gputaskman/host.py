@@ -16,6 +16,9 @@ from dataclasses import dataclass, field
 import psutil
 
 
+SAME_PROCESS_SECS = 2.0  # psutil and the NT list give one creation time to ~1 microsecond; this absorbs clock steps
+
+
 @dataclass
 class HostProc:
     pid: int
@@ -23,6 +26,7 @@ class HostProc:
     rss: int | None          # resident / working set bytes
     private: int | None      # Windows private bytes (commit charged to the process); None elsewhere
     cpu_pct: float | None    # share of the WHOLE machine (0-100), like Task Manager; None until a second reading
+    created: float | None = None  # unix seconds; tells one process from the next that reuses its pid
 
 
 @dataclass
@@ -40,8 +44,13 @@ class HostSample:
     denied: int = 0                 # processes whose memory we were not allowed to read
     cost_ms: float = 0.0
 
-    def proc(self, pid: int | None) -> HostProc | None:
-        return self._by_pid.get(pid) if pid is not None else None
+    def proc(self, pid: int | None, created: float = 0.0) -> HostProc | None:
+        """This pid's reading. A caller that knows when its process started (0.0: it doesn't) gets only that
+        process: a pid can be reused between the GPU sample and this one."""
+        p = self._by_pid.get(pid) if pid is not None else None
+        if p and created and p.created is not None and abs(p.created - created) > SAME_PROCESS_SECS:
+            return None
+        return p
 
     def __post_init__(self) -> None:
         self._by_pid = {p.pid: p for p in self.procs}
@@ -85,7 +94,7 @@ class HostSampler:
                 continue
             seen.add(ident)
             procs.append(HostProc(p.pid, name, mi.rss, getattr(mi, "private", None),
-                                  cpu / self._logical if ident in self._rated else None))
+                                  cpu / self._logical if ident in self._rated else None, ident[1]))
         self._rated = seen
         return self._finish(t0, per_core, vm, sw, procs, denied)
 
@@ -103,7 +112,7 @@ class HostSampler:
             cpu = None
             if wall and prev is not None and cpu100ns >= prev:
                 cpu = (cpu100ns - prev) / 1e7 / wall / self._logical * 100
-            procs.append(HostProc(pid, name, ws, private, cpu))
+            procs.append(HostProc(pid, name, ws, private, cpu, created))
         self._last_cpu, self._last_wall = last, now
         return procs
 
@@ -177,7 +186,8 @@ def _check_nt_layout(rows: dict) -> None:
     if row is not None:
         name, ws, _private, _cpu, created = row
         rss = me.memory_info().rss
-        if name.lower() == me.name().lower() and abs(created - me.create_time()) < 2 and rss / 2 <= ws <= rss * 2:
+        if (name.lower() == me.name().lower() and abs(created - me.create_time()) < SAME_PROCESS_SECS
+                and rss / 2 <= ws <= rss * 2):
             return
     raise OSError("NtQuerySystemInformation process layout not recognised on this Windows build")
 

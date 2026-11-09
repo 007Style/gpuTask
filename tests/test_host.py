@@ -40,6 +40,15 @@ class SampleTests(unittest.TestCase):
         self.assertEqual(d["top_cpu"][0]["cpu_pct"], 0.0)
         self.assertNotIn("mhz", d["cpu"])  # psutil reports a nominal frequency, not a measurement
 
+    def test_a_pid_taken_by_another_process_is_not_returned(self):
+        h = sample(procs=[host.HostProc(7, "new.exe", 10, 5, 1.0, 6000.0), host.HostProc(8, "p.exe", 10, 5, 1.0, 5000.0),
+                          host.HostProc(9, "q.exe", 10, 5, 1.0, None)])
+        self.assertIsNone(h.proc(7, 5000.0))  # pid 7 now belongs to a process that started later
+        self.assertEqual(h.proc(7, 6000.0).name, "new.exe")
+        self.assertEqual(h.proc(8, 5000.000002).name, "p.exe")  # psutil and the NT list differ by microseconds
+        self.assertEqual(h.proc(7).name, "new.exe")  # a caller with no creation time (pid 0 or 4) keeps the pid match
+        self.assertEqual(h.proc(9, 5000.0).name, "q.exe")  # a reading with no creation time cannot disagree
+
     def test_json_keeps_unknown_as_null_and_rounds_rates(self):
         h = sample(procs=[host.HostProc(2, "b", 10, None, 12.3456)])
         d = host.to_dict(h)
@@ -75,6 +84,7 @@ class NtPathTests(unittest.TestCase):
     def test_cpu_is_a_rate_that_needs_two_readings(self):
         first = self.read({7: ("a.exe", 100, 50, 10 * SECOND, 5000.0)})
         self.assertIsNone(first.proc(7).cpu_pct)
+        self.assertEqual(first.proc(7).created, 5000.0)  # lets the caller tell this process from a reuse of its pid
         second = self.read({7: ("a.exe", 100, 50, 12 * SECOND, 5000.0)}, seconds=4)
         # 2 s of CPU time in 4 s of wall clock on 4 logical CPUs: 12.5% of the whole machine
         self.assertAlmostEqual(second.proc(7).cpu_pct, 12.5)
@@ -182,8 +192,10 @@ class PsutilPathTests(unittest.TestCase):
         h = self.sampler.sample()
         self.assertEqual(h.denied, 1)
         self.assertIsNone(h.proc(1).rss)  # not readable: unknown, not 0
+        self.assertIsNone(h.proc(1).created)
         self.assertIsNone(h.proc(2))
         self.assertEqual(h.proc(3).rss, 7)
+        self.assertEqual(h.proc(3).created, 1.0)
 
 
 class LiveTests(unittest.TestCase):

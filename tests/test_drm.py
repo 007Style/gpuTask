@@ -457,7 +457,6 @@ class ReadDeviceTests(unittest.TestCase):
             (gt / "rps_act_freq_mhz").write_text("300\n")
             (gt / "rps_cur_freq_mhz").write_text("350\n")
             (gt / "rps_RP0_freq_mhz").write_text("1250\n")
-            (gt / "throttle_reason_status").write_text("1\n")
             (gt / "throttle_reason_pl1").write_text("1\n")
             (gt / "throttle_reason_pl2").write_text("0\n")
             (gt / "throttle_reason_thermal").write_text("0\n")
@@ -489,7 +488,23 @@ class ReadDeviceTests(unittest.TestCase):
             d = drm.read_device(card, 0)
 
             self.assertEqual(d.sm_clock, 300)
-            self.assertEqual(d.throttle, [])
+            # No throttle node is readable here: unknown, not "no throttling".
+            self.assertIsNone(d.throttle)
+
+    def test_read_device_intel_throttle_all_idle_is_empty_not_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            card_sysfs = Path(tmp) / "card1"
+            dev = card_sysfs / "device"
+            dev.mkdir(parents=True)
+            gt = card_sysfs / "gt" / "gt0"
+            gt.mkdir(parents=True)
+            (gt / "throttle_reason_pl1").write_text("0\n")
+            (gt / "throttle_reason_thermal").write_text("0\n")
+
+            card = drm.DrmCard(key=32, pdev="0000:00:02.0", sysfs=str(dev), driver="i915",
+                               vendor_id=0x8086, device_id=0xA7AD, name="Intel Intel Graphics",
+                               vram_total=0, integrated=True, intel=True)
+            self.assertEqual(drm.read_device(card, 0).throttle, [])
 
     def test_intel_throttle_skips_unreadable_nodes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1347,6 +1362,30 @@ class IntelScanTests(unittest.TestCase):
             self.assertEqual(g.resident_gtt, 37476 * KiB)  # still shown as a reference
             # The stamped device total sums resident system memory (shared buffers can double-count it).
             self.assertEqual(adapters[card.key].dedicated, 37476 * KiB)
+
+    def test_mixed_discrete_and_integrated_cards_charge_each_by_its_rule(self):
+        disc_pdev = "0000:03:00.0"
+        igpu_pdev = "0000:00:02.0"
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = Path(tmp) / "proc"
+            proc.mkdir()
+            disc = drm.DrmCard(key=drm.pci_key(disc_pdev), pdev=disc_pdev, sysfs=str(Path(tmp) / "d" / "device"),
+                               driver="i915", vendor_id=0x8086, device_id=0x56A0, name="Intel Arc A770",
+                               vram_total=16 * GiB, integrated=False, intel=True)
+            igpu = drm.DrmCard(key=drm.pci_key(igpu_pdev), pdev=igpu_pdev, sysfs=str(Path(tmp) / "i" / "device"),
+                               driver="i915", vendor_id=0x8086, device_id=0xA782, name="Intel UHD Graphics",
+                               vram_total=0, integrated=True, intel=True)
+            counters = drm.DrmCounters(found=[disc, igpu], proc=str(proc), clock=Clock())
+            _write_fd(proc, 100, 5, _i915_fdinfo(1, disc_pdev, local_mib=64, system_mib=8))
+            _write_fd(proc, 200, 6, I915_IGPU_FDINFO)
+            procs, adapters = counters.sample()
+            g_disc = procs[disc.key][100]
+            self.assertEqual((g_disc.dedicated, g_disc.shared), (64 * MiB, 8 * MiB))
+            g_igpu = procs[igpu.key][200]
+            self.assertEqual(g_igpu.dedicated, 60 * MiB)
+            self.assertNotIn("shared", g_igpu.available)
+            self.assertEqual(adapters[disc.key].dedicated, 64 * MiB)
+            self.assertEqual(adapters[igpu.key].dedicated, 60 * MiB)
 
     def test_device_used_sums_each_client_once_and_is_unknown_when_incomplete(self):
         with tempfile.TemporaryDirectory() as tmp:

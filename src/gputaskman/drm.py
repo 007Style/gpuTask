@@ -61,8 +61,9 @@ class DrmCard:
     # BAR) window, an estimate of the card's memory; 0 means unknown (an integrated GPU, or a discrete card
     # whose window is under 1 GiB). Per-process bytes still come from fdinfo.
     intel: bool = False
-    # Intel only: used local memory, stamped in each DrmCounters.sample() as the sum of the card's
-    # clients' local bytes (shared buffers can double-count); None = no readable client, unknown.
+    # Intel only: used memory, stamped in each DrmCounters.sample() as the sum of the card's
+    # clients' resident bytes (local bytes on a discrete card, system bytes on an integrated one;
+    # shared buffers can double-count); None = no readable client, unknown.
     vram_used: int | None = None
 
 
@@ -410,12 +411,22 @@ _INTEL_THROTTLE = (
 )
 
 
-def _intel_throttle(gt: str) -> list[str]:
-    """Names of the limits currently throttling an Intel GPU; empty when none is (or none is readable).
+def _intel_throttle(gt: str) -> list[str] | None:
+    """Names of the limits currently throttling an Intel GPU; empty when none is active.
 
-    _int already turns an unreadable or unparseable node into None, so those are skipped: unknown,
-    not inactive."""
-    return [label for node, label in _INTEL_THROTTLE if _int(os.path.join(gt, node))]
+    _int already turns an unreadable or unparseable node into None, so those are skipped. None when no
+    node was readable at all: unknown, not "no throttling" (an empty list means readable and idle).
+    """
+    seen = False
+    active = []
+    for node, label in _INTEL_THROTTLE:
+        value = _int(os.path.join(gt, node))
+        if value is None:
+            continue
+        seen = True
+        if value:
+            active.append(label)
+    return active if seen else None
 
 
 def read_device(card: DrmCard, index: int) -> DeviceTelemetry:
@@ -833,6 +844,9 @@ class DrmCounters:
                 proc.attributed = False
                 proc.available -= {"dedicated", "shared"}
             elif integrated_intel:
+                # Unified memory: the same system bytes are the charge (vram_bytes) and the reachable
+                # reference (gtt_resident_bytes). Both are measured and labelled; diff.py compares
+                # per-field and never sums them.
                 proc.dedicated = proc.resident_gtt
             else:
                 proc.dedicated = proc.resident_vram

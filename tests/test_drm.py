@@ -10,6 +10,7 @@ from gputaskman import drm
 
 GiB = 1 << 30
 MiB = 1 << 20
+KiB = 1 << 10
 
 FDINFO = """pos:\t0
 flags:\t02100002
@@ -420,6 +421,60 @@ class ReadDeviceTests(unittest.TestCase):
             self.assertEqual(d.pcie_width, 16)
             self.assertIsNone(d.enc)
             self.assertIsNone(d.dec)
+
+    def test_cpu_package_temp_prefers_package_id_0(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nvme = root / "hwmon0"
+            nvme.mkdir()
+            (nvme / "name").write_text("nvme\n")
+            cpu = root / "hwmon1"
+            cpu.mkdir()
+            (cpu / "name").write_text("coretemp\n")
+            (cpu / "temp1_label").write_text("Package id 0\n")
+            (cpu / "temp1_input").write_text("55000\n")
+            (cpu / "temp2_label").write_text("Core 0\n")
+            (cpu / "temp2_input").write_text("99000\n")  # a core is not the package
+            self.assertEqual(drm._cpu_package_temp(str(root)), 55)
+
+    def test_cpu_package_temp_missing_is_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cpu = root / "hwmon0"
+            cpu.mkdir()
+            (cpu / "name").write_text("coretemp\n")
+            (cpu / "temp1_label").write_text("Core 0\n")  # no package sensor: no guessing from cores
+            (cpu / "temp1_input").write_text("99000\n")
+            self.assertIsNone(drm._cpu_package_temp(str(root)))
+            self.assertIsNone(drm._cpu_package_temp(str(root / "no-such-dir")))
+
+    def test_read_device_intel_falls_back_to_cpu_package_temp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            card_sysfs = Path(tmp) / "card1"
+            dev = card_sysfs / "device"
+            dev.mkdir(parents=True)
+            card = drm.DrmCard(key=32, pdev="0000:00:02.0", sysfs=str(dev), driver="i915",
+                               vendor_id=0x8086, device_id=0xA7AD, name="Intel Intel Graphics",
+                               vram_total=0, integrated=True, intel=True)
+            with patch.object(drm, "_cpu_package_temp", return_value=55):
+                d = drm.read_device(card, 0)
+            self.assertEqual((d.temp, d.temp_kind), (55, "CPU package"))
+
+    def test_read_device_intel_gpu_sensor_wins_over_cpu_package(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            card_sysfs = Path(tmp) / "card1"
+            dev = card_sysfs / "device"
+            dev.mkdir(parents=True)
+            hwmon = dev / "hwmon" / "hwmon0"
+            hwmon.mkdir(parents=True)
+            (hwmon / "temp1_label").write_text("edge\n")
+            (hwmon / "temp1_input").write_text("61000\n")
+            card = drm.DrmCard(key=32, pdev="0000:00:02.0", sysfs=str(dev), driver="i915",
+                               vendor_id=0x8086, device_id=0xA7AD, name="Intel Intel Graphics",
+                               vram_total=0, integrated=True, intel=True)
+            with patch.object(drm, "_cpu_package_temp", return_value=55):
+                d = drm.read_device(card, 0)
+            self.assertEqual((d.temp, d.temp_kind), (61, ""))
 
 
 class DrmCountersTests(unittest.TestCase):

@@ -584,14 +584,15 @@ class GpuTaskManager(App):
             clock_label = (f"gfx {format_metric(nv.gfx_clock)} MHz" if nv.source.startswith("AMD ") else
                            f"SM {format_metric(nv.sm_clock)}/{format_metric(nv.sm_clock_max)} MHz")
             power_kind = f" {nv.power_kind}" if nv.power_kind else ""
+            temp_kind = f" ({nv.temp_kind})" if nv.temp_kind else ""
             if self.monitoring:
                 clock = nv.gfx_clock if nv.source.startswith("AMD ") else nv.sm_clock
                 label = "gfx" if nv.source.startswith("AMD ") else "SM"
-                st = Text(f"{format_metric(nv.temp, unit='°C')}  "
+                st = Text(f"{format_metric(nv.temp, unit='°C')}{temp_kind}  "
                           f"{format_metric(nv.power_w, '.0f')} W{power_kind}  "
                           f"{label} {format_metric(clock)} MHz", style="grey70")
             else:
-                st = Text(f"{format_metric(nv.temp, unit='°C')}  {format_metric(nv.power_w, '.0f')}/"
+                st = Text(f"{format_metric(nv.temp, unit='°C')}{temp_kind}  {format_metric(nv.power_w, '.0f')}/"
                           f"{format_metric(nv.power_limit_w, '.0f')} W{power_kind}  {pstate}  "
                           f"{clock_label}  "
                           f"mem {format_metric(nv.mem_clock)} MHz  video {format_metric(nv.video_clock)} MHz  "

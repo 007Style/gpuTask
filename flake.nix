@@ -27,6 +27,7 @@
                 (pythonSource ./src) (pythonSource ./tests) (pythonSource ./tools)
               ];
             };
+            nativeBuildInputs = [ pkgs.makeWrapper ];
             build-system = [ pkgs.python3Packages.uv-build ];
             # Nixpkgs supplies the backend; accept its newer release only in
             # this build. The resulting wheel and the full test suite are checked.
@@ -41,6 +42,15 @@
               runHook postCheck
             '';
             pythonImportsCheck = [ "gputaskman.cli" "gputaskman.app" ];
+            # WSL2 exposes the host driver's NVML in /usr/lib/wsl/lib (not in
+            # /run/opengl-driver/lib or the loader's default path), so a
+            # Nix-built Python cannot find libnvidia-ml.so.1 and reports no
+            # GPU. Put that directory on the wrapper's loader path; the path
+            # does not exist on NixOS or native Linux, where it is ignored.
+            postFixup = ''
+              wrapProgram $out/bin/gputaskman --suffix LD_LIBRARY_PATH : /usr/lib/wsl/lib
+              wrapProgram $out/bin/gtm --suffix LD_LIBRARY_PATH : /usr/lib/wsl/lib
+            '';
             meta = {
               inherit (project) description;
               homepage = project.urls.Repository;
@@ -69,6 +79,10 @@
             ];
             shellHook = ''
               export PYTHONPATH="$PWD/src''${PYTHONPATH:+:$PYTHONPATH}"
+              # WSL2 keeps NVML outside the loader's default path; see postFixup above.
+              if [ -d /usr/lib/wsl/lib ]; then
+                export LD_LIBRARY_PATH="/usr/lib/wsl/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+              fi
             '';
           };
         });

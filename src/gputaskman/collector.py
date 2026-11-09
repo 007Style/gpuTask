@@ -6,6 +6,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass, field
+from contextlib import ExitStack
 
 import psutil
 
@@ -14,6 +15,7 @@ from .adl import Adl
 from .dxgi import VENDOR_NVIDIA, Adapter
 from .handy import HandyEvidence, inspect_handy
 from .llm import LlmView, ServerProber, build_view, gb, ollama_log_path
+from . import nvml as nvml_mod
 from .nvml import Nvml, NvDevice
 from .pdh import ProcGpu
 from .procinfo import AI_KINDS, ProcDetail, ProcInspector, classify
@@ -121,7 +123,7 @@ class Snapshot:
     shared_is_spill: bool = True
     counter_status: str = ""  # Windows counter availability or adapter matching problem
     counter_adapter_matched: bool | None = None  # Windows PDH LUID matched the selected DXGI adapter
-
+    nv_lost: bool = False  # NVML faulted for this GPU after a disable/re-enable; restart restores it
     @property
     def host_data(self) -> bool:
         return self.host_status.startswith("ok")
@@ -172,7 +174,8 @@ def select_nv_device(adapter: Adapter | None, devices: list[NvDevice], gpu_index
         if len(matches) == 1:
             return matches[0]
         return None
-    return devices[gpu_index] if gpu_index < len(devices) else None
+    matches = [d for d in devices if d.index == gpu_index]
+    return matches[0] if len(matches) == 1 else None
 
 
 class Collector:
@@ -185,13 +188,20 @@ class Collector:
     def backend(self) -> str:
         return "drm" if self.drm_card is not None else BACKEND
 
-    def __init__(self, gpu_index: int = 0, scan_budget: float | None = SCAN_BUDGET, host: bool = True) -> None:
-        self.adapters = [a for a in enumerate_adapters() if not a.software]
+    def __init__(self, gpu_index: int = 0, scan_budget: float | None = SCAN_BUDGET, host: bool = True,
+                 adapters: list[Adapter] | None = None) -> None:
+        self.adapters = [a for a in (enumerate_adapters() if adapters is None else adapters) if not a.software]
         self.adapter = select_adapter(self.adapters, gpu_index)
-        self.counters = GpuCounters()
-        self.nvml = Nvml()
-        self.amdsmi = AmdSmi(self.adapter, self.adapters)
-        self.adl = Adl(self.adapter, self.adapters)
+        with ExitStack() as resources:
+            self.counters = GpuCounters()
+            resources.callback(self.counters.close)
+            self.nvml = Nvml()
+            resources.callback(self.nvml.close)
+            self.amdsmi = AmdSmi(self.adapter, self.adapters)
+            resources.callback(self.amdsmi.close)
+            self.adl = Adl(self.adapter, self.adapters)
+            resources.callback(self.adl.close)
+            resources.pop_all()
         self._mac_driver = f"macOS {macos_version()}".strip() if BACKEND == "metal" else ""
         # Native Linux on an AMD or Intel GPU: device metrics from the driver's sysfs (Intel's are
         # partial and get their fdinfo-derived used-memory stamp), processes from DRM fdinfo.
@@ -272,10 +282,17 @@ class Collector:
             snap.counter_adapter_matched = luid in per_luid or luid in adapters
             if not snap.counter_adapter_matched:
                 snap.counter_status = ("Windows GPU counters could not be matched to the selected adapter; "
-                                       "VRAM and processes are unavailable. This can occur in GPU-PV VMs.")
+                                       "VRAM and processes are unavailable. The adapter may be temporarily "
+                                       "unavailable, or GPU-PV VMs may not expose these counters.")
             elif a is None or a.dedicated is None or a.shared is None:
                 snap.counter_status = ("Some Windows adapter memory counters are unavailable; "
                                        "GPU-PV VMs may not expose them.")
+            if (nv is None and self.adapter.vendor_id == VENDOR_NVIDIA and self.adapter.pci_address
+                    and any(_bdf(b) == self.adapter.pci_address for b in nvml_mod.LOST)):
+                snap.nv_lost = True
+                snap.counter_status = " ".join(filter(None, (
+                    snap.counter_status, "NVIDIA telemetry stopped after this GPU was re-enabled; "
+                                         "restart gputaskman to restore it.")))
         if self.drm_card is not None:
             snap.process_status = self.counters.drm.status
         live = [(pid, g) for pid, g in procs.items() if _is_live(g)]
@@ -387,9 +404,10 @@ class Collector:
                 r.gpu.inferred, r.gpu.inferred_by = g.bytes, g.confidence
 
     def close(self) -> None:
-        self.counters.close()
-        self.nvml.close()
-        self.amdsmi.close()
-        self.adl.close()
-        if self.host is not None:
-            self.host.close()
+        with ExitStack() as resources:
+            if self.host is not None:
+                resources.callback(self.host.close)
+            resources.callback(self.adl.close)
+            resources.callback(self.amdsmi.close)
+            resources.callback(self.nvml.close)
+            resources.callback(self.counters.close)

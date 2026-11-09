@@ -240,6 +240,7 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(s.procs, [])
         self.assertFalse(s.counter_adapter_matched)
         self.assertIn("could not be matched", s.counter_status)
+        self.assertIn("temporarily unavailable", s.counter_status)
         self.assertIn("GPU-PV", to_text(s))
         data = to_dict(s)
         self.assertIsNone(data["attributed"])
@@ -248,6 +249,25 @@ class MemoryTests(unittest.TestCase):
         output = io.StringIO()
         Console(file=output, width=160).print(GpuTaskManager().render_device(s))
         self.assertIn("could not be matched", output.getvalue())
+
+    def test_lost_nvml_telemetry_is_explained_not_silent(self):
+        c = Collector.__new__(Collector)
+        c.adapter = Adapter(1, "RTX 3060", 0x10DE, 12 * GiB, 0, False, (5, 0, 0))
+        c.adapters = [c.adapter]
+        c.gpu_index, c.scan_budget, c.host, c.host_status = 0, None, None, ""
+        c.nvml = Mock(ok=True, driver="", cuda_version="")
+        c.nvml.sample.return_value = []
+        c.counters = Mock(outside={})
+        c.counters.sample.return_value = ({1: {}}, {1: AdapterGpu(dedicated=GiB, shared=0)})
+        c.inspector, c.prober = Mock(), Mock()
+        with patch("gputaskman.collector.BACKEND", "wddm"), \
+                patch("gputaskman.collector.sys.platform", "win32"), \
+                patch("gputaskman.nvml.LOST", {"00000000:05:00.0"}):
+            s = c.sample()
+        self.assertIsNone(s.nv)
+        self.assertTrue(s.nv_lost)
+        self.assertIn("restart gputaskman", s.counter_status)
+        self.assertEqual(s.vram_used, GiB)
 
     def test_windows_matching_counter_zero_is_not_unavailable(self):
         c = Collector.__new__(Collector)
@@ -887,6 +907,132 @@ class UiTests(unittest.IsolatedAsyncioTestCase):
         Console(file=output, width=widget.content_size.width, color_system=None).print(widget.content)
         return output.getvalue()
 
+    async def test_monitoring_toggle_hides_diagnostics_without_changing_live_state(self):
+        s = snapshot()
+        s.driver, s.cuda = "621.01", "13.5"
+        s.nv = NvDevice(index=0, name="Test GPU", driver_model="WDDM", pci_bus="00000000:01:00.0",
+                        util_gpu=47, util_mem=44, temp=59, power_w=126, power_limit_w=300,
+                        sm_clock=2595, sm_clock_max=3090, mem_clock=15801, video_clock=2242,
+                        pstate=1, pcie_gen=5, pcie_width=8, compute_cap="12.0",
+                        pcie_rx_kbs=35 * 1024, pcie_tx_kbs=31 * 1024, throttle=["thermal"])
+        s.counter_status = "Counters unavailable for one protected process"
+        with patch.object(GpuTaskManager, "poll"):
+            app = GpuTaskManager()
+            async with app.run_test(size=(180, 50)) as pilot:
+                app.apply(s)
+                await pilot.pause()
+                device = app.query_one("#device", Static)
+                full = "\n".join(line.plain for line in device.content.renderables)
+                self.assertFalse(app.monitoring)
+                self.assertEqual(str(device.border_title), "Full diagnostics")
+                for diagnostic in ("driver 621.01", "CUDA 13.5", "WDDM", "00000000:01:00.0",
+                                   "PCIe gen5 x8", "CC 12.0", "126/300 W", "P1",
+                                   "2595/3090 MHz", "mem 15801 MHz", "video 2242 MHz"):
+                    self.assertIn(diagnostic, full)
+                await pilot.press("down", "p")
+                selected = app.selected_key
+                histories = list(app.hist_util)
+                table = app.query_one("#procs")
+                row_count = table.row_count
+                charts = self.chart_text(app)
+                inspector = app.query_one("#inspector", Static).content
+                await pilot.press("m")
+                await pilot.pause()
+                slim = "\n".join(line.plain for line in device.content.renderables)
+                self.assertTrue(app.monitoring)
+                self.assertEqual(str(device.border_title), "Slim monitoring")
+                for hidden in ("621.01", "13.5", "WDDM", "00000000:01:00.0", "PCIe gen", "CC ",
+                               "/300 W", "P1", "/3090", "mem 15801", "video 2242"):
+                    self.assertNotIn(hidden, slim)
+                for live in ("Test GPU", "VRAM", "10.00 GB / 16.00 GB", "shared(RAM) 1.00 GB",
+                             "GPU 47%", "Mem activity 44%", "PCIe↓", "59°C", "126 W", "SM 2595 MHz",
+                             "throttle: thermal", s.counter_status, "[PAUSED]"):
+                    self.assertIn(live, slim)
+                self.assertEqual(app.selected_key, selected)
+                self.assertEqual(list(app.hist_util), histories)
+                self.assertEqual(table.row_count, row_count)
+                self.assertEqual(self.chart_text(app), charts)
+                self.assertIs(app.query_one("#inspector", Static).content, inspector)
+                await pilot.press("m")
+                await pilot.pause()
+                restored = "\n".join(line.plain for line in device.content.renderables)
+                self.assertEqual(restored.replace("   [PAUSED]", ""), full)
+
+    async def test_monitoring_applies_to_every_gpu_and_survives_new_samples(self):
+        with patch.object(GpuTaskManager, "poll"):
+            app = GpuTaskManager()
+            async with app.run_test(size=(140, 42)) as pilot:
+                await pilot.press("m")
+                first, second = snapshot(), snapshot()
+                first.driver = second.driver = "test-driver"
+                first.nv = NvDevice(index=0, name="First GPU", util_gpu=10)
+                second.nv = NvDevice(index=1, name="Second GPU", util_gpu=80)
+                app.apply_all([first, second])
+                await pilot.pause()
+                device = app.query_one("#device", Static)
+                rendered = io.StringIO()
+                Console(file=rendered, width=140).print(device.content)
+                for name in ("GPU 0", "GPU 1", "First GPU", "Second GPU"):
+                    self.assertIn(name, rendered.getvalue())
+                self.assertNotIn("test-driver", rendered.getvalue())
+                self.assertNotIn("PCIe gen", rendered.getvalue())
+                self.assertEqual(app.query_one("#procs").row_count, 4)
+                self.assertEqual(list(app._histories[0]["util"]), [10])
+                self.assertEqual(list(app._histories[1]["util"]), [80])
+                first.nv.util_gpu = 20
+                app.apply_all([first, second])
+                await pilot.pause()
+                self.assertTrue(app.monitoring)
+                self.assertEqual(list(app._histories[0]["util"]), [10, 20])
+                self.assertEqual(list(app._histories[1]["util"]), [80, 80])
+                await pilot.resize_terminal(80, 24)
+                await pilot.pause()
+                self.assertGreaterEqual(app.query_one("#procs").region.height, 4)
+                self.assertLessEqual(app.query_one("#procs").region.bottom, app.query_one(Footer).region.y)
+                screenshot = "".join(ET.fromstring(app.export_screenshot()).itertext())
+                self.assertIn("Slim/Full", screenshot)
+                await pilot.press("m")
+                await pilot.pause()
+                rendered = io.StringIO()
+                Console(file=rendered, width=140).print(device.content)
+                self.assertIn("test-driver", rendered.getvalue())
+
+    async def test_monitoring_keeps_missing_values_and_backend_provenance(self):
+        with patch.object(GpuTaskManager, "poll"):
+            app = GpuTaskManager()
+            async with app.run_test(size=(140, 42)) as pilot:
+                await pilot.press("m")
+                for backend in ("wddm", "wsl", "nvml", "metal"):
+                    with self.subTest(backend=backend):
+                        s = snapshot()
+                        s.backend, s.driver = backend, "hidden-driver"
+                        s.vram_used = None
+                        s.nv = NvDevice(index=0, util_gpu=0)
+                        s.counter_status = "Counter pairing unavailable"
+                        app.apply(s)
+                        await pilot.pause()
+                        lines = "\n".join(line.plain for line in app.render_device(s).renderables)
+                        self.assertNotIn("hidden-driver", lines)
+                        self.assertIn("N/A / 16.00 GB", lines)
+                        self.assertIn("GPU 0%", lines)
+                        self.assertIn(s.counter_status, lines)
+                        self.assertNotIn("None", lines)
+                        if backend != "metal":
+                            self.assertIn("N/A  N/A W  SM N/A MHz", lines)
+                s = snapshot()
+                s.nv = NvDevice(index=0, source="AMD ADL", util_gpu=25, gfx_clock=2200,
+                                power_w=115, power_kind="ASIC")
+                app.apply(s)
+                await pilot.pause()
+                lines = "\n".join(line.plain for line in app.render_device(s).renderables)
+                self.assertIn("AMD gfx 25%", lines)
+                self.assertIn("gfx 2200 MHz", lines)
+                self.assertIn("115 W ASIC", lines)
+                s.nv = None
+                app.apply(s)
+                await pilot.pause()
+                self.assertIn("VRAM", "\n".join(line.plain for line in app.render_device(s).renderables))
+
     async def test_wsl_sort_selection_and_bar_use_inferred_vram_without_double_counting(self):
         s = snapshot()
         s.backend = "wsl"
@@ -975,6 +1121,18 @@ class UiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(list(app.hist_clock), [1500, 0, None, None])
                 app.hist_clock.clear()
                 self.assertEqual(app.chart_series(index, None)[1], 1)
+
+    async def test_row_highlight_after_the_inspector_is_gone_is_ignored(self):
+        # During teardown a queued RowHighlighted can arrive after the inspector was removed
+        # (observed on Windows 3.11 CI). It must not raise NoMatches out of run_test.
+        with patch.object(GpuTaskManager, "poll"):
+            app = GpuTaskManager()
+            async with app.run_test(size=(140, 42)) as pilot:
+                app.apply(snapshot())
+                await pilot.pause()
+                app.query_one("#inspector").remove()
+                await pilot.pause()
+                app.render_inspector()
 
     async def test_unavailable_device_metrics_render_as_na(self):
         with patch.object(GpuTaskManager, "poll"):
@@ -1112,7 +1270,10 @@ class UiTests(unittest.IsolatedAsyncioTestCase):
                 collector.close.assert_called_once()
 
     async def test_explicit_gpu_keeps_single_device_layout(self):
-        with patch("gputaskman.app.Collector") as factory:
+        adapters = [Adapter(1, "first", 0x10DE, 16 * GiB, 0, False),
+                    Adapter(2, "second", 0x10DE, 8 * GiB, 0, False)]
+        with patch("gputaskman.app.enumerate_adapters", return_value=adapters), \
+                patch("gputaskman.app.Collector") as factory:
             factory.SCAN_BUDGET = 0.15
             factory.return_value.sample.side_effect = snapshot
             closed = threading.Event()

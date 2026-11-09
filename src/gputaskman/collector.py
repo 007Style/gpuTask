@@ -115,8 +115,8 @@ class Snapshot:
     vram_used: int | None  # WDDM adapter-wide dedicated usage
     shared_used: int | None
     procs: list[ProcRow] = field(default_factory=list)
-    backend: str = "wddm"  # wddm (Windows) | nvml (native Linux, NVIDIA) | drm (native Linux, AMD) | wsl (device-wide only) | metal (macOS)
-    process_status: str = ""  # amdgpu only: what the DRM process scan couldn't cover; empty when it saw everything
+    backend: str = "wddm"  # wddm (Windows) | nvml (native Linux, NVIDIA) | drm (native Linux, AMD or Intel) | wsl (device-wide only) | metal (macOS)
+    process_status: str = ""  # drm backend only: what the DRM process scan couldn't cover; empty when it saw everything
     host_status: str = ""  # WSL only: Windows host counters via interop -- ok | starting | off (...) | ...
     wsl_split: str = ""  # WSL only: why Linux rows have no (inferred) VRAM, when they don't
     # False on an APU (amdgpu iGPU): its GTT is ordinary GPU memory, not spill from a full VRAM.
@@ -182,7 +182,7 @@ class Collector:
     DEEP_TOP_N = 25  # memory-map candidates: the top N VRAM users plus anything busy
     _mac_driver = ""  # "macOS 26.3.1" on the metal backend, read once at startup
     SCAN_BUDGET = 0.15  # seconds of memory-map scanning per sample; leftovers wait for the next sample
-    drm_card = None  # the selected GPU's amdgpu card, when it is one (drm.DrmCard)
+    drm_card = None  # the selected GPU's AMD or Intel card, when it is one (drm.DrmCard)
 
     @property
     def backend(self) -> str:
@@ -203,7 +203,8 @@ class Collector:
             resources.callback(self.adl.close)
             resources.pop_all()
         self._mac_driver = f"macOS {macos_version()}".strip() if BACKEND == "metal" else ""
-        # Native Linux on an AMD GPU: device metrics from amdgpu's sysfs, processes from DRM fdinfo.
+        # Native Linux on an AMD or Intel GPU: device metrics from the driver's sysfs (Intel's are
+        # partial and get their fdinfo-derived used-memory stamp), processes from DRM fdinfo.
         drm = getattr(self.counters, "drm", None)
         if drm is not None and self.adapter and self.adapter.vendor_id != VENDOR_NVIDIA:
             self.drm_card = next((c for c in drm.cards if c.key == self.adapter.luid), None)

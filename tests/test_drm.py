@@ -9,6 +9,7 @@ from pathlib import Path
 from gputaskman import drm
 
 GiB = 1 << 30
+MiB = 1 << 20
 
 FDINFO = """pos:\t0
 flags:\t02100002
@@ -42,6 +43,115 @@ drm-engine-enc:\t1200 ns
 drm-engine-capacity-gfx:\t1
 """
 
+# The Intel samples are laid out the way the kernels print them (i915_drm_client.c; the xe_drm_client.c documentation
+# sample; sizes in the units drm_print_memory_stats uses). They are built from that code, not captured from hardware.
+I915_FDINFO = """pos:\t0
+flags:\t02100002
+mnt_id:\t28
+ino:\t415
+drm-driver:\ti915
+drm-pdev:\t0000:03:00.0
+drm-client-id:\t42
+drm-total-system0:\t8 MiB
+drm-shared-system0:\t0
+drm-active-system0:\t0
+drm-resident-system0:\t6 MiB
+drm-purgeable-system0:\t0
+drm-total-local0:\t2048 MiB
+drm-shared-local0:\t0
+drm-active-local0:\t16 MiB
+drm-resident-local0:\t2048 MiB
+drm-purgeable-local0:\t0
+drm-total-stolen-local0:\t0
+drm-shared-stolen-local0:\t0
+drm-active-stolen-local0:\t0
+drm-resident-stolen-local0:\t64 KiB
+drm-purgeable-stolen-local0:\t0
+drm-engine-render:\t5308400172 ns
+drm-engine-copy:\t1200 ns
+drm-engine-video:\t0 ns
+drm-engine-capacity-video:\t2
+drm-engine-video-enhance:\t0 ns
+drm-engine-capacity-video-enhance:\t2
+drm-engine-compute:\t750000000 ns
+drm-engine-capacity-compute:\t4
+"""
+
+# An integrated GPU has no local0 region, only system0 and its stolen carve-out.
+I915_IGPU_FDINFO = """pos:\t0
+flags:\t02100002
+mnt_id:\t28
+ino:\t415
+drm-driver:\ti915
+drm-pdev:\t0000:00:02.0
+drm-client-id:\t7
+drm-total-system0:\t64 MiB
+drm-shared-system0:\t0
+drm-active-system0:\t0
+drm-resident-system0:\t60 MiB
+drm-purgeable-system0:\t0
+drm-total-stolen-system0:\t0
+drm-shared-stolen-system0:\t0
+drm-active-stolen-system0:\t0
+drm-resident-stolen-system0:\t0
+drm-purgeable-stolen-system0:\t0
+drm-engine-render:\t1200000000 ns
+drm-engine-copy:\t0 ns
+drm-engine-video:\t300000000 ns
+drm-engine-video-enhance:\t0 ns
+"""
+
+# i915 before Gen8 prints the memory stats but no drm-engine lines at all.
+I915_GEN7_FDINFO = """drm-driver:\ti915
+drm-pdev:\t0000:00:02.0
+drm-client-id:\t5
+drm-total-system0:\t4 MiB
+drm-shared-system0:\t0
+drm-active-system0:\t0
+drm-resident-system0:\t4 MiB
+drm-purgeable-system0:\t0
+"""
+
+# xe: memory regions are named system/gtt/vram0/stolen and the load is drm-cycles-*, not drm-engine-<class> ns.
+XE_FDINFO = """pos:\t0
+flags:\t0100002
+mnt_id:\t26
+ino:\t685
+drm-driver:\txe
+drm-client-id:\t3
+drm-pdev:\t0000:03:00.0
+drm-total-system:\t0
+drm-shared-system:\t0
+drm-active-system:\t0
+drm-resident-system:\t0
+drm-purgeable-system:\t0
+drm-total-gtt:\t192 KiB
+drm-shared-gtt:\t0
+drm-active-gtt:\t0
+drm-resident-gtt:\t192 KiB
+drm-total-vram0:\t23992 KiB
+drm-shared-vram0:\t16 MiB
+drm-active-vram0:\t0
+drm-resident-vram0:\t23992 KiB
+drm-total-stolen:\t0
+drm-shared-stolen:\t0
+drm-active-stolen:\t0
+drm-resident-stolen:\t0
+drm-cycles-rcs:\t28257900
+drm-total-cycles-rcs:\t7655183225
+drm-cycles-bcs:\t0
+drm-total-cycles-bcs:\t7655183225
+drm-cycles-vcs:\t0
+drm-total-cycles-vcs:\t7655183225
+drm-engine-capacity-vcs:\t2
+drm-cycles-vecs:\t0
+drm-total-cycles-vecs:\t7655183225
+drm-engine-capacity-vecs:\t2
+drm-cycles-ccs:\t0
+drm-total-cycles-ccs:\t7655183225
+drm-engine-capacity-ccs:\t4
+"""
+
 
 def _make_card(root: Path, name, pdev, vendor, device, vram, driver="amdgpu", gtt=0, apu=False) -> Path:
     dev = root / "drm" / name / "device"
@@ -52,6 +162,19 @@ def _make_card(root: Path, name, pdev, vendor, device, vram, driver="amdgpu", gt
     (dev / "mem_info_gtt_total").write_text(str(gtt))
     if not apu:
         (dev / "mem_info_vram_vendor").write_text("samsung\n")  # only discrete cards have VRAM chips
+    driver_dir = root / "drivers" / driver
+    driver_dir.mkdir(parents=True, exist_ok=True)
+    os.symlink(driver_dir, dev / "driver")
+    (dev / "uevent").write_text(f"DRIVER={driver}\nPCI_SLOT_NAME={pdev}\n")
+    return dev
+
+
+def _make_intel_card(root: Path, name, pdev, device, driver="i915") -> Path:
+    """An Intel card's sysfs: there are no mem_info_* files, the local-memory BAR is the resource2 file."""
+    dev = root / "drm" / name / "device"
+    dev.mkdir(parents=True)
+    (dev / "vendor").write_text("0x8086\n")
+    (dev / "device").write_text(f"0x{device:04x}\n")
     driver_dir = root / "drivers" / driver
     driver_dir.mkdir(parents=True, exist_ok=True)
     os.symlink(driver_dir, dev / "driver")
@@ -94,6 +217,26 @@ def _fdinfo(client, pdev, gfx=0, vram=0, gtt=0, shared_vram=0, shared_gtt=0, sha
         f"drm-engine-gfx:\t{gfx} ns\n"
         f"drm-engine-capacity-gfx:\t1\n"
     )
+
+
+def _i915_fdinfo(client, pdev, render=0, video=0, local_mib=0, system_mib=0, shared_local_mib=0, engines=True) -> str:
+    """A discrete i915 client's fdinfo: memory by region (sizes in MiB) and, unless engines is False, the engine
+    classes the way i915 prints them."""
+    text = (
+        "pos:\t0\n"
+        "drm-driver:\ti915\n"
+        f"drm-client-id:\t{client}\n"
+        f"drm-pdev:\t{pdev}\n"
+        f"drm-shared-system0:\t0\n"
+        f"drm-resident-system0:\t{system_mib} MiB\n"
+        f"drm-shared-local0:\t{shared_local_mib} MiB\n"
+        f"drm-resident-local0:\t{local_mib} MiB\n"
+    )
+    if engines:
+        text += (f"drm-engine-render:\t{render} ns\n"
+                 "drm-engine-copy:\t0 ns\n"
+                 f"drm-engine-video:\t{video} ns\n")
+    return text
 
 
 class Clock:
@@ -788,6 +931,12 @@ class EngineAndSelectionTests(unittest.TestCase):
         self.assertEqual(drm._engine_key("vpe"), "other")
         self.assertEqual(drm._engine_key("enc", unified_video=True), "video")
         self.assertEqual(drm._engine_key("gfx", unified_video=True), "3d")
+        self.assertEqual(drm._engine_key("rcs0", intel=True), "3d")
+        self.assertEqual(drm._engine_key("ccs0", intel=True), "compute")
+        self.assertEqual(drm._engine_key("bcs0", intel=True), "copy")
+        self.assertEqual(drm._engine_key("vcs0", intel=True), "video")
+        self.assertEqual(drm._engine_key("vecs0", intel=True), "video")  # video-enhance is post-processing, not encode
+        self.assertEqual(drm._engine_key("rcs0", intel=False), "other")  # Intel-only prefix on AMD
 
     def test_amd_selectable_next_to_nvidia_on_linux(self):
         from gputaskman import collector
@@ -798,6 +947,369 @@ class EngineAndSelectionTests(unittest.TestCase):
         with patch.object(collector, "BACKEND", "nvml"):
             self.assertIs(collector.select_adapter([amd, nvidia], 0), nvidia)
             self.assertIs(collector.select_adapter([amd, nvidia], 1), amd)
+
+    def test_intel_selectable_next_to_nvidia_on_linux(self):
+        from gputaskman import collector
+        from gputaskman.dxgi import Adapter
+
+        nvidia = Adapter(1, "NVIDIA GPU", 0x10DE, 8 * GiB, 0, False)
+        intel = Adapter(2, "Intel Arc A770", 0x8086, 16 * GiB, 0, False)
+        with patch.object(collector, "BACKEND", "nvml"):
+            self.assertIs(collector.select_adapter([intel, nvidia], 0), nvidia)
+            self.assertIs(collector.select_adapter([intel, nvidia], 1), intel)
+
+
+class IntelCardTests(unittest.TestCase):
+    """Intel (i915/xe) cards through the same DRM fdinfo backend, from a synthetic sysfs tree."""
+
+    INTEL = drm.DrmCard(key=12288, pdev="0000:03:00.0", sysfs="/x/card2/device", driver="i915",
+                        vendor_id=0x8086, device_id=0x56A0, name="Intel Arc A770",
+                        vram_total=16 * GiB, integrated=False, intel=True)
+    IGPU = drm.DrmCard(key=32, pdev="0000:00:02.0", sysfs="/x/card1/device", driver="i915",
+                       vendor_id=0x8086, device_id=0xA782, name="Intel UHD Graphics",
+                       vram_total=0, integrated=True, intel=True)
+    AMD = drm.DrmCard(key=0, pdev="0000:43:00.0", sysfs="/x/amd/device", driver="amdgpu",
+                      vendor_id=0x1002, device_id=0x7480, name="AMD GPU", vram_total=8 * GiB,
+                      integrated=False)
+
+    def make(self, cards):
+        return drm.DrmCounters(found=cards)
+
+    def test_intel_engine_names(self):
+        self.assertEqual(drm._engine_key("rcs0", intel=True), "3d")
+        self.assertEqual(drm._engine_key("ccs0", intel=True), "compute")
+        self.assertEqual(drm._engine_key("bcs0", intel=True), "copy")
+        self.assertEqual(drm._engine_key("vcs0", intel=True), "video")
+        self.assertEqual(drm._engine_key("vecs0", intel=True), "video")
+        self.assertEqual(drm._engine_key("rcs0", intel=False), "other")
+
+    def test_intel_engine_classes_as_i915_prints_them(self):
+        # i915 names whole classes (i915_drm_client.c uabi_class_names), not command streamers.
+        for name, expected in (("render", "3d"), ("copy", "copy"), ("video", "video"),
+                               ("video-enhance", "video"), ("compute", "compute")):
+            with self.subTest(name=name):
+                self.assertEqual(drm._engine_key(name, intel=True), expected)
+        self.assertEqual(drm._engine_key("something-new", intel=True), "other")
+        self.assertEqual(drm._engine_key("render", intel=False), "other")  # not an AMD engine name
+
+    def test_intel_card_is_recognized_and_amd_unchanged(self):
+        counters = self.make([self.INTEL])
+        self.assertTrue(counters.ok)
+        self.assertEqual([c.pdev for c in counters.cards], ["0000:03:00.0"])
+        self.assertTrue(counters.cards[0].intel)
+
+    def test_intel_fdinfo_fields_parse(self):
+        text = ("drm-driver:\ti915\n"
+                "drm-client-id:\t99\n"
+                "drm-pdev:\t0000:03:00.0\n"
+                "drm-engine-rcs0:\t1200000000 ns\n"
+                "drm-engine-bcs0:\t400000000 ns\n"
+                "drm-engine-ccs0:\t800000000 ns\n"
+                "drm-engine-vcs0:\t200000000 ns\n"
+                "drm-engine-vecs0:\t100000000 ns\n"
+                "drm-resident-local0:\t1073741824\n"
+                "drm-resident-stolen-local0:\t1048576\n"
+                "drm-resident-system0:\t268435456\n")
+        fields = drm.parse_fdinfo(text)
+        self.assertEqual(fields["driver"], "i915")
+        self.assertEqual(fields["pdev"], "0000:03:00.0")
+        self.assertEqual(fields["client_id"], 99)
+        self.assertEqual(fields["engines"], {"rcs0": 1_200_000_000, "bcs0": 400_000_000,
+                                             "ccs0": 800_000_000, "vcs0": 200_000_000,
+                                             "vecs0": 100_000_000})
+        self.assertEqual(fields["vram"], GiB + 1_048_576)  # local0 + stolen-local0
+        self.assertEqual(fields["gtt"], 268_435_456)  # system0
+        self.assertIsNone(fields["shared"])  # shared gate needs both Intel shared regions
+
+    def test_intel_missing_regions_stay_unknown_not_zero(self):
+        text = ("drm-driver:\txe\n"
+                "drm-client-id:\t7\n"
+                "drm-engine-rcs0:\t1000 ns\n")
+        fields = drm.parse_fdinfo(text)
+        self.assertIsNone(fields["vram"])  # an iGPU has no local0: unknown, not 0
+        self.assertIsNone(fields["gtt"])
+
+    def test_intel_adapters_trust_the_client_stamp(self):
+        self.INTEL.vram_used = 15 * GiB
+        counters = self.make([self.INTEL])
+        out = counters._adapters()
+        self.assertEqual(out[self.INTEL.key].dedicated, float(15 * GiB))
+        self.assertIsNone(out[self.INTEL.key].shared)  # no device-wide shared counter on Intel
+        self.IGPU.vram_used = None
+        counters = self.make([self.IGPU])
+        out = counters._adapters()
+        self.assertIsNone(out[self.IGPU.key].dedicated)
+        self.assertIsNone(out[self.IGPU.key].shared)
+
+
+class IntelFdinfoTests(unittest.TestCase):
+    """fdinfo laid out the way the Intel kernels print it (the fixtures at the top of this file)."""
+
+    def test_i915_discrete_client(self):
+        info = drm.parse_fdinfo(I915_FDINFO)
+        self.assertEqual((info["driver"], info["client_id"], info["pdev"]), ("i915", 42, "0000:03:00.0"))
+        self.assertEqual(info["vram"], 2048 * MiB + 64 * 1024)  # local0 plus stolen-local0 (the fixture's 64 KiB is synthetic)
+        self.assertEqual(info["gtt"], 6 * MiB)  # system0
+        self.assertEqual(info["shared"], 0)  # both shared regions are reported, and empty
+        # Only the drm-engine-<class> counters are engines; the capacity lines are not.
+        self.assertEqual(info["engines"], {"render": 5308400172, "copy": 1200, "video": 0,
+                                           "video-enhance": 0, "compute": 750_000_000})
+
+    def test_i915_integrated_client(self):
+        info = drm.parse_fdinfo(I915_IGPU_FDINFO)
+        self.assertIsNone(info["vram"])  # no local0 on an integrated GPU: unknown, not 0
+        self.assertEqual(info["gtt"], 60 * MiB)  # system0 plus an empty stolen-system0
+        self.assertIsNone(info["shared"])  # no drm-shared-local0, so the shared-buffer gate stays closed
+        self.assertEqual(set(info["engines"]), {"render", "copy", "video", "video-enhance"})
+
+    def test_i915_without_engine_lines_has_unknown_load(self):
+        info = drm.parse_fdinfo(I915_GEN7_FDINFO)
+        self.assertIsNone(info["engines"])  # unknown, not an empty (zero) load
+        self.assertEqual(info["gtt"], 4 * MiB)  # the memory is still read
+
+    def test_i915_unparseable_region_makes_that_figure_unknown(self):
+        # Treating a region that won't parse as 0 would show a smaller number than the process holds.
+        info = drm.parse_fdinfo(I915_FDINFO.replace("drm-resident-local0:\t2048 MiB", "drm-resident-local0:\tlots"))
+        self.assertIsNone(info["vram"])  # stolen-local0 still parses, but the local0 half is unknown
+        self.assertEqual(info["gtt"], 6 * MiB)  # the other figure is unaffected
+        info = drm.parse_fdinfo(I915_FDINFO.replace("drm-resident-system0:\t6 MiB", "drm-resident-system0:\t?"))
+        self.assertIsNone(info["gtt"])
+        self.assertEqual(info["vram"], 2048 * MiB + 64 * 1024)
+
+    def test_i915_region_it_does_not_print_adds_nothing(self):
+        # i915 prints a line for every region the device has, so a missing stolen-local0 line is a region it lacks.
+        text = "\n".join(line for line in I915_FDINFO.splitlines() if "stolen-local0" not in line)
+        self.assertEqual(drm.parse_fdinfo(text)["vram"], 2048 * MiB)
+
+    def test_xe_client_reports_neither_memory_nor_load(self):
+        info = drm.parse_fdinfo(XE_FDINFO)
+        self.assertEqual((info["driver"], info["client_id"], info["pdev"]), ("xe", 3, "0000:03:00.0"))
+        # xe calls its regions system/gtt/vram0/stolen and reports drm-cycles-*; none of that is decoded yet.
+        for field in ("vram", "gtt", "shared", "engines"):
+            with self.subTest(field=field):
+                self.assertIsNone(info[field])
+
+
+class IntelBarTests(unittest.TestCase):
+    """cards() takes an Intel card's total from the size of its local-memory BAR file. The sizes are faked: a real
+    BAR is GiBs of address space, not data."""
+
+    def _cards(self, bars: dict[str, int], driver="i915"):
+        real_getsize = os.path.getsize
+
+        def getsize(path):
+            name = os.path.basename(path)
+            if name not in ("resource2_wc", "resource2"):
+                return real_getsize(path)
+            if name not in bars:
+                raise FileNotFoundError(path)
+            return bars[name]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _make_intel_card(root, "card0", "0000:03:00.0", 0x56A0, driver)
+            with patch.object(os.path, "getsize", getsize):
+                return drm.cards(str(root / "drm"), str(root / "pci.ids"))
+
+    def test_resizable_bar_marks_a_discrete_card_and_sizes_it(self):
+        (card,) = self._cards({"resource2_wc": 16 * GiB})
+        self.assertTrue(card.intel)
+        self.assertEqual((card.vram_total, card.integrated), (16 * GiB, False))
+
+    def test_resource2_alone_is_enough(self):
+        (card,) = self._cards({"resource2": 8 * GiB})  # no write-combining alias to read
+        self.assertEqual((card.vram_total, card.integrated), (8 * GiB, False))
+
+    def test_empty_resource2_wc_falls_back_to_resource2(self):
+        (card,) = self._cards({"resource2_wc": 0, "resource2": 8 * GiB})
+        self.assertEqual(card.vram_total, 8 * GiB)
+
+    def test_small_or_missing_window_is_an_unknown_total_not_a_size(self):
+        (card,) = self._cards({"resource2_wc": 256 * MiB})  # an iGPU's system-memory window
+        self.assertEqual((card.vram_total, card.integrated), (0, True))
+        (card,) = self._cards({})  # no BAR file at all
+        self.assertEqual((card.vram_total, card.integrated), (0, True))
+
+    def test_xe_card_is_sized_the_same_way(self):
+        (card,) = self._cards({"resource2_wc": 16 * GiB}, driver="xe")
+        self.assertEqual((card.driver, card.intel, card.vram_total), ("xe", True, 16 * GiB))
+
+
+class IntelScanTests(unittest.TestCase):
+    """DrmCounters.sample() over Intel clients in a fake /proc. Each test builds its own card, because a sample
+    stamps the card's used memory."""
+
+    PDEV = "0000:03:00.0"
+
+    def _setup(self, tmp, driver="i915", vram_total=16 * GiB, integrated=False):
+        proc = Path(tmp) / "proc"
+        proc.mkdir()
+        card = drm.DrmCard(key=drm.pci_key(self.PDEV), pdev=self.PDEV, sysfs=str(Path(tmp) / "card1" / "device"),
+                           driver=driver, vendor_id=0x8086, device_id=0x56A0, name="Intel Arc A770",
+                           vram_total=vram_total, integrated=integrated, intel=True)
+        self.clock = Clock()
+        return card, proc, drm.DrmCounters(found=[card], proc=str(proc), clock=self.clock)
+
+    def test_local_memory_in_fdinfo_makes_a_card_with_a_small_window_discrete(self):
+        # An Arc without resizable BAR has a window under 1 GiB, so cards() calls it integrated; only a card with
+        # local memory prints local0, and that is what shows it is discrete.
+        with tempfile.TemporaryDirectory() as tmp:
+            card, proc, counters = self._setup(tmp, vram_total=0, integrated=True)
+            counters.sample()
+            self.assertTrue(card.integrated)  # no client yet: nothing shows otherwise
+            _write_fd(proc, 100, 5, _i915_fdinfo(1, self.PDEV, local_mib=64))
+            counters.sample()
+            self.assertFalse(card.integrated)
+            self.assertEqual(card.vram_total, 0)  # and its total is still unknown, not invented
+
+    def test_integrated_gpu_stays_integrated_when_its_clients_print_no_local_memory(self):
+        pdev = "0000:00:02.0"
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = Path(tmp) / "proc"
+            proc.mkdir()
+            card = drm.DrmCard(key=drm.pci_key(pdev), pdev=pdev, sysfs=str(Path(tmp) / "card0" / "device"),
+                               driver="i915", vendor_id=0x8086, device_id=0xA782, name="Intel UHD Graphics",
+                               vram_total=0, integrated=True, intel=True)
+            counters = drm.DrmCounters(found=[card], proc=str(proc), clock=Clock())
+            _write_fd(proc, 100, 5, I915_IGPU_FDINFO)
+            counters.sample()
+            self.assertTrue(card.integrated)
+
+    def test_render_and_video_load_are_measured_between_two_samples(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            card, proc, counters = self._setup(tmp)
+            _write_fd(proc, 100, 5, _i915_fdinfo(1, self.PDEV, local_mib=256, system_mib=8))
+            counters.start()
+            self.clock.tick()
+            _write_fd(proc, 100, 5, _i915_fdinfo(1, self.PDEV, render=500_000_000, video=250_000_000,
+                                                 local_mib=256, system_mib=8))
+            g = counters.sample()[0][card.key][100]
+            self.assertIn("engine", g.available)
+            self.assertEqual(dict(g.engines), {"3d": 50.0, "copy": 0.0, "video": 25.0})  # none fell into "other"
+            self.assertEqual(g.gpu_pct, 50.0)
+            self.assertEqual((g.drm_reason, g.dedicated, g.shared), ("", 256 * MiB, 8 * MiB))
+
+    def test_xe_client_is_unknown_not_idle_and_not_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            card, proc, counters = self._setup(tmp, driver="xe")
+            _write_fd(proc, 100, 5, XE_FDINFO)
+            counters.start()
+            self.clock.tick()
+            procs, adapters = counters.sample()
+            g = procs[card.key][100]
+            self.assertEqual(g.drm_reason, drm.REASON_LEGACY)
+            self.assertNotIn("engine", g.available)  # drm-cycles-* is not decoded: unknown, not 0%
+            self.assertNotIn("dedicated", g.available)
+            self.assertIsNone(g.resident_vram)
+            self.assertIsNone(adapters[card.key].dedicated)  # and so is the card's used memory
+
+    def test_unknown_engine_load_does_not_hide_measured_memory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            card, proc, counters = self._setup(tmp)
+            _write_fd(proc, 100, 5, _i915_fdinfo(1, self.PDEV, local_mib=64, engines=False))
+            counters.start()
+            self.clock.tick()
+            g = counters.sample()[0][card.key][100]
+            self.assertNotIn("engine", g.available)  # no drm-engine lines: the load is unknown
+            self.assertIn("dedicated", g.available)  # and that has no bearing on the memory
+            self.assertEqual(g.dedicated, 64 * MiB)
+
+    def test_integrated_gpu_load_is_measured_while_its_vram_is_n_a(self):
+        pdev = "0000:00:02.0"
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = Path(tmp) / "proc"
+            proc.mkdir()
+            card = drm.DrmCard(key=drm.pci_key(pdev), pdev=pdev, sysfs=str(Path(tmp) / "card0" / "device"),
+                               driver="i915", vendor_id=0x8086, device_id=0xA782, name="Intel UHD Graphics",
+                               vram_total=0, integrated=True, intel=True)
+            clock = Clock()
+            counters = drm.DrmCounters(found=[card], proc=str(proc), clock=clock)
+            _write_fd(proc, 100, 5, I915_IGPU_FDINFO)
+            counters.start()
+            clock.tick()
+            _write_fd(proc, 100, 5, I915_IGPU_FDINFO.replace("render:\t1200000000", "render:\t1700000000"))
+            procs, adapters = counters.sample()
+            g = procs[card.key][100]
+            self.assertEqual(g.drm_reason, drm.REASON_LEGACY)  # shared buffers can't be ruled out
+            self.assertNotIn("dedicated", g.available)
+            self.assertIn("engine", g.available)
+            self.assertEqual(g.engines["3d"], 50.0)
+            self.assertIsNone(adapters[card.key].dedicated)
+
+    def test_device_used_sums_each_client_once_and_is_unknown_when_incomplete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            card, proc, counters = self._setup(tmp)
+            self.assertIsNone(counters.sample()[1][card.key].dedicated)  # no client visible: unknown, not 0
+            _write_fd(proc, 100, 5, _i915_fdinfo(1, self.PDEV, local_mib=100))
+            _write_fd(proc, 200, 5, _i915_fdinfo(1, self.PDEV, local_mib=100))  # the same client, held by a second process
+            _write_fd(proc, 300, 5, _i915_fdinfo(2, self.PDEV, local_mib=50))
+            adapters = counters.sample()[1]
+            self.assertEqual(adapters[card.key].dedicated, 150 * MiB)
+            self.assertIsNone(adapters[card.key].shared)  # Intel has no device-wide system-memory counter
+            _write_fd(proc, 400, 5, f"drm-driver:\ti915\ndrm-client-id:\t3\ndrm-pdev:\t{self.PDEV}\n"
+                                    "drm-resident-local0:\tlots\n")
+            self.assertIsNone(counters.sample()[1][card.key].dedicated)  # one client unreadable: the sum is unknown
+
+
+class IntelNoteTests(unittest.TestCase):
+    """Intel's device VRAM used is a sum over the clients gputaskman can inspect and its total is a PCI window size,
+    and the output says so."""
+
+    def _snapshot(self, source, vram_used=4 * GiB, vram_total=16 * GiB):
+        from gputaskman.collector import Snapshot
+        from gputaskman.telemetry import DeviceTelemetry
+
+        return Snapshot(taken=1, adapter=None, adapters=[], nv=DeviceTelemetry(index=0, source=source), driver="",
+                        cuda="", vram_total=vram_total, vram_used=vram_used, shared_used=None, backend="drm",
+                        procs=[])
+
+    def _panel(self, snapshot):
+        from gputaskman.app import GpuTaskManager
+
+        return "\n".join(item.plain for item in GpuTaskManager().render_device(snapshot).renderables)
+
+    def test_text_carries_the_note_for_intel_only(self):
+        from gputaskman.report import INTEL_MEMORY_NOTE, to_text
+
+        self.assertIn(INTEL_MEMORY_NOTE, to_text(self._snapshot("Intel sysfs")))
+        self.assertNotIn(INTEL_MEMORY_NOTE, to_text(self._snapshot("AMD sysfs")))  # amdgpu has a device counter
+        # Nothing derived from the client sum or the window is shown (N/A used, unknown total): no caveat to make.
+        self.assertNotIn(INTEL_MEMORY_NOTE, to_text(self._snapshot("Intel sysfs", vram_used=None, vram_total=0)))
+
+    def test_device_panel_carries_the_note_for_intel_only(self):
+        from gputaskman.report import INTEL_MEMORY_NOTE
+
+        self.assertIn(INTEL_MEMORY_NOTE, self._panel(self._snapshot("Intel sysfs")))
+        self.assertNotIn(INTEL_MEMORY_NOTE, self._panel(self._snapshot("AMD sysfs")))
+        self.assertNotIn(INTEL_MEMORY_NOTE, self._panel(self._snapshot("Intel sysfs", vram_used=None, vram_total=0)))
+
+    def test_unknown_total_reads_n_a_and_free_is_left_out(self):
+        from gputaskman.report import to_text
+
+        snapshot = self._snapshot("Intel sysfs", vram_used=3 * GiB, vram_total=0)
+        self.assertIn("VRAM 3.00 GB / N/A", to_text(snapshot))
+        panel = self._panel(snapshot)
+        self.assertIn("3.00 GB / N/A", panel)
+        self.assertNotIn("/ 0 MB", panel)
+        self.assertNotRegex(panel, r"free \d")  # a free figure needs a total (the note's own "free memory" wording is not one)
+
+    def test_window_total_is_not_turned_into_a_free_figure(self):
+        panel = self._panel(self._snapshot("Intel sysfs"))  # 4 GB used of a 16 GB window
+        self.assertIn("4.00 GB / 16.00 GB", panel)
+        self.assertNotRegex(panel, r"free \d")
+        self.assertIn("free 12.00 GB", self._panel(self._snapshot("AMD sysfs")))  # AMD's total is a device counter
+
+    def test_json_says_unknown_and_carries_the_note(self):
+        from gputaskman.report import INTEL_MEMORY_NOTE, to_dict
+
+        unknown = to_dict(self._snapshot("Intel sysfs", vram_used=3 * GiB, vram_total=0))
+        self.assertIsNone(unknown["vram_total"])  # unknown, not 0 bytes
+        self.assertEqual(unknown["vram_used"], 3 * GiB)
+        self.assertEqual(unknown["memory_note"], INTEL_MEMORY_NOTE)
+        window = to_dict(self._snapshot("Intel sysfs"))
+        self.assertEqual((window["vram_total"], window["memory_note"]), (16 * GiB, INTEL_MEMORY_NOTE))
+        amd = to_dict(self._snapshot("AMD sysfs"))
+        self.assertEqual((amd["vram_total"], amd["memory_note"]), (16 * GiB, None))
 
 
 if __name__ == "__main__":

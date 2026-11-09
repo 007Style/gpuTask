@@ -46,7 +46,7 @@ def main() -> None:
         ap.error("--interval must be a finite number greater than zero")
 
     if sys.platform not in ("win32", "darwin") and not sys.platform.startswith("linux"):
-        sys.exit("gputaskman supports Windows (WDDM), Linux/WSL (NVML, or amdgpu DRM) and macOS (Apple Silicon) only.")
+        sys.exit("gputaskman supports Windows (WDDM), Linux/WSL (NVML, or amdgpu/Intel DRM) and macOS (Apple Silicon) only.")
 
     if args.list_gpus:
         from .collector import enumerate_adapters, ordered_adapters

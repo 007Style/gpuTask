@@ -84,11 +84,11 @@ class ProcGpu:
     # owner is inferred; kept apart from `dedicated` so it isn't counted twice next to the WSL VM row.
     inferred: float | None = None
     inferred_by: str = ""  # "consistent" (candidates agree on bytes) | "order" (heuristic owner)
-    # amdgpu (DRM fdinfo): resident bytes in every buffer this process can reach, shared ones included. A reference
+    # DRM fdinfo (amdgpu, Intel): resident bytes in every buffer this process can reach, shared ones included. A reference
     # for display only; the same buffer can appear under several processes, so these are never summed. None: unknown.
     resident_vram: float | None = None
     resident_gtt: float | None = None
-    drm_reason: str = ""  # amdgpu: why dedicated/shared are n/a (drm.REASON_*); empty when they are measured
+    drm_reason: str = ""  # DRM fdinfo: why dedicated/shared are n/a (drm.REASON_*); empty when they are measured
     kfd: bool = False  # amdgpu: holds /dev/kfd (ROCm/HIP), whose compute isn't timed per process
 
     @property

@@ -54,6 +54,8 @@ class ProcRow:
     host: bool = False  # pid is from another PID namespace, never a local one (see origin)
     origin: str = ""  # with host: "windows" (a Windows process seen from WSL) | "outside" (outside this container)
     gpu_index: int | None = None
+    ram: int | None = None  # system RAM (working set) from host.py; None = unknown, not zero
+    cpu: float | None = None  # % of the whole machine from host.py; None until the second sample
 
     @property
     def key(self) -> str:

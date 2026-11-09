@@ -58,6 +58,7 @@ cli.py ──► Collector.sample()  (collector.py)
             ├─ LLM detail      llm.py: buffer logs, ServerProber (local APIs), build_view()
             └─ app adapters    handy.py (settings + bounded log tail)
          ──► Snapshot ──► app.py (Textual TUI) / report.py (text and JSON)
+cli.py ──► HostSampler.sample()  (host.py: system RAM/CPU, OS-reported; sampled beside the Collector, not in Snapshot)
 cli.py diff ──► diff.py: compares two saved --json snapshots (no collection)
 ```
 
@@ -80,6 +81,7 @@ identify everything immediately; the TUI spreads scans across refreshes.
 | Add a GPU vendor or backend | `dxgi.py`, `collector.py`, a new module | Pair devices by LUID or PCI bus ID, never by name or index; load vendor DLLs by absolute system path |
 | Add a column or JSON field | `report.py` and `app.py` | Follow the null rules above; update the README tables. If it is a measured byte count, consider adding it to `diff.py` `MEASURED` |
 | Change snapshot comparison | `diff.py` | Works only on saved `--json` files, never live state. Compare measured fields directly; keep runtime-reported and estimated values in their own sections; an absent row is `not listed`, not zero. Refuse only when both snapshots name conflicting adapters (vendor, PCI address, a non-Windows key); when they cannot be compared, warn (`name-only`) instead, because a Windows LUID changes at boot and `diff` has no override flag |
+| Change system RAM/CPU | `host.py` | Machine memory and load as the OS reports them: never GPU bytes, never added to `Snapshot.attributed`, and `diff` ignores it. Unknown is `None`/`null` and a failure carries a reason, never zeros. The JSON key is `system` because `host` already means the WSL Windows host. Windows uses the NT process list (psutil per process takes about 6 s per pass for 1,000 processes), checked against psutil at startup; CPU rates are keyed by `(pid, create_time)` so a reused PID never inherits another process's history (on the psutil path, `is_running()` is what makes psutil drop its cached object for a reused PID; keep that call) |
 | Change WSL matching | `wslhost.py` `ContextTracker` | Keep `tests/test_wslhost.py` replays passing; they are measured sequences |
 
 ## Verify

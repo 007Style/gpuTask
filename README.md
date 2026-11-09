@@ -388,6 +388,8 @@ for a privacy consent prompt.
   video-engine clock, and responsive history charts with an all-charts or single-metric view.
 - **Process view:** local GPU memory, GPU-accessible system RAM, estimated non-resident commit,
   engine activity, and detected runtimes such as CUDA, HIP, Vulkan, Direct3D, ggml and ONNX Runtime.
+- **System RAM and CPU:** a panel plus RAM and CPU% columns, as the OS reports them: machine memory
+  and load, never GPU memory (see [System RAM and CPU](#system-ram-and-cpu)).
 - **Model inspector:** which model each process holds (LLM, decision, embedding, speech, or diffusion), how
   it was identified, architecture, quantization, layer count, weights, estimated KV cost, and
   buffer sizes from compatible load logs.
@@ -423,13 +425,14 @@ uv run --locked gputaskman --once       # one text snapshot
 uv run --locked gputaskman --json       # one JSON snapshot; implies --once
 uv run --locked gputaskman diff before.json after.json   # compare two --json snapshots
 uv run --locked gputaskman --no-host    # WSL: don't read Windows host counters through interop
+uv run --locked gputaskman --no-system  # don't sample system RAM/CPU: no panel, columns, or JSON section
 uv run --locked gputaskman --help
 ```
 
 | Key | Action |
 |---|---|
 | Up / Down | Select a process and inspect it |
-| `s` | Cycle sort: VRAM, GPU%, spill, paged, name |
+| `s` | Cycle sort: VRAM, GPU%, spill, paged, name (then RAM, CPU% unless `--no-system`) |
 | `c` | Cycle all charts or a single metric (also available in the **Charts** dropdown) |
 | `a` | Switch between top and all collected processes |
 | `m` | Toggle full diagnostics / slim monitoring |
@@ -534,6 +537,42 @@ different adapter/render GUID from DXGI's `0x4BB7`; it was not a proven alias fo
 The portable build's `--once` explanation and `--json` unmatched status were verified in the guest.
 Other Hyper-V GPU-PV configurations have not been validated.
 
+### System RAM and CPU
+
+A **System** panel under the GPU header, and **RAM** and **CPU%** columns in the process table, show what
+each process costs the *machine*, as the OS reports it. The numbers come from psutil; on Windows the process
+list comes from `NtQuerySystemInformation`, because psutil's per-process calls take about 6 s per pass for
+~1,000 processes there. `s` sorts by them, unknown values last. Full diagnostics also shows a per-thread strip, 60-sample CPU and
+RAM histories, and the top processes by RAM and CPU; slim monitoring keeps two lines (the RAM and CPU bars).
+`--no-system` removes the panel, the columns and the sampling.
+
+These are system-memory figures, never GPU bytes. They are not added to any GPU total or to the attributed VRAM:
+
+- **RAM** is the process's working set (Linux: resident set), which includes pages shared with other processes,
+  so it will not match Task Manager's default *Memory (active private working set)* column. `PRIVATE` in
+  `--once` (`private` in `--json`) is the Windows commit charged to the process; it is `n/a` (`null`) elsewhere.
+- **CPU%** is a share of the whole machine, like Task Manager: one busy thread on a 32-thread machine is about
+  3%. It is a rate between two samples, so a new process (or one whose PID was reused) shows `…` for one
+  refresh. Below 0.5% it is blank.
+- **`n/a`** means the OS would not say (a protected process), the PID now belongs to a different process than the
+  one the GPU row describes (compared by creation time when both are known), or the row is a Windows process
+  listed from WSL, whose PID is not a Linux PID.
+- Inside WSL the panel describes the Linux VM, and its border says so.
+- When the numbers cannot be read, the panel, `--once` and `--json` say why, and the GPU view is unaffected.
+  That covers 32-bit Python on Windows and a Windows build whose process-list layout does not match: the layout
+  is checked against psutil for gputaskman's own process at startup instead of being trusted.
+
+`--json` adds a `system` section: `cpu`, `ram` (with swap or pagefile), the top 10 processes machine-wide by
+`rss` and by `cpu_pct`, `denied` (processes the OS would not describe) and `cost_ms`. Unknown values are `null`;
+if sampling failed the section is `{"error": "<reason>"}`. `--once` and `--json` take their CPU readings inside
+the second they already wait for GPU engine rates. `gputaskman diff` compares GPU memory only and ignores this
+section.
+
+Live checks: Windows 11 on the RTX 4080 SUPER machine with 995 processes (the process list matched psutil for the
+same process; the TUI and `--json` ran), and Linux under WSL2 on the same machine (totals matched `/proc/meminfo`,
+gputaskman's own resident size matched `VmRSS` within 1%, and a single busy thread read 3.12% of the machine
+against the expected 100/32 = 3.1%). **Not validated on hardware:** macOS, Windows on ARM64, and bare-metal Linux.
+
 ### Comparing snapshots
 
 To see which memory bucket actually grew when you load a model or change the context length, save
@@ -549,7 +588,8 @@ uv run --locked gputaskman diff before.json after.json          # add --json for
 The device and process tables compare **measured** counters only. Runtime-reported segments
 (llama.cpp buffer logs) and estimates (KV cache from GGUF metadata and `-c`) are listed separately
 under each process and are never added to measured totals. A model file that appears in a process
-is listed as evidence that the process opened or named it, not as GPU growth.
+is listed as evidence that the process opened or named it, not as GPU growth. The `system` section
+(machine RAM and CPU) is not compared.
 
 Processes are paired by PID, then by name and listening ports, then by a unique name, because a
 model reload often restarts the server under a new PID. A process missing from one snapshot shows
@@ -717,6 +757,7 @@ Identification is designed to stay cheap. Measured on one Windows machine:
 | macOS: `ioreg` device stats + Metal clients | ~10 ms | Every refresh |
 | macOS: memory-map scan (`proc_pidinfo` region walk) | ~4 ms per process | Same policy as the memory-map scan above |
 | macOS: `footprint` GPU memory | ~70 ms per process, background thread | Busy and new processes every ~2 s, idle ones every 30 s (54 runs in 40 s with 27 GPU processes, M4 Mac mini) |
+| System RAM/CPU: process list + psutil totals | Windows (`NtQuerySystemInformation`): ~28 ms median for 995 processes (Windows 11, RTX 4080 SUPER machine, 32 threads); the contributor measured ~6 ms for ~480 processes (Windows 11, i9-13900K). Linux under WSL2 (psutil): ~3.4 ms median for 44 processes, ~9.5 ms for the first sample of 123; the per-pid reuse check (`is_running()`) adds ~0.3 ms for 44 processes, about 7 µs each | Every refresh; `--no-system` turns it off. psutil's per-process `memory_info`/`cpu_times` took ~6 s per pass for 995 processes on Windows, so it is only the non-Windows path. macOS unmeasured |
 
 With two llama-servers running, a steady refresh costs roughly 15-30 ms of CPU (about 340 ms before
 process details were cached).
@@ -868,6 +909,7 @@ downloads are bundled in this repository.
 | `stores.py` | Friendly names from Ollama, LM Studio, and Hugging Face model stores |
 | `gguf.py` | Model metadata, kind, and size estimates |
 | `llm.py` | Buffer logs, local server probing, and breakdowns |
+| `host.py` | System RAM and CPU as the OS reports them: psutil totals, per-process RAM and CPU%, and the Windows process-list reader |
 | `collector.py` | Shared snapshot collection |
 | `app.py` / `report.py` / `cli.py` | TUI, text/JSON, and command-line entry points |
 | `diff.py` | Before/after comparison of two `--json` snapshots |

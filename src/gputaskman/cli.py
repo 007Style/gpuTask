@@ -38,6 +38,8 @@ def main() -> None:
     ap.add_argument("--list-gpus", action="store_true", help="list selectable GPU adapters and exit")
     ap.add_argument("--no-host", action="store_true",
                     help="WSL: don't read Windows host GPU counters through interop (WSL VM total, Windows apps)")
+    ap.add_argument("--no-system", action="store_true",
+                    help="don't sample system RAM/CPU: no TUI panel or RAM/CPU%% columns, no system section in --once/--json")
     ap.add_argument("-i", "--interval", type=float, default=1.0, help="refresh seconds (default 1)")
     args = ap.parse_args()
     if args.gpu is not None and args.gpu < 0:
@@ -65,6 +67,7 @@ def main() -> None:
 
     if args.once or args.json:
         from .collector import Collector
+        from .host import HostSampler
         from .report import dump
 
         try:
@@ -76,12 +79,25 @@ def main() -> None:
                 c.host.wait(15.0)  # WSL: the first Windows counter sample takes several seconds
             if hasattr(c.counters, "warm_up"):
                 c.counters.warm_up(15.0)  # macOS: per-process GPU memory comes from a background footprint pass
+            sampler, system, system_error = None, None, None
+            if not args.no_system:
+                try:
+                    sampler = HostSampler()
+                    sampler.sample()  # per-process CPU% is a rate too; this primes it
+                except Exception as error:  # system RAM/CPU is extra: its failure must not cost the GPU report
+                    sampler, system_error = None, f"{type(error).__name__}: {error}"
             time.sleep(1.0)  # engine utilization is a rate; needs two samples
-            print(dump(c.sample(), args.json))
+            snapshot = c.sample()
+            if sampler:
+                try:
+                    system = sampler.sample()
+                except Exception as error:
+                    system_error = f"{type(error).__name__}: {error}"
+            print(dump(snapshot, args.json, system, system_error))
         finally:
             c.close()
         return
 
     from .app import GpuTaskManager
 
-    GpuTaskManager(gpu_index=args.gpu, interval=args.interval, host=not args.no_host).run()
+    GpuTaskManager(gpu_index=args.gpu, interval=args.interval, host=not args.no_host, system=not args.no_system).run()

@@ -272,5 +272,18 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
     return "\n".join(out)
 
 
-def dump(s: Snapshot, as_json: bool) -> str:
-    return json.dumps(to_dict(s), indent=2, default=str) if as_json else to_text(s)
+def dump(s: Snapshot, as_json: bool, system=None, system_error: str | None = None) -> str:
+    """system: an optional host.HostSample (OS-reported system RAM/CPU); system_error: why it is missing."""
+    from . import host as hostmod
+
+    if as_json:
+        d = to_dict(s)
+        if system is not None:
+            d["system"] = hostmod.to_dict(system)
+        elif system_error:
+            d["system"] = {"error": system_error}
+        return json.dumps(d, indent=2, default=str)
+    text = to_text(s)
+    if system is not None:
+        return text + "\n\n" + hostmod.to_text(system)
+    return text + (f"\n\nSystem RAM/CPU unavailable: {system_error}" if system_error else "")

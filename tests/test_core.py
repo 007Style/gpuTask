@@ -28,6 +28,7 @@ from gputaskman.collector import Collector, ProcRow, Snapshot, select_adapter, s
 from gputaskman.dxgi import Adapter
 from gputaskman.gguf import GgufInfo, read_gguf
 from gputaskman.handy import HandyEvidence, inspect_handy, _log_cache, _settings_cache
+from gputaskman.host import HostSample
 from gputaskman.llm import (LlmView, ServerInfo, ServerProber, _get, api_key, build_view, is_gpu_device,
                             llama_server_models, lmstudio_models, parse_flags, parse_load_log, probe_server,
                             redact_cmdline)
@@ -1019,6 +1020,12 @@ class UiTests(unittest.IsolatedAsyncioTestCase):
         backend = patch("gputaskman.app.BACKEND", "wddm")
         backend.start()
         self.addCleanup(backend.stop)
+        # The monitor must not query this machine's processes: a fixed sample keeps these tests hardware-independent.
+        sampler = patch("gputaskman.app.HostSampler")
+        sampler.start().return_value.sample.return_value = HostSample(
+            cpu_pct=10.0, per_core=[10.0], logical=1, physical=1, ram_total=16 * GiB, ram_used=4 * GiB,
+            ram_available=12 * GiB, swap_total=0, swap_used=0)
+        self.addCleanup(sampler.stop)
 
     def chart_text(self, app):
         widget = app.query_one("#charts", Static)
@@ -1533,7 +1540,7 @@ class UiTests(unittest.IsolatedAsyncioTestCase):
                 app.apply(snapshot())
                 await pilot.pause()
                 self.assertEqual(app.selected_pid, 20)
-                for _ in app.SORTS:
+                for _ in app.sorts:
                     await pilot.press("s")
                 self.assertEqual(app.sort_idx, 0)
                 await pilot.press("a", "p")

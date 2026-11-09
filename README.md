@@ -169,8 +169,16 @@ Live check, on a Vast.ai Docker container (Ubuntu 22.04, RTX 3060 Ti, driver 580
 PyTorch jobs already running at startup, a third started while watching, and one killed, were all
 matched to the right container PIDs with their NVML sizes (1.12, 2.52 and 1.59 GB) and live GPU%.
 An Ollama `qwen3:0.6b` runner was detected and named from Ollama's store with `api+mapped+cmdline`
-evidence, its weights / KV-cache / compute split shown, and the TUI rendered. Bare-metal Linux
-(same PID namespace, no matching needed) is covered by tests but has not been run on hardware.
+evidence, its weights / KV-cache / compute split shown, and the TUI rendered.
+
+Live check, bare-metal Linux (CachyOS, kernel 7.3.3, same PID namespace, no matching needed) on a
+laptop with an RTX 4050 Laptop GPU (driver 620.70.06) and an AMD Phoenix iGPU: every per-process size
+matched `nvidia-smi` (a llama-server with Qwen2.5-1.5B Q4_K_M at `-ngl 99 -c 4096` showed 1.19 GB
+against 1218 MiB, and `gputaskman diff` put the device change at +1.20 GB, against +1224 MiB from
+`nvidia-smi`). The model was identified with `api+mapped+cmdline` evidence, and with
+`-lv 4 --log-file` the exact CUDA0 buffer sizes (935 MB weights, 112 MB KV cache) matched the
+GGUF-based estimates. During generation the TUI showed the server at 96% GPU% against 95% from
+`nvidia-smi pmon`.
 
 **AMD GPUs on native Linux** (the `amdgpu` driver) need no ROCm, AMD SMI, or extra package: the
 kernel already exposes what's needed.
@@ -438,7 +446,11 @@ selecting a row inspects its memory on that GPU. Single-GPU layouts are unchange
 Memory totals and histories stay separate per device; model files and runtime buffer logs
 can span devices and do not prove per-device model placement. Discovery's 150 ms scan budget
 is divided across GPUs, though each GPU has its own counter and telemetry queries.
-This layout is covered by synthetic tests, **not yet validated on multi-GPU hardware**.
+Live check on a mixed-vendor Linux laptop (RTX 4050 Laptop GPU through NVML, AMD Phoenix iGPU
+through DRM; CachyOS, kernel 7.3.3): both GPUs got their own header and charts, and the compositor
+had a separate row on each GPU (measured on the NVIDIA one, `n/a` on the iGPU, where it opened
+`/dev/dri/card*` and root-owned holders can't be ruled out without root). Systems with two
+discrete GPUs, and multi-GPU on Windows, are **not yet validated**.
 On Windows, the live TUI checks DXGI adapter topology every five seconds in the existing
 sampling worker (or on the next sample with a longer interval). Removed adapters retain their
 session GPU number with unavailable readings; surviving adapters keep their collectors and
@@ -838,7 +850,7 @@ downloads are bundled in this repository.
 - Model identity for non-GGUF runtimes (ONNX Runtime, PyTorch, TensorRT) beyond installed candidates.
 - Explicit provenance and availability for every counter and estimate.
 - Reliable multi-GPU matching and per-device model placement.
-- Bare-metal Linux validation on NVIDIA hardware; Intel GPUs (`i915`/`xe`) through the same DRM fdinfo path as AMD.
+- Intel GPUs (`i915`/`xe`) through the same DRM fdinfo path as AMD.
 - macOS: a portable build, Ollama/llama.cpp/MLX validation, and compressed GPU memory (footprint's
   `swapped`) as the paged column.
 - WSL: per-process GPU load for Linux rows, and Ollama's systemd journal as a log source.

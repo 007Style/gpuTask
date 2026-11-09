@@ -91,13 +91,21 @@ METAL_NOTE = ("macOS: unified memory, so GPU memory is part of system RAM. Rows 
               "memory needs root.")
 INTEL_MEMORY_NOTE = ("Intel VRAM used is the sum of local memory resident in the processes gputaskman can inspect "
                      "(the driver has no device-wide counter): buffers shared between processes can be counted "
-                     "twice, and processes it can't inspect are missing.")
+                     "twice, and kernel-owned memory and processes it can't inspect are missing. The total is the "
+                     "size of the card's local-memory PCI window, an estimate that can differ from its memory, so "
+                     "free memory is not shown.")
 
 
 def intel_memory_note(s: Snapshot) -> str:
-    """Intel's device VRAM used is a sum over visible DRM clients, not a device counter."""
+    """Intel's device VRAM used is a sum over visible DRM clients and its total a PCI window size: neither is a
+    device counter, so the output says so whenever it shows either."""
     return INTEL_MEMORY_NOTE if (s.backend == "drm" and s.nv and s.nv.source == "Intel sysfs"
-                                 and s.vram_used is not None) else ""
+                                 and (s.vram_used is not None or s.vram_total)) else ""
+
+
+def vram_total_label(s: Snapshot) -> str:
+    """A total of 0 means unknown (an Intel iGPU, or a card whose memory window can't be read), not 0 bytes."""
+    return gb(s.vram_total) if s.vram_total else "N/A"
 
 
 def to_dict(s: Snapshot) -> dict:
@@ -147,10 +155,11 @@ def to_dict(s: Snapshot) -> dict:
     return {
         "taken": s.taken, "gpu": s.adapter.name if s.adapter else None, "driver": s.driver, "cuda": s.cuda,
         "adapter": dataclasses.asdict(s.adapter) if s.adapter else None,
-        "vram_total": s.vram_total, "vram_used": s.vram_used, "shared_used": s.shared_used,
+        "vram_total": s.vram_total or None, "vram_used": s.vram_used, "shared_used": s.shared_used,
         "attributed": s.attributed, "backend": s.backend, "shared_is_spill": s.shared_is_spill,
         "host_status": s.host_status or None,
         "process_status": s.process_status or None,
+        "memory_note": intel_memory_note(s) or None,
         "counter_status": s.counter_status or None, "counter_adapter_matched": s.counter_adapter_matched,
         "wsl_split": s.wsl_split or None, "device": nv, "processes": procs,
     }
@@ -174,7 +183,7 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
         out.append(f"{name}{info}  {nv.driver_model if nv else ''}")
         used = gb(s.vram_used) if s.vram_used is not None else "N/A"
         shared = gb(s.shared_used) if s.shared_used is not None else "N/A"
-        memory = f"VRAM {used} / {gb(s.vram_total)}"
+        memory = f"VRAM {used} / {vram_total_label(s)}"
         if s.backend in ("wddm", "drm") or s.host_data:
             memory += f"   shared (in system RAM) {shared}"
         out.append(memory)

@@ -58,7 +58,8 @@ class DrmCard:
     # so its busy time is video work of either kind, not encode.
     unified_video: bool = False
     # Intel (i915/xe): no device-wide memory sysfs exists. vram_total holds the local-memory (resizable
-    # BAR) window for discrete cards, 0 for integrated ones; per-process bytes still come from fdinfo.
+    # BAR) window, an estimate of the card's memory; 0 means unknown (an integrated GPU, or a discrete card
+    # whose window is under 1 GiB). Per-process bytes still come from fdinfo.
     intel: bool = False
     # Intel only: used local memory, stamped in each DrmCounters.sample() as the sum of the card's
     # clients' local bytes (shared buffers can double-count); None = no readable client, unknown.
@@ -116,13 +117,15 @@ def parse_fdinfo(text: str) -> dict | None:
         return parse_size(fields.get(resident, fields.get(legacy)))
 
     def intel_resident(*keys: str) -> int | None:
-        """Resident bytes of an Intel logical region: the sum of its memory placements. A placement key
-        that is absent counts as 0 (older kernels don't report stolen); all keys absent means the card
-        has no such region (an iGPU has no local0) and returns None -- unknown, not 0."""
-        values = [parse_size(fields.get(k)) for k in keys]
-        if all(v is None for v in values):
+        """Resident bytes of an Intel memory type: the sum of its regions. i915 prints a line for every region the
+        device has, so an absent key has nothing to add and no key at all means the device has none (an iGPU has
+        no local0): None, unknown, not 0. A key that won't parse makes the whole figure unknown rather than a
+        smaller number."""
+        present = [k for k in keys if k in fields]
+        if not present:
             return None
-        return sum(v for v in values if v is not None)
+        values = [parse_size(fields[k]) for k in present]
+        return None if None in values else sum(values)
 
     # drm-shared-<region> counts buffers with more than one handle by their *preferred* region, resident or not,
     # while drm-resident-<region> counts by where buffers are now, so the two can't be subtracted. A shared
@@ -149,10 +152,11 @@ def parse_fdinfo(text: str) -> dict | None:
             # xe reports drm-cycles-* instead and gen7 i915 nothing. No such line means the load is unknown, not 0
             # (AGENTS.md rule 2).
             engines = None
-        # Intel's logical regions are local0 (device memory; the local/stolen pair covers memory that
-        # shrunk out of local into system) and system0 (GPU-placed system memory, the GTT equivalent).
-        # There is no separate CPU-only region: system0 feeds the shared/spill slot instead. These are
-        # i915's names; xe calls them vram0/gtt/system, so its memory stays unknown until validated.
+        # i915's regions: local0 is device memory and system0 is system memory the GPU's buffers currently
+        # sit in (the GTT slot); stolen-local0 and stolen-system0 are the firmware-reserved parts of each.
+        # system0 includes buffers placed there on purpose, not only memory that spilled from local0.
+        # There is no separate CPU-only region. These are i915's names; xe calls them vram0/gtt/system, so
+        # its memory stays unknown until validated.
         return {
             "driver": fields["drm-driver"],
             "client_id": client_id,
@@ -290,13 +294,17 @@ def cards(root: str = "/sys/class/drm", pci_ids: str | None = None) -> list[DrmC
         if intel and not vram_total:
             # i915/xe expose no VRAM sysfs. The resource2 file IS the local-memory BAR, so its size is
             # the window (the file is binary -- its contents are not a number): >= 1 GiB marks a
-            # discrete card's local VRAM, ~256 MB is an iGPU's system-memory window.
-            try:
-                bar = os.path.getsize(os.path.join(device, "resource2_wc"))
-                if bar <= 0:
-                    bar = os.path.getsize(os.path.join(device, "resource2"))
-            except OSError:
-                bar = 0
+            # discrete card's local VRAM, ~256 MB is an iGPU's system-memory window. The window is an
+            # estimate of the card's memory, not a reading of it: resizable BAR rounds to a power of two and
+            # a partial BAR can be smaller than the card (report.INTEL_MEMORY_NOTE says so).
+            bar = 0
+            for bar_file in ("resource2_wc", "resource2"):
+                try:
+                    bar = os.path.getsize(os.path.join(device, bar_file))
+                except OSError:
+                    continue
+                if bar > 0:
+                    break
             vram_total = bar if bar >= _LOCAL_BAR_MIN else 0
         found.append(DrmCard(
             key=pci_key(pdev),
@@ -308,7 +316,8 @@ def cards(root: str = "/sys/class/drm", pci_ids: str | None = None) -> list[DrmC
             name=_card_name(device, vendor_id, device_id, pci_ids),
             vram_total=vram_total,
             # amdgpu reports the VRAM chips' vendor only for a discrete card; an APU's "VRAM" is a RAM
-            # carve-out. Intel reports no vendor node at all: a card with a local-memory BAR is discrete.
+            # carve-out. Intel reports no vendor node at all: a card with a local-memory BAR is discrete,
+            # and fdinfo showing local memory (see _stamp_intel_memory) overrides a small window.
             integrated=(vram_total == 0) if intel else not os.path.exists(os.path.join(device, "mem_info_vram_vendor")),
             unified_video=_vcn_major(device) >= 4,
             intel=intel,
@@ -324,8 +333,8 @@ def adapters(found: list[DrmCard]) -> list[Adapter]:
             luid=c.key,
             name=c.name,
             vendor_id=c.vendor_id,
-            # Intel: the local-memory BAR for discrete cards, 0 for an integrated GPU (its carve-out size
-            # is not exposed; totals stay unknown rather than invented).
+            # Intel: the local-memory BAR window (an estimate), 0 (unknown) when it is under 1 GiB: an
+            # integrated GPU's carve-out size is not exposed, and totals stay unknown rather than invented.
             dedicated_vram=c.vram_total,
             shared_system=_int(os.path.join(c.sysfs, "mem_info_gtt_total")) or 0 if not c.intel else 0,
             software=False,
@@ -425,7 +434,9 @@ def read_device(card: DrmCard, index: int) -> DeviceTelemetry:
         gt = os.path.join(os.path.dirname(d), "gt", "gt0")
         cur = _int(os.path.join(gt, "rps_cur_freq_mhz"))
         if cur is not None:
-            dev.gfx_clock = cur  # engine frequency from the gt node (hwmon has no sclk on Intel)
+            # rps_cur_freq_mhz is the frequency the driver last requested (rps_act_freq_mhz is the actual one,
+            # per the kernel's intel_gt_sysfs_pm.c); hwmon has no sclk on Intel. Not displayed yet.
+            dev.gfx_clock = cur
         dev.sm_clock_max = _int(os.path.join(gt, "rps_RP0_freq_mhz"))
         # sysfs current_link_* on i915/xe can report the power-on default instead of the live link
         # (2.5 GT/s x1 shown while a measured DMA transfer ran at ~19 GB/s), so both stay unset:
@@ -575,6 +586,10 @@ class DrmCounters:
                 continue
             used = [c[1]["vram"] for _key, c in clients.items() if c[1]["pdev"] == card.pdev]
             card.vram_used = sum(used) if used and None not in used else None
+            if any(v is not None for v in used):
+                # A client reports local memory, so the card has some: discrete, whatever its BAR window says
+                # (a card without resizable BAR has a small window and no known total).
+                card.integrated = False
 
     def _start_time(self, pid: int) -> str | None:
         """Field 22 of /proc/<pid>/stat: tells a reused pid from the process cached under it."""

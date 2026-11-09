@@ -49,9 +49,9 @@ these rules:
 ```
 cli.py ──► Collector.sample()  (collector.py)
             ├─ adapters        dxgi.py (Windows) / linux.enumerate_adapters / macos.enumerate_adapters
-            ├─ counters        pdh.py GpuCounters (Windows PDH) / linux.py LinuxCounters (NVML, + drm.py for amdgpu) /
+            ├─ counters        pdh.py GpuCounters (Windows PDH) / linux.py LinuxCounters (NVML, + drm.py for amdgpu and Intel) /
             │                  macos.py MacCounters (IOKit Metal clients + footprint poller)
-            ├─ device metrics  nvml.py; drm.py read_device (AMD, Linux) (macOS: MacCounters.device from IOKit)
+            ├─ device metrics  nvml.py; drm.py read_device (AMD and Intel, Linux) (macOS: MacCounters.device from IOKit)
             ├─ WSL host        wslhost.py: HostStream (powershell PDH via interop), ContextTracker
             ├─ processes       procinfo.py: runtime DLLs, mapped files, cmdline, classify()
             ├─ model naming    stores.py (Ollama, LM Studio, Hugging Face), gguf.py (header, kind, sizes)
@@ -63,7 +63,9 @@ cli.py diff ──► diff.py: compares two saved --json snapshots (no collectio
 
 The backend is chosen at import time in `collector.py`: `BACKEND` is `wddm` on Windows, `nvml` on
 native Linux, `wsl` under WSL, and `metal` on macOS. On native Linux, `Collector.backend` becomes `drm`
-when the selected GPU is an amdgpu card (device readings from sysfs, processes from DRM fdinfo). One-shot
+when the selected GPU is an amdgpu or Intel i915 card (device readings from sysfs, processes from DRM
+fdinfo). An Intel card has no device-wide memory counter: its VRAM used is a sum over visible clients and
+its total is a PCI window size, so both carry `report.INTEL_MEMORY_NOTE`, and a total of 0 is unknown. One-shot
 output (`--once`, `--json`) uses `scan_budget=None` to
 identify everything immediately; the TUI spreads scans across refreshes.
 
@@ -136,5 +138,8 @@ workflow `release.yml`, and environment `pypi`. Only the isolated publishing job
 Validated live: Windows 11 with an RTX 4080 SUPER (WDDM, plus WSL2), a Linux container with an
 RTX 3060 Ti, macOS 26.3.1 on an M4 Mac mini (Metal; own-user processes, not run as root), and
 bare-metal Linux with an amdgpu Radeon RX 9070-series card plus a Radeon 610M (DRM path).
-Not yet validated on hardware: bare-metal Linux with NVIDIA, multi-GPU systems, and GPU-backed WinML on
-Copilot+ PCs. Planned work is listed under **Next** in the README.
+Intel i915 (an Arc A770 with resizable BAR plus a UHD 730) was validated by a contributor, not repeated by
+the maintainer.
+Not yet validated on hardware: bare-metal Linux with NVIDIA, multi-GPU systems, Intel `xe` and Arc cards
+without resizable BAR, and GPU-backed WinML on Copilot+ PCs. Planned work is listed under **Next** in the
+README.

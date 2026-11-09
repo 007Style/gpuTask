@@ -238,13 +238,15 @@ covered by unit tests only and **not yet validated on AMD hardware**.
 | | Source |
 |---|---|
 | Device temperature, power, GT clock | `hwmon` and `gt/gt0` under `/sys/class/drm/card*`. Power is the rate of the cumulative energy counter between two refreshes, so it is `n/a` on the first |
-| Device VRAM total | Size of the local-memory BAR (`resource2`). A card whose window is under 1 GiB (an integrated GPU, or a discrete one without resizable BAR) is treated as integrated and has no total |
-| Device VRAM used | The sum of its clients' resident local memory: i915 has no device-wide counter, so buffers shared between processes can be counted twice and processes gputaskman can't inspect are missing (the UI and `--once` say so). `n/a` when any client's local memory is unknown |
-| Per-process VRAM and SPILL | `drm-resident-local0` and `drm-resident-system0`, plus their `stolen-` regions, under the same private-client rules as AMD. Both `drm-shared-local0` and `drm-shared-system0` must be present to charge a process, so an integrated GPU (no `local0`) shows `n/a` (`legacy`) |
+| Device VRAM total | The size of the local-memory PCI window (`resource2`), an **estimate**: kernel-owned memory is missing from the sysfs view, resizable BAR rounds to a power of two, and a partial window can be smaller than the card, so the total can differ from the card's memory. A window under 1 GiB (an integrated GPU, or a discrete card without resizable BAR) shows `N/A` (`null` in JSON). Free memory is never shown for Intel |
+| Device VRAM used | The sum of its clients' resident local memory: i915 has no device-wide counter, so buffers shared between processes can be counted twice, and kernel-owned memory and processes gputaskman can't inspect are missing. The UI, `--once`, `--json` (`memory_note`) and `gputaskman diff` all say so. `n/a` when any client's local memory is unknown |
+| Integrated or discrete | An iGPU has no `local0`, so a card with a local-memory window of 1 GiB or more is discrete, and so is any card whose fdinfo reports local memory, even when its window is smaller |
+| Per-process VRAM and SPILL | `drm-resident-local0` and `drm-resident-system0`, plus their `stolen-` regions (the firmware-reserved part of each), under the same private-client rules as AMD. `system0` is memory the GPU's buffers currently sit in, including buffers placed there on purpose, so SPILL here (like AMD's GTT) is where they are, not proof they were pushed out of VRAM. Both `drm-shared-local0` and `drm-shared-system0` must be present to charge a process, so an integrated GPU (no `local0`) shows `n/a` (`legacy`). A region value that can't be parsed makes that figure `n/a`, not a smaller number |
 | Per-process engine load (3d, compute, copy, video) | `drm-engine-render`, `-compute`, `-copy`, `-video`, `-video-enhance` busy time, sampled twice. `n/a` where the driver reports none (before Gen 8). A class with several identical engines (`drm-engine-capacity-*`, such as video on an Arc) is not divided by its capacity, so one busy engine reads 100% |
 
 Device GPU load, memory bandwidth, and the PCIe link are `n/a`: i915 has no device-wide busy counter, and its
-sysfs link fields can report the power-on default instead of the live link. The GT clock is read but not shown yet.
+sysfs link fields can report the power-on default instead of the live link. The GT clock is read but not shown yet, and
+what is read (`rps_cur_freq_mhz`) is the frequency the driver last *requested*; the kernel's actual frequency is `rps_act_freq_mhz`.
 `xe` cards are detected, but its fdinfo uses other keys (`drm-cycles-*`, `drm-resident-vram0`/`-gtt`), so its
 per-process rows show `n/a` until they are decoded on hardware.
 

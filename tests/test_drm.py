@@ -169,6 +169,19 @@ def _make_card(root: Path, name, pdev, vendor, device, vram, driver="amdgpu", gt
     return dev
 
 
+def _make_intel_card(root: Path, name, pdev, device, driver="i915") -> Path:
+    """An Intel card's sysfs: there are no mem_info_* files, the local-memory BAR is the resource2 file."""
+    dev = root / "drm" / name / "device"
+    dev.mkdir(parents=True)
+    (dev / "vendor").write_text("0x8086\n")
+    (dev / "device").write_text(f"0x{device:04x}\n")
+    driver_dir = root / "drivers" / driver
+    driver_dir.mkdir(parents=True, exist_ok=True)
+    os.symlink(driver_dir, dev / "driver")
+    (dev / "uevent").write_text(f"DRIVER={driver}\nPCI_SLOT_NAME={pdev}\n")
+    return dev
+
+
 def _card(dev, pdev, name="AMD GPU", vram=16 * GiB, vendor=0x1002, device=0x7550) -> drm.DrmCard:
     return drm.DrmCard(
         key=drm.pci_key(pdev), pdev=pdev, sysfs=str(dev), driver="amdgpu",
@@ -1035,7 +1048,7 @@ class IntelFdinfoTests(unittest.TestCase):
     def test_i915_discrete_client(self):
         info = drm.parse_fdinfo(I915_FDINFO)
         self.assertEqual((info["driver"], info["client_id"], info["pdev"]), ("i915", 42, "0000:03:00.0"))
-        self.assertEqual(info["vram"], 2048 * MiB + 64 * 1024)  # local0 plus the stolen-local0 it shrank into
+        self.assertEqual(info["vram"], 2048 * MiB + 64 * 1024)  # local0 plus stolen-local0 (the fixture's 64 KiB is synthetic)
         self.assertEqual(info["gtt"], 6 * MiB)  # system0
         self.assertEqual(info["shared"], 0)  # both shared regions are reported, and empty
         # Only the drm-engine-<class> counters are engines; the capacity lines are not.
@@ -1054,6 +1067,20 @@ class IntelFdinfoTests(unittest.TestCase):
         self.assertIsNone(info["engines"])  # unknown, not an empty (zero) load
         self.assertEqual(info["gtt"], 4 * MiB)  # the memory is still read
 
+    def test_i915_unparseable_region_makes_that_figure_unknown(self):
+        # Treating a region that won't parse as 0 would show a smaller number than the process holds.
+        info = drm.parse_fdinfo(I915_FDINFO.replace("drm-resident-local0:\t2048 MiB", "drm-resident-local0:\tlots"))
+        self.assertIsNone(info["vram"])  # stolen-local0 still parses, but the local0 half is unknown
+        self.assertEqual(info["gtt"], 6 * MiB)  # the other figure is unaffected
+        info = drm.parse_fdinfo(I915_FDINFO.replace("drm-resident-system0:\t6 MiB", "drm-resident-system0:\t?"))
+        self.assertIsNone(info["gtt"])
+        self.assertEqual(info["vram"], 2048 * MiB + 64 * 1024)
+
+    def test_i915_region_it_does_not_print_adds_nothing(self):
+        # i915 prints a line for every region the device has, so a missing stolen-local0 line is a region it lacks.
+        text = "\n".join(line for line in I915_FDINFO.splitlines() if "stolen-local0" not in line)
+        self.assertEqual(drm.parse_fdinfo(text)["vram"], 2048 * MiB)
+
     def test_xe_client_reports_neither_memory_nor_load(self):
         info = drm.parse_fdinfo(XE_FDINFO)
         self.assertEqual((info["driver"], info["client_id"], info["pdev"]), ("xe", 3, "0000:03:00.0"))
@@ -1063,20 +1090,90 @@ class IntelFdinfoTests(unittest.TestCase):
                 self.assertIsNone(info[field])
 
 
+class IntelBarTests(unittest.TestCase):
+    """cards() takes an Intel card's total from the size of its local-memory BAR file. The sizes are faked: a real
+    BAR is GiBs of address space, not data."""
+
+    def _cards(self, bars: dict[str, int], driver="i915"):
+        real_getsize = os.path.getsize
+
+        def getsize(path):
+            name = os.path.basename(path)
+            if name not in ("resource2_wc", "resource2"):
+                return real_getsize(path)
+            if name not in bars:
+                raise FileNotFoundError(path)
+            return bars[name]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _make_intel_card(root, "card0", "0000:03:00.0", 0x56A0, driver)
+            with patch.object(os.path, "getsize", getsize):
+                return drm.cards(str(root / "drm"), str(root / "pci.ids"))
+
+    def test_resizable_bar_marks_a_discrete_card_and_sizes_it(self):
+        (card,) = self._cards({"resource2_wc": 16 * GiB})
+        self.assertTrue(card.intel)
+        self.assertEqual((card.vram_total, card.integrated), (16 * GiB, False))
+
+    def test_resource2_alone_is_enough(self):
+        (card,) = self._cards({"resource2": 8 * GiB})  # no write-combining alias to read
+        self.assertEqual((card.vram_total, card.integrated), (8 * GiB, False))
+
+    def test_empty_resource2_wc_falls_back_to_resource2(self):
+        (card,) = self._cards({"resource2_wc": 0, "resource2": 8 * GiB})
+        self.assertEqual(card.vram_total, 8 * GiB)
+
+    def test_small_or_missing_window_is_an_unknown_total_not_a_size(self):
+        (card,) = self._cards({"resource2_wc": 256 * MiB})  # an iGPU's system-memory window
+        self.assertEqual((card.vram_total, card.integrated), (0, True))
+        (card,) = self._cards({})  # no BAR file at all
+        self.assertEqual((card.vram_total, card.integrated), (0, True))
+
+    def test_xe_card_is_sized_the_same_way(self):
+        (card,) = self._cards({"resource2_wc": 16 * GiB}, driver="xe")
+        self.assertEqual((card.driver, card.intel, card.vram_total), ("xe", True, 16 * GiB))
+
+
 class IntelScanTests(unittest.TestCase):
     """DrmCounters.sample() over Intel clients in a fake /proc. Each test builds its own card, because a sample
     stamps the card's used memory."""
 
     PDEV = "0000:03:00.0"
 
-    def _setup(self, tmp, driver="i915"):
+    def _setup(self, tmp, driver="i915", vram_total=16 * GiB, integrated=False):
         proc = Path(tmp) / "proc"
         proc.mkdir()
         card = drm.DrmCard(key=drm.pci_key(self.PDEV), pdev=self.PDEV, sysfs=str(Path(tmp) / "card1" / "device"),
                            driver=driver, vendor_id=0x8086, device_id=0x56A0, name="Intel Arc A770",
-                           vram_total=16 * GiB, integrated=False, intel=True)
+                           vram_total=vram_total, integrated=integrated, intel=True)
         self.clock = Clock()
         return card, proc, drm.DrmCounters(found=[card], proc=str(proc), clock=self.clock)
+
+    def test_local_memory_in_fdinfo_makes_a_card_with_a_small_window_discrete(self):
+        # An Arc without resizable BAR has a window under 1 GiB, so cards() calls it integrated; only a card with
+        # local memory prints local0, and that is what shows it is discrete.
+        with tempfile.TemporaryDirectory() as tmp:
+            card, proc, counters = self._setup(tmp, vram_total=0, integrated=True)
+            counters.sample()
+            self.assertTrue(card.integrated)  # no client yet: nothing shows otherwise
+            _write_fd(proc, 100, 5, _i915_fdinfo(1, self.PDEV, local_mib=64))
+            counters.sample()
+            self.assertFalse(card.integrated)
+            self.assertEqual(card.vram_total, 0)  # and its total is still unknown, not invented
+
+    def test_integrated_gpu_stays_integrated_when_its_clients_print_no_local_memory(self):
+        pdev = "0000:00:02.0"
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = Path(tmp) / "proc"
+            proc.mkdir()
+            card = drm.DrmCard(key=drm.pci_key(pdev), pdev=pdev, sysfs=str(Path(tmp) / "card0" / "device"),
+                               driver="i915", vendor_id=0x8086, device_id=0xA782, name="Intel UHD Graphics",
+                               vram_total=0, integrated=True, intel=True)
+            counters = drm.DrmCounters(found=[card], proc=str(proc), clock=Clock())
+            _write_fd(proc, 100, 5, I915_IGPU_FDINFO)
+            counters.sample()
+            self.assertTrue(card.integrated)
 
     def test_render_and_video_load_are_measured_between_two_samples(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1155,33 +1252,64 @@ class IntelScanTests(unittest.TestCase):
 
 
 class IntelNoteTests(unittest.TestCase):
-    """Intel's device VRAM-used is a sum over the clients gputaskman can inspect, and the output says so."""
+    """Intel's device VRAM used is a sum over the clients gputaskman can inspect and its total is a PCI window size,
+    and the output says so."""
 
-    def _snapshot(self, source, vram_used=4 * GiB):
+    def _snapshot(self, source, vram_used=4 * GiB, vram_total=16 * GiB):
         from gputaskman.collector import Snapshot
         from gputaskman.telemetry import DeviceTelemetry
 
         return Snapshot(taken=1, adapter=None, adapters=[], nv=DeviceTelemetry(index=0, source=source), driver="",
-                        cuda="", vram_total=16 * GiB, vram_used=vram_used, shared_used=None, backend="drm",
+                        cuda="", vram_total=vram_total, vram_used=vram_used, shared_used=None, backend="drm",
                         procs=[])
+
+    def _panel(self, snapshot):
+        from gputaskman.app import GpuTaskManager
+
+        return "\n".join(item.plain for item in GpuTaskManager().render_device(snapshot).renderables)
 
     def test_text_carries_the_note_for_intel_only(self):
         from gputaskman.report import INTEL_MEMORY_NOTE, to_text
 
         self.assertIn(INTEL_MEMORY_NOTE, to_text(self._snapshot("Intel sysfs")))
         self.assertNotIn(INTEL_MEMORY_NOTE, to_text(self._snapshot("AMD sysfs")))  # amdgpu has a device counter
-        self.assertNotIn(INTEL_MEMORY_NOTE, to_text(self._snapshot("Intel sysfs", vram_used=None)))  # N/A, no caveat
+        # Nothing derived from the client sum or the window is shown (N/A used, unknown total): no caveat to make.
+        self.assertNotIn(INTEL_MEMORY_NOTE, to_text(self._snapshot("Intel sysfs", vram_used=None, vram_total=0)))
 
     def test_device_panel_carries_the_note_for_intel_only(self):
-        from gputaskman.app import GpuTaskManager
         from gputaskman.report import INTEL_MEMORY_NOTE
 
-        def panel(snapshot):
-            return "\n".join(item.plain for item in GpuTaskManager().render_device(snapshot).renderables)
+        self.assertIn(INTEL_MEMORY_NOTE, self._panel(self._snapshot("Intel sysfs")))
+        self.assertNotIn(INTEL_MEMORY_NOTE, self._panel(self._snapshot("AMD sysfs")))
+        self.assertNotIn(INTEL_MEMORY_NOTE, self._panel(self._snapshot("Intel sysfs", vram_used=None, vram_total=0)))
 
-        self.assertIn(INTEL_MEMORY_NOTE, panel(self._snapshot("Intel sysfs")))
-        self.assertNotIn(INTEL_MEMORY_NOTE, panel(self._snapshot("AMD sysfs")))
-        self.assertNotIn(INTEL_MEMORY_NOTE, panel(self._snapshot("Intel sysfs", vram_used=None)))
+    def test_unknown_total_reads_n_a_and_free_is_left_out(self):
+        from gputaskman.report import to_text
+
+        snapshot = self._snapshot("Intel sysfs", vram_used=3 * GiB, vram_total=0)
+        self.assertIn("VRAM 3.00 GB / N/A", to_text(snapshot))
+        panel = self._panel(snapshot)
+        self.assertIn("3.00 GB / N/A", panel)
+        self.assertNotIn("/ 0 MB", panel)
+        self.assertNotRegex(panel, r"free \d")  # a free figure needs a total (the note's own "free memory" wording is not one)
+
+    def test_window_total_is_not_turned_into_a_free_figure(self):
+        panel = self._panel(self._snapshot("Intel sysfs"))  # 4 GB used of a 16 GB window
+        self.assertIn("4.00 GB / 16.00 GB", panel)
+        self.assertNotRegex(panel, r"free \d")
+        self.assertIn("free 12.00 GB", self._panel(self._snapshot("AMD sysfs")))  # AMD's total is a device counter
+
+    def test_json_says_unknown_and_carries_the_note(self):
+        from gputaskman.report import INTEL_MEMORY_NOTE, to_dict
+
+        unknown = to_dict(self._snapshot("Intel sysfs", vram_used=3 * GiB, vram_total=0))
+        self.assertIsNone(unknown["vram_total"])  # unknown, not 0 bytes
+        self.assertEqual(unknown["vram_used"], 3 * GiB)
+        self.assertEqual(unknown["memory_note"], INTEL_MEMORY_NOTE)
+        window = to_dict(self._snapshot("Intel sysfs"))
+        self.assertEqual((window["vram_total"], window["memory_note"]), (16 * GiB, INTEL_MEMORY_NOTE))
+        amd = to_dict(self._snapshot("AMD sysfs"))
+        self.assertEqual((amd["vram_total"], amd["memory_note"]), (16 * GiB, None))
 
 
 if __name__ == "__main__":

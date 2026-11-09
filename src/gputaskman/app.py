@@ -22,7 +22,7 @@ from .llm import gb
 from .nvml import NvDevice, format_metric
 from .recovery import LiveCollectors
 from .report import (DRM_RESIDENT_NOTE, METAL_NOTE, WSL_EMPTY, drm_note, has_engine_counters, has_spill_counters, has_wddm_counters,
-                     inferred_note, intel_memory_note, vram_label, wsl_note)
+                     inferred_note, intel_memory_note, vram_label, vram_total_label, wsl_note)
 
 KIND_STYLE = {
     "LLM": "bold magenta", "decision": "bold orchid", "decision?": "orchid",
@@ -94,8 +94,9 @@ opened through a render node, and no shared buffers. Otherwise they show `n/a` a
 the inspector still shows the resident bytes it can reach (shared buffers included, so not added up). **Intel GPUs
 on Linux** (`i915`) take the same path: sysfs for the device, fdinfo for engine load and, on a discrete Arc, local-memory
 VRAM. An integrated GPU shows engine load only (VRAM `n/a`), `xe` cards are detected but their per-process fdinfo isn't
-decoded yet (rows show `n/a`), and with no device-wide memory counter the device's VRAM used is a sum over the processes
-it can inspect: shared buffers can be counted twice and uninspectable processes are missing. Only processes you can inspect are
+decoded yet (rows show `n/a`). With no device-wide memory counter, an Intel card's VRAM used is a sum over the processes
+it can inspect (shared buffers can be counted twice; kernel-owned memory and uninspectable processes are missing), its total is
+the size of the card's local-memory PCI window (an estimate), and free memory is not shown. Only processes you can inspect are
 listed, and the header says how many it couldn't; run with `sudo` to see other users'. Under **WSL**, Windows
 charges all Linux GPU memory to the VM (`vmwp.exe`), so VRAM and load are device-wide only; rows
 are Linux processes with `/dev/dxg` open and show `n/a` rather than a made-up share. When WSL
@@ -428,7 +429,7 @@ class GpuTaskManager(App):
         vram = Text("GPU mem " if s.backend == "metal" else "VRAM ")
         vram.append_text(stacked_bar(parts, s.vram_total, width))
         used_label = gb(s.vram_used) if s.vram_used is not None else "N/A"
-        vram.append(f" {used_label} / {gb(s.vram_total)}", style="bold")
+        vram.append(f" {used_label} / {vram_total_label(s)}", style="bold")
         legend = Text("     ")
         for k, v in order[:7]:
             legend.append("■ ", style=KIND_STYLE.get(k, "white"))
@@ -436,7 +437,7 @@ class GpuTaskManager(App):
         if other > 32 << 20:
             legend.append("■ ", style="grey35")
             legend.append(f"unattributed {gb(other)}  ")
-        if s.vram_used is not None:
+        if s.vram_used is not None and s.vram_total and not intel_memory_note(s):
             legend.append(f"free {gb(max(s.vram_total - s.vram_used, 0))}", style="grey62")
         if s.shared_used is not None and s.shared_used > 64 << 20:
             legend.append(f"   shared(RAM) {gb(s.shared_used)}", style="yellow")

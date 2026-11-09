@@ -155,6 +155,7 @@ def diff(before: dict, after: dict) -> dict:
     taken_b, taken_a = before.get("taken"), after.get("taken")
     seconds = round(taken_a - taken_b, 1) if isinstance(taken_b, (int, float)) and isinstance(taken_a, (int, float)) else None
     return {"gpu": after.get("gpu"), "backend": after.get("backend"), "seconds": seconds,
+            "memory_note": after.get("memory_note") or before.get("memory_note"),
             "device": device, "processes": procs}
 
 
@@ -209,6 +210,8 @@ def to_text(d: dict) -> str:
     for key, label in DEVICE:
         c = d["device"][key]
         out.append(f"{label:<26}{_gb(c['before']):>11}{_gb(c['after']):>11}{_signed(c['delta']):>11}")
+    if d.get("memory_note"):
+        out.append(d["memory_note"])
 
     procs = [p for p in d["processes"] if _changed(p)]
     out += ["", f"{'PROCESSES (dedicated)':<22}{'PID':>14}  {'MATCH':<11}{'BEFORE':>11}{'AFTER':>11}"

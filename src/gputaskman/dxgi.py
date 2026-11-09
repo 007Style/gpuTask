@@ -88,13 +88,17 @@ def adapter_pci_address(luid: int) -> tuple[int, int, int] | None:
         return None
 
 
-def enumerate_adapters() -> list[Adapter]:
+def enumerate_adapters(*, strict: bool = False) -> list[Adapter]:
     try:
         dxgi = ctypes.WinDLL("dxgi")
     except OSError:
+        if strict:
+            raise
         return []
     factory = ctypes.c_void_p()
     if dxgi.CreateDXGIFactory1(ctypes.byref(_IID_IDXGIFactory1), ctypes.byref(factory)) != 0:
+        if strict:
+            raise OSError("DXGI adapter discovery failed")
         return []
     out: list[Adapter] = []
     try:
@@ -102,11 +106,15 @@ def enumerate_adapters() -> list[Adapter]:
         i = 0
         while True:
             adapter = ctypes.c_void_p()
-            if enum_adapters1(factory, i, ctypes.byref(adapter)) != 0:
-                break  # DXGI_ERROR_NOT_FOUND
+            status = enum_adapters1(factory, i, ctypes.byref(adapter))
+            if status != 0:
+                if strict and status & 0xffffffff != 0x887A0002:  # DXGI_ERROR_NOT_FOUND
+                    raise OSError("DXGI adapter enumeration failed")
+                break
             try:
                 desc = _DESC1()
-                if _vcall(adapter, 10, ctypes.c_long, ctypes.POINTER(_DESC1))(adapter, ctypes.byref(desc)) == 0:
+                status = _vcall(adapter, 10, ctypes.c_long, ctypes.POINTER(_DESC1))(adapter, ctypes.byref(desc))
+                if status == 0:
                     luid = ((desc.AdapterLuid.HighPart & 0xffffffff) << 32) | desc.AdapterLuid.LowPart
                     out.append(Adapter(
                         luid=luid,
@@ -117,6 +125,8 @@ def enumerate_adapters() -> list[Adapter]:
                         software=bool(desc.Flags & 2),
                         pci_address=adapter_pci_address(luid),
                     ))
+                elif strict:
+                    raise OSError("DXGI adapter description unavailable")
             finally:
                 _vcall(adapter, 2, wintypes.ULONG)(adapter)  # Release
             i += 1

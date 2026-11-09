@@ -615,7 +615,11 @@ class GpuTaskManager(App):
             t.border_subtitle = WSL_EMPTY
 
     def render_inspector(self) -> None:
-        panel = self.query_one("#inspector", Static)
+        # A queued RowHighlighted can arrive while the screen is being torn down, after the
+        # inspector is gone. Nothing is left to render then, so ignore it instead of raising.
+        panel = next(iter(self.query("#inspector")), None)
+        if panel is None:
+            return
         s = self._row_snapshots.get(self.selected_key, self.snap)
         r = next((x for x in s.procs if x.key == self.selected_key), None) if s else None
         if r is None:

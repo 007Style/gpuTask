@@ -60,6 +60,7 @@ cli.py ──► Collector.sample()  (collector.py)
          ──► Snapshot ──► app.py (Textual TUI) / report.py (text and JSON)
 cli.py ──► HostSampler.sample()  (host.py: system RAM/CPU, OS-reported; sampled beside the Collector, not in Snapshot)
 cli.py diff ──► diff.py: compares two saved --json snapshots (no collection)
+cli.py record ──► record.py: appends one --json snapshot per interval (Collector, or LiveCollectors on Windows, sampled as the TUI does)
 ```
 
 The backend is chosen at import time in `collector.py`: `BACKEND` is `wddm` on Windows, `nvml` on
@@ -83,6 +84,7 @@ identify everything immediately; the TUI spreads scans across refreshes.
 | Change snapshot comparison | `diff.py` | Works only on saved `--json` files, never live state. Compare measured fields directly; keep runtime-reported and estimated values in their own sections; an absent row is `not listed`, not zero. Refuse only when both snapshots name conflicting adapters (vendor, PCI address, a non-Windows key); when they cannot be compared, warn (`name-only`) instead, because a Windows LUID changes at boot and `diff` has no override flag. A PID whose two `started_at` values are both valid and more than `SAME_PROCESS_SECS` apart is a different process: no pairing rule may join it (unknown or malformed start times never conflict, so older snapshots pair as before) |
 | Change system RAM/CPU | `host.py` | Machine memory and load as the OS reports them: never GPU bytes, never added to `Snapshot.attributed`, and `diff` ignores it. Unknown is `None`/`null` and a failure carries a reason, never zeros. The JSON key is `system` because `host` already means the WSL Windows host. Windows uses the NT process list (psutil per process takes about 6 s per pass for 1,000 processes), checked against psutil at startup; CPU rates are keyed by `(pid, create_time)` so a reused PID never inherits another process's history (on the psutil path, `is_running()` is what makes psutil drop its cached object for a reused PID; keep that call) |
 | Change WSL matching | `wslhost.py` `ContextTracker` | Keep `tests/test_wslhost.py` replays passing; they are measured sequences |
+| Change recording | `record.py`, `cli.py` `record_main` | Every line must equal the `--json` object (`report.to_json_dict`, which `dump()` also uses), so unknown stays `null` and nothing is added or summed. Append only, one compact line per sample, flushed as it is written: Ctrl+C or a kill keeps every finished sample, and an interrupted sample writes nothing. Sample the way the TUI does (budgeted scanning, `LiveCollectors` on Windows so a GPU disable/re-enable is recorded as unavailable with a reason); never add a probe, `scan_budget=None`, or `psutil.open_files()` |
 
 ## Verify
 

@@ -432,6 +432,7 @@ uv run --locked gputaskman -i 2         # sample every two seconds
 uv run --locked gputaskman --once       # one text snapshot
 uv run --locked gputaskman --json       # one JSON snapshot; implies --once
 uv run --locked gputaskman diff before.json after.json   # compare two --json snapshots
+uv run --locked gputaskman record -o session.jsonl --duration 300   # append one --json snapshot per second for 5 minutes
 uv run --locked gputaskman --no-host    # WSL: don't read Windows host counters through interop
 uv run --locked gputaskman --no-system  # don't sample system RAM/CPU: no panel, columns, or JSON section
 uv run --locked gputaskman --help
@@ -632,6 +633,45 @@ estimated +504 MB of KV cache, but the server's measured dedicated memory grew b
 Gemma 3 uses sliding-window attention, so the estimate is an upper bound. The comparison makes
 that gap visible instead of hiding it.
 
+### Recording a session
+
+To keep what a long run did to the GPU (a training job, an overnight server, a game session),
+`record` appends one `--json` snapshot per interval to a file:
+
+```powershell
+uv run --locked gputaskman record -o session.jsonl                    # until Ctrl+C
+uv run --locked gputaskman record --gpu 0 --interval 5 --duration 300 -o session.jsonl
+```
+
+Each line is one complete `--json` snapshot: the same fields, the same `null` for anything that could
+not be measured, the same measured, inferred, and estimated labels. `taken` is the sample time in Unix
+seconds. The file is only ever appended to, so recording again continues it (a last line cut short by
+a crash is closed first). Every line is flushed to the operating system as it is written, so Ctrl+C
+or killing the process keeps every sample taken so far; a power loss can still lose the last few
+seconds, and a reader should skip a final line that does not parse. A full disk stops the recording
+with an error and leaves the lines already written.
+
+Recording samples the way the live TUI does, with no extra probes. Scanning is budgeted per sample, so
+model details can appear a sample or two after a process starts; on WSL the first sample comes a few
+seconds late while the Windows host counters warm up. On Windows, a GPU that is disabled and re-enabled
+stays in the recording: the samples in between carry `null` measurements and the reason, then resume
+when the adapter returns. The first version records one GPU (`--gpu`, default 0).
+
+A snapshot of 52 processes is about 27 KB, so one second between samples is roughly 100 MB an hour; use
+`--interval 5` or more for long runs. The lines carry the same paths, command-line flags, model names, and
+local ports as `--json` (see [Privacy](#privacy-and-troubleshooting)), so review a recording before you share it.
+
+Any line of the file is a normal snapshot, so two of them can go to `diff`:
+
+```powershell
+Get-Content session.jsonl -TotalCount 1 | Set-Content first.json
+Get-Content session.jsonl -Tail 1 | Set-Content last.json
+uv run --locked gputaskman diff first.json last.json
+```
+
+On Linux, WSL, and macOS use `head -n 1 session.jsonl > first.json` and `tail -n 1 session.jsonl > last.json`.
+Replaying or summarizing a whole recording is not built yet.
+
 ## How can it know what's inside?
 
 It combines evidence rather than reading arbitrary GPU memory. Windows' graphics kernel supplies
@@ -779,6 +819,7 @@ Identification is designed to stay cheap. Measured on one Windows machine:
 | macOS: memory-map scan (`proc_pidinfo` region walk) | ~4 ms per process | Same policy as the memory-map scan above |
 | macOS: `footprint` GPU memory | ~70 ms per process, background thread | Busy and new processes every ~2 s, idle ones every 30 s (54 runs in 40 s with 27 GPU processes, M4 Mac mini) |
 | System RAM/CPU: process list + psutil totals | Windows (`NtQuerySystemInformation`): ~28 ms median for 995 processes (Windows 11, RTX 4080 SUPER machine, 32 threads); the contributor measured ~6 ms for ~480 processes (Windows 11, i9-13900K). Linux under WSL2 (psutil): ~3.4 ms median for 44 processes, ~9.5 ms for the first sample of 123; the per-pid reuse check (`is_running()`) adds ~0.3 ms for 44 processes, about 7 µs each | Every refresh; `--no-system` turns it off. psutil's per-process `memory_info`/`cpu_times` took ~6 s per pass for 995 processes on Windows, so it is only the non-Windows path. macOS unmeasured |
+| `record`: build and write one `--json` line | ~0.4 ms to build the object plus ~0.1 ms to serialize it, median of 30 for a 52-process, 27 KB line (Windows 11, RTX 4080 SUPER machine). A recorded sample is otherwise a normal refresh: 283 ms wall time for the first, ~90 ms from the fifth | Once per `--interval`, only while recording; no extra probes. Other platforms unmeasured |
 
 With two llama-servers running, a steady refresh costs roughly 15-30 ms of CPU (about 340 ms before
 process details were cached).
@@ -934,6 +975,7 @@ downloads are bundled in this repository.
 | `collector.py` | Shared snapshot collection |
 | `app.py` / `report.py` / `cli.py` | TUI, text/JSON, and command-line entry points |
 | `diff.py` | Before/after comparison of two `--json` snapshots |
+| `record.py` | `gputaskman record`: appends one `--json` snapshot per interval to a JSON Lines file |
 
 ## Next
 
@@ -946,6 +988,7 @@ downloads are bundled in this repository.
   `swapped`) as the paged column.
 - WSL: per-process GPU load for Linux rows, and Ollama's systemd journal as a log source.
 - Live throughput deltas, LM Studio validation, and per-model context accounting.
+- Replay and summaries of a `gputaskman record` file; today any one line works with `diff`.
 - Opt-in ETW file-open tracing to name models loaded by read-and-close runtimes (any whisper or ONNX
   app), correlated with the process's VRAM jump at load time.
 - Data-driven app adapters (settings path plus load/unload log patterns) once a second app needs one.

@@ -12,9 +12,9 @@ import psutil
 
 from .amdsmi import AmdSmi, _bdf
 from .adl import Adl
-from .dxgi import VENDOR_NVIDIA, Adapter
+from .dxgi import VENDOR_AMD, VENDOR_NVIDIA, Adapter
 from .handy import HandyEvidence, inspect_handy
-from .llm import LlmView, ServerProber, build_view, gb, ollama_log_path
+from .llm import LlmView, ServerProber, api_key, build_view, gb, ollama_log_path
 from . import nvml as nvml_mod
 from .nvml import Nvml, NvDevice
 from .pdh import ProcGpu
@@ -259,11 +259,12 @@ class Collector:
             from .drm import read_device
 
             nv = read_device(self.drm_card, self.gpu_index)
+        elif self.adapter and self.adapter.vendor_id != VENDOR_NVIDIA:
+            # NVML can't describe this GPU, and a sweep of every NVIDIA device costs ~60 ms per device.
+            nv = (self.adl.sample() or self.amdsmi.sample()) if self.adapter.vendor_id == VENDOR_AMD else None
         else:
             nvs = self.nvml.sample() if self.nvml.ok else []
             nv = select_nv_device(self.adapter, nvs, self.gpu_index, self.adapters)
-            if self.adapter and self.adapter.vendor_id == 0x1002:
-                nv = self.adl.sample() or self.amdsmi.sample()
         total = (nv.mem_total if nv else 0) or (self.adapter.dedicated_vram if self.adapter else 0)
 
         snap = Snapshot(
@@ -333,7 +334,9 @@ class Collector:
             if (row.detail.is_diffusion or row.kind not in AI_KINDS or not (row.detail.models or row.kind == "LLM")
                     or not {"dedicated", "shared"} <= row.gpu.available):
                 continue
-            own = self.prober.get(self.inspector.exclusive_ports(row.pid))
+            ports = self.inspector.exclusive_ports(row.pid)
+            key = api_key(row.detail.cmdline)
+            own = self.prober.get(ports, key)
             host = self.prober.get(self._parent_ports(row.pid))  # Ollama / LM Studio front-end process
             log = ollama_log_path() if row in ollama_runners and len(ollama_runners) == 1 else None
             # On an APU, GTT is the GPU's ordinary memory (often most of it), not spill: count it as held memory.
@@ -341,6 +344,12 @@ class Collector:
             row.llm = build_view(row.detail, held, row.gpu.shared if snap.shared_is_spill else 0,
                                  own or host, log, host=host if own else None,
                                  attributed=row.gpu.shown_vram is not None)
+            locked = None if own else self.prober.locked_port(ports)
+            if locked:
+                why = ("rejected the key from the launch arguments" if key else
+                       "wants an API key, and none was found in the launch arguments (keys from LLAMA_API_KEY "
+                       "or --api-key-file are not read)")
+                row.llm.notes.append(f"Local API on port {locked} {why}. Server details are skipped.")
 
         self.inspector.prune(set(procs))
         return snap

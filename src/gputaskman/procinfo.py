@@ -148,6 +148,16 @@ def _match_runtimes(dll_names: set[str]) -> list[str]:
     return [tag for tag, rx in _RUNTIME_RX if any(rx.match(d) for d in dll_names)]
 
 
+def file_key(path: str) -> tuple[int, int] | str:
+    """Identity of the file itself, so one model reached by two spellings (extended-length prefix, link,
+    case) is one model. Falls back to the normalized path when the file can't be read or has no file id."""
+    try:
+        st = os.stat(path)
+    except (OSError, ValueError):
+        return os.path.normcase(os.path.abspath(path))
+    return (st.st_dev, st.st_ino) if st.st_ino else os.path.normcase(os.path.abspath(path))
+
+
 def _models_from_cmdline(cmd: list[str]) -> list[str]:
     paths = []
     flags = {"-m", "--model", "--mmproj", "-md", "--model-draft", "--lora"}
@@ -396,12 +406,13 @@ class ProcInspector:
                 continue
             store = store_name(path)
             if _is_model_file(ext, size, gg, store):
-                models[path.lower()] = make_model(path, size, m.rss, gg, "mapped", store)
+                models[file_key(path)] = make_model(path, size, m.rss, gg, "mapped", store)
         for path in _models_from_cmdline(d.cmdline):
-            if path.lower() in models:
-                models[path.lower()].add_source("cmdline")
+            key = file_key(path)
+            if key in models:
+                models[key].add_source("cmdline")
             else:
-                models[path.lower()] = make_model(path, os.path.getsize(path), 0, is_gguf(path), "cmdline")
+                models[key] = make_model(path, os.path.getsize(path), 0, is_gguf(path), "cmdline")
         d.runtimes = _match_runtimes(dlls)
         d.models = sorted(models.values(), key=lambda m: -m.size)
         ai = any(r in AI_RUNTIMES for r in d.runtimes)

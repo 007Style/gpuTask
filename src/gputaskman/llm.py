@@ -21,7 +21,7 @@ import urllib.request
 from dataclasses import dataclass, field
 
 from .gguf import GgufInfo, is_gguf, read_gguf
-from .procinfo import MappedModel, ProcDetail, make_model
+from .procinfo import MappedModel, ProcDetail, file_key, make_model
 
 MiB = 1 << 20
 KV_TYPE_BYTES = {"f32": 4, "f16": 2, "bf16": 2, "q8_0": 34 / 32, "q4_0": 18 / 32, "q4_1": 20 / 32,
@@ -383,8 +383,8 @@ def _merge_api(files: list[MappedModel], server: ServerInfo | None, host: Server
     """Mark files a runtime API also reports; return the API entries that matched this process."""
     matched: list[dict] = []
     if server and server.kind == "llama-server" and server.model_path:
-        key = os.path.normcase(os.path.abspath(server.model_path))
-        hit = next((f for f in files if os.path.normcase(os.path.abspath(f.path)) == key), None)
+        key = file_key(server.model_path)
+        hit = next((f for f in files if file_key(f.path) == key), None)
         if hit:
             hit.add_source("api")
         elif os.path.isfile(server.model_path):  # loaded without mmap or via the router: API-only evidence

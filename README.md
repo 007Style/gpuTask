@@ -705,6 +705,13 @@ The collector probes existing local listening ports with GET requests to `/props
 absent, disabled, or authenticated; other evidence is still useful. It does not launch `ollama`,
 `lms`, or an inference request. Throughput may update only after a request completes.
 
+If llama-server was started with `--api-key`, the probe sends that key as a bearer token to the same
+server's own port, and never follows a redirect with it. The key is never stored, printed, or written
+to JSON, and the inspector shows it as `***`. A key in `--api-key-file` or `LLAMA_API_KEY` is not used:
+gputaskman does not open a path taken from another process's command line, and an environment variable
+can't be seen from outside the process. In that case the probe stops at the first 401, so the server logs
+one rejected request every 30 seconds, and the inspector says why server details are missing.
+
 Ollama's local `server.log` is considered when one Ollama runner is detected. Log formats,
 rotation, and stale load blocks can affect attribution, so compare the reported model and
 process when interpreting logs. Log sizes describe allocations at load time, not necessarily

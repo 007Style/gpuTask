@@ -28,7 +28,7 @@ from gputaskman.collector import Collector, ProcRow, Snapshot, select_adapter, s
 from gputaskman.dxgi import Adapter
 from gputaskman.gguf import GgufInfo, read_gguf
 from gputaskman.handy import HandyEvidence, inspect_handy, _log_cache, _settings_cache
-from gputaskman.llm import (LlmView, ServerInfo, ServerProber, api_key, build_view, is_gpu_device,
+from gputaskman.llm import (LlmView, ServerInfo, ServerProber, _get, api_key, build_view, is_gpu_device,
                             llama_server_models, lmstudio_models, parse_flags, parse_load_log, probe_server,
                             redact_cmdline)
 from gputaskman.nvml import NvDevice, Nvml
@@ -774,11 +774,12 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(api_key(["llama-server", "--api-key=abc,def"]), "abc")
         self.assertIsNone(api_key(["llama-server", "-m", "x.gguf"]))
         self.assertIsNone(api_key(["llama-server", "--api-key"]))
-        with tempfile.TemporaryDirectory() as root:
+        with tempfile.TemporaryDirectory() as root:  # a path from another process's command line is never opened
             path = os.path.join(root, "keys.txt")
-            Path(path).write_text("\n  file-key  \nsecond\n", encoding="utf-8")
-            self.assertEqual(api_key(["llama-server", "--api-key-file", path]), "file-key")
-            self.assertIsNone(api_key(["llama-server", "--api-key-file", os.path.join(root, "missing")]))
+            Path(path).write_text("file-key\n", encoding="utf-8")
+            self.assertIsNone(api_key(["llama-server", "--api-key-file", path]))
+            self.assertIsNone(api_key(["llama-server", f"--api-key-file={path}"]))
+            self.assertEqual(api_key(["llama-server", "--api-key-file", path, "--api-key", "abc"]), "abc")
         self.assertEqual(redact_cmdline(["llama-server", "--api-key", "abc", "--api-key-file=/k", "--port", "8080"]),
                          ["llama-server", "--api-key", "***", "--api-key-file=***", "--port", "8080"])
         self.assertNotIn("api_key", str(parse_flags(["--api-key", "abc"])))
@@ -826,6 +827,43 @@ class IdentityTests(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+    def test_api_key_is_not_forwarded_by_a_redirect(self):
+        import http.server
+        seen: dict[str, list[str | None]] = {"first": [], "other": []}
+
+        def handler(name, redirect_to=None):
+            class Handler(http.server.BaseHTTPRequestHandler):
+                def do_GET(self):
+                    seen[name].append(self.headers.get("Authorization"))
+                    self.send_response(302 if redirect_to else 200)
+                    if redirect_to:
+                        self.send_header("Location", redirect_to)
+                    self.end_headers()
+                    if not redirect_to:
+                        self.wfile.write(b"{}")
+
+                def log_message(self, *args):
+                    pass
+            return Handler
+
+        other = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler("other"))
+        first = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), handler("first", f"http://127.0.0.1:{other.server_address[1]}/props"))
+        for server in (other, first):
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            url = f"http://127.0.0.1:{first.server_address[1]}/props"
+            self.assertIsNone(_get(url, key="s3cret"))
+            self.assertEqual(len(seen["first"]), 1)
+            self.assertIsNotNone(seen["first"][0])  # the server the key belongs to did get it
+            self.assertEqual(seen["other"], [])  # the redirect target was never contacted
+            self.assertEqual(_get(url), {})  # requests without a key behave as before
+            self.assertEqual(seen["other"], [None])
+        finally:
+            for server in (other, first):
+                server.shutdown()
+                server.server_close()
 
     def test_lmstudio_falls_back_to_v0_when_v1_is_an_error(self):
         replies = {"/api/v1/models": {"error": "Unexpected endpoint or method. (GET /api/v1/models)"},

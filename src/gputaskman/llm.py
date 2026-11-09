@@ -117,7 +117,14 @@ def ollama_log_path() -> str:
 
 # ---------------------------------------------------------------- local servers
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
 _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+# urllib forwards the Authorization header across redirects, so a request that carries a key never follows one.
+_keyed_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
 
 
 _SECRET_FLAGS = ("--api-key", "--api-key-file")
@@ -127,30 +134,21 @@ UNAUTHORIZED = object()  # _get result for HTTP 401: the server wants a key
 def api_key(cmd: list[str]) -> str | None:
     """llama-server's API key from its own launch arguments, if it was given one there.
 
-    `--api-key` may list several comma-separated keys; any of them works. `--api-key-file` holds one key per
-    line. A key set only through the LLAMA_API_KEY environment variable can't be seen from outside the process.
+    `--api-key` may list several comma-separated keys; any of them works. `--api-key-file` is not read: its path
+    comes from another process's command line, and opening it would read a file on that process's behalf. A key
+    set only through the LLAMA_API_KEY environment variable can't be seen from outside the process.
     The key is only sent back to that process's own localhost port and is never stored or shown.
     """
     for i, arg in enumerate(cmd):
         key, val = arg, None
         if "=" in arg and arg.startswith("--"):
             key, val = arg.split("=", 1)
-        if key not in _SECRET_FLAGS:
+        if key != "--api-key":
             continue
         if val is None and i + 1 < len(cmd):
             val = cmd[i + 1]
-        if not val:
-            continue
-        if key == "--api-key":
+        if val:
             return next((k.strip() for k in val.split(",") if k.strip()), None)
-        try:
-            with open(val, encoding="utf-8", errors="replace") as f:
-                lines = f.read(64 << 10).splitlines()
-        except OSError:
-            continue
-        found = next((ln.strip() for ln in lines if ln.strip()), None)
-        if found:
-            return found
     return None
 
 
@@ -176,7 +174,8 @@ def _get(url: str, timeout: float = 0.5, key: str | None = None):
     if key:
         headers["Authorization"] = f"Bearer {key}"
     try:
-        with _opener.open(urllib.request.Request(url, headers=headers), timeout=timeout) as r:
+        with (_keyed_opener if key else _opener).open(urllib.request.Request(url, headers=headers),
+                                                       timeout=timeout) as r:
             if r.status != 200:
                 return None
             body = r.read(4 << 20)

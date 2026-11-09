@@ -346,8 +346,8 @@ class Collector:
             locked = None if own else self.prober.locked_port(ports)
             if locked:
                 why = ("rejected the key from the launch arguments" if key else
-                       "wants an API key, and none was found in the launch arguments (a key set through "
-                       "LLAMA_API_KEY can't be read from outside the process)")
+                       "wants an API key, and none was found in the launch arguments (keys from LLAMA_API_KEY "
+                       "or --api-key-file are not read)")
                 row.llm.notes.append(f"Local API on port {locked} {why}. Server details are skipped.")
 
         self.inspector.prune(set(procs))

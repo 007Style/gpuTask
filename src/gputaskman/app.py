@@ -18,7 +18,7 @@ from textual.widgets import DataTable, Footer, Markdown, Select, Static
 from textual.worker import get_current_worker
 
 from .collector import BACKEND, Collector, ProcRow, Snapshot, enumerate_adapters, ordered_adapters
-from .llm import gb
+from .llm import gb, redact_cmdline
 from .nvml import NvDevice, format_metric
 from .recovery import LiveCollectors
 from .report import (DRM_RESIDENT_NOTE, METAL_NOTE, WSL_EMPTY, drm_note, has_engine_counters, has_spill_counters, has_wddm_counters,
@@ -755,7 +755,7 @@ class GpuTaskManager(App):
         if r.detail.ports:
             out.append(Text("listening: " + ", ".join(map(str, r.detail.ports[:8])), style="grey50"))
         if r.detail.cmdline:
-            out.append(Text(" ".join(r.detail.cmdline)[:400], style="grey42", overflow="ellipsis"))
+            out.append(Text(" ".join(redact_cmdline(r.detail.cmdline))[:400], style="grey42", overflow="ellipsis"))
         elif r.detail.access_denied:
             out.append(Text("(protected process - run elevated for runtime/file details)", style="grey42"))
         panel.update(Group(*out))

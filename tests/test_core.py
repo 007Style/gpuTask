@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import asyncio
 import ctypes
 import io
@@ -27,8 +28,9 @@ from gputaskman.collector import Collector, ProcRow, Snapshot, select_adapter, s
 from gputaskman.dxgi import Adapter
 from gputaskman.gguf import GgufInfo, read_gguf
 from gputaskman.handy import HandyEvidence, inspect_handy, _log_cache, _settings_cache
-from gputaskman.llm import (LlmView, ServerInfo, build_view, is_gpu_device, llama_server_models, lmstudio_models,
-                            parse_flags, parse_load_log, probe_server)
+from gputaskman.llm import (LlmView, ServerInfo, ServerProber, api_key, build_view, is_gpu_device,
+                            llama_server_models, lmstudio_models, parse_flags, parse_load_log, probe_server,
+                            redact_cmdline)
 from gputaskman.nvml import NvDevice, Nvml
 from gputaskman.pdh import AdapterGpu, GpuCounters, ProcGpu
 from gputaskman.procinfo import (AI_KINDS, MappedModel, ProcDetail, ProcInspector, _is_model_file, _match_runtimes,
@@ -746,10 +748,68 @@ class IdentityTests(unittest.TestCase):
                            "meta": {"ftype": "Q8_0", "n_ctx": 8192, "size": 447}}]}
         self.assertEqual(llama_server_models(llama, r"C:\m\Laya-Q8_0.gguf")[0]["type"], "decision")
 
+    def test_api_key_from_launch_arguments(self):
+        self.assertEqual(api_key(["llama-server", "--api-key", "abc"]), "abc")
+        self.assertEqual(api_key(["llama-server", "--api-key=abc,def"]), "abc")
+        self.assertIsNone(api_key(["llama-server", "-m", "x.gguf"]))
+        self.assertIsNone(api_key(["llama-server", "--api-key"]))
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "keys.txt")
+            Path(path).write_text("\n  file-key  \nsecond\n", encoding="utf-8")
+            self.assertEqual(api_key(["llama-server", "--api-key-file", path]), "file-key")
+            self.assertIsNone(api_key(["llama-server", "--api-key-file", os.path.join(root, "missing")]))
+        self.assertEqual(redact_cmdline(["llama-server", "--api-key", "abc", "--api-key-file=/k", "--port", "8080"]),
+                         ["llama-server", "--api-key", "***", "--api-key-file=***", "--port", "8080"])
+        self.assertNotIn("api_key", str(parse_flags(["--api-key", "abc"])))
+
+    def test_llama_server_with_api_key(self):
+        """A real local HTTP server that only answers when the bearer token matches, like llama-server --api-key."""
+        import http.server
+        seen: list[tuple[str, str | None]] = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                auth = self.headers.get("Authorization")
+                seen.append((self.path, auth))
+                if auth != "Bearer s3cret":
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                body = {"/props": {"model_path": "/m/x.gguf", "total_slots": 2,
+                                   "default_generation_settings": {"n_ctx": 4096}},
+                        "/slots": [{"is_processing": True}, {"is_processing": False}]}.get(self.path)
+                self.send_response(200 if body is not None else 404)
+                self.end_headers()
+                if body is not None:
+                    self.wfile.write(json.dumps(body).encode())
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        port = server.server_address[1]
+        try:
+            prober = ServerProber()
+            self.assertIsNone(prober.get([port]))
+            self.assertEqual(prober.locked, {port})
+            self.assertEqual([p for p, _ in seen], ["/props"])  # stops at the first 401, no LM Studio/Ollama probes
+            seen.clear()
+            s = probe_server(port, key="s3cret")
+            self.assertEqual((s.kind, s.n_ctx, s.slots_busy, s.slots_total), ("llama-server", 4096, 1, 2))
+            self.assertTrue(all(auth == "Bearer s3cret" for _, auth in seen))
+            self.assertNotIn("s3cret", json.dumps(dataclasses.asdict(s)))
+            prober._cache.clear()
+            self.assertIsNotNone(prober.get([port], "s3cret"))
+            self.assertEqual(prober.locked, set())
+        finally:
+            server.shutdown()
+            server.server_close()
+
     def test_lmstudio_falls_back_to_v0_when_v1_is_an_error(self):
         replies = {"/api/v1/models": {"error": "Unexpected endpoint or method. (GET /api/v1/models)"},
                    "/api/v0/models": {"data": [{"id": "qwen", "state": "loaded", "max_context_length": 8192}]}}
-        with patch("gputaskman.llm._get", side_effect=lambda url: next(
+        with patch("gputaskman.llm._get", side_effect=lambda url, **_: next(
                 (v for k, v in replies.items() if url.endswith(k)), None)):
             s = probe_server(1234)
         self.assertEqual((s.kind, s.models[0]["name"]), ("lmstudio", "qwen"))

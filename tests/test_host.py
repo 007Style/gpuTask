@@ -140,12 +140,15 @@ class LayoutCheckTests(unittest.TestCase):
 
 
 class FakeProc:
-    def __init__(self, pid, name="p.exe", created=1.0, rss=10, cpu=40.0, denied=False, gone=False):
+    def __init__(self, pid, name="p.exe", created=1.0, rss=10, cpu=40.0, denied=False, gone=False, running=True):
         self.pid, self._name, self._created, self.rss = pid, name, created, rss
-        self.cpu, self.denied, self.gone = cpu, denied, gone
+        self.cpu, self.denied, self.gone, self.running = cpu, denied, gone, running
 
     def oneshot(self):
         return contextlib.nullcontext()
+
+    def is_running(self):
+        return self.running
 
     def name(self):
         if self.gone:
@@ -186,6 +189,18 @@ class PsutilPathTests(unittest.TestCase):
         self.sampler.sample()
         self.procs = [FakeProc(1, created=2.0, cpu=100.0)]
         self.assertIsNone(self.sampler.sample().proc(1).cpu_pct)
+
+    def test_a_cached_object_for_a_reused_pid_is_skipped_until_psutil_replaces_it(self):
+        self.procs = [FakeProc(1, created=1.0, cpu=100.0)]
+        self.sampler.sample()
+        self.assertAlmostEqual(self.sampler.sample().proc(1).cpu_pct, 25.0)
+        # psutil keeps handing back the old process's object (its counters are the old process's)
+        self.procs = [FakeProc(1, created=1.0, cpu=-20.0, running=False)]
+        self.assertIsNone(self.sampler.sample().proc(1))
+        self.procs = [FakeProc(1, created=9.0, cpu=0.0)]  # the replacement: its first reading is only a baseline
+        self.assertIsNone(self.sampler.sample().proc(1).cpu_pct)
+        self.procs = [FakeProc(1, created=9.0, cpu=100.0)]
+        self.assertAlmostEqual(self.sampler.sample().proc(1).cpu_pct, 25.0)
 
     def test_protected_and_vanished_processes_are_unknown_or_skipped(self):
         self.procs = [FakeProc(1, denied=True), FakeProc(2, gone=True), FakeProc(3, rss=7)]

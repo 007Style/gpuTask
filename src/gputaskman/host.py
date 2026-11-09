@@ -79,8 +79,10 @@ class HostSampler:
         if _nt_query is not None:
             return self._finish(t0, per_core, vm, sw, self._sample_nt(), 0)
         procs, denied, seen = [], 0, set()
-        for p in psutil.process_iter():  # psutil keeps these objects between calls and replaces one whose pid was reused
+        for p in psutil.process_iter():  # psutil keeps these objects between calls, even for a pid that was reused
             try:
+                if not p.is_running():  # a reused pid: skipped this once, then psutil builds a fresh object (no CPU history)
+                    continue
                 with p.oneshot():
                     name = p.name()
                     mi = p.memory_info()

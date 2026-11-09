@@ -757,7 +757,7 @@ Identification is designed to stay cheap. Measured on one Windows machine:
 | macOS: `ioreg` device stats + Metal clients | ~10 ms | Every refresh |
 | macOS: memory-map scan (`proc_pidinfo` region walk) | ~4 ms per process | Same policy as the memory-map scan above |
 | macOS: `footprint` GPU memory | ~70 ms per process, background thread | Busy and new processes every ~2 s, idle ones every 30 s (54 runs in 40 s with 27 GPU processes, M4 Mac mini) |
-| System RAM/CPU: process list + psutil totals | Windows (`NtQuerySystemInformation`): ~28 ms median for 995 processes (Windows 11, RTX 4080 SUPER machine, 32 threads); the contributor measured ~6 ms for ~480 processes (Windows 11, i9-13900K). Linux under WSL2 (psutil): ~3.4 ms median for 44 processes, ~9.5 ms for the first sample of 123 | Every refresh; `--no-system` turns it off. psutil's per-process `memory_info`/`cpu_times` took ~6 s per pass for 995 processes on Windows, so it is only the non-Windows path. macOS unmeasured |
+| System RAM/CPU: process list + psutil totals | Windows (`NtQuerySystemInformation`): ~28 ms median for 995 processes (Windows 11, RTX 4080 SUPER machine, 32 threads); the contributor measured ~6 ms for ~480 processes (Windows 11, i9-13900K). Linux under WSL2 (psutil): ~3.4 ms median for 44 processes, ~9.5 ms for the first sample of 123; the per-pid reuse check (`is_running()`) adds ~0.3 ms for 44 processes, about 7 µs each | Every refresh; `--no-system` turns it off. psutil's per-process `memory_info`/`cpu_times` took ~6 s per pass for 995 processes on Windows, so it is only the non-Windows path. macOS unmeasured |
 
 With two llama-servers running, a steady refresh costs roughly 15-30 ms of CPU (about 340 ms before
 process details were cached).

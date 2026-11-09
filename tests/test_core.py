@@ -240,6 +240,7 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(s.procs, [])
         self.assertFalse(s.counter_adapter_matched)
         self.assertIn("could not be matched", s.counter_status)
+        self.assertIn("temporarily unavailable", s.counter_status)
         self.assertIn("GPU-PV", to_text(s))
         data = to_dict(s)
         self.assertIsNone(data["attributed"])
@@ -269,6 +270,25 @@ class MemoryTests(unittest.TestCase):
                     s = c.sample()
                 self.assertEqual(c.nvml.sample.called, swept)
                 self.assertIs(s.nv, expected)
+
+    def test_lost_nvml_telemetry_is_explained_not_silent(self):
+        c = Collector.__new__(Collector)
+        c.adapter = Adapter(1, "RTX 3060", 0x10DE, 12 * GiB, 0, False, (5, 0, 0))
+        c.adapters = [c.adapter]
+        c.gpu_index, c.scan_budget, c.host, c.host_status = 0, None, None, ""
+        c.nvml = Mock(ok=True, driver="", cuda_version="")
+        c.nvml.sample.return_value = []
+        c.counters = Mock(outside={})
+        c.counters.sample.return_value = ({1: {}}, {1: AdapterGpu(dedicated=GiB, shared=0)})
+        c.inspector, c.prober = Mock(), Mock()
+        with patch("gputaskman.collector.BACKEND", "wddm"), \
+                patch("gputaskman.collector.sys.platform", "win32"), \
+                patch("gputaskman.nvml.LOST", {"00000000:05:00.0"}):
+            s = c.sample()
+        self.assertIsNone(s.nv)
+        self.assertTrue(s.nv_lost)
+        self.assertIn("restart gputaskman", s.counter_status)
+        self.assertEqual(s.vram_used, GiB)
 
     def test_windows_matching_counter_zero_is_not_unavailable(self):
         c = Collector.__new__(Collector)
@@ -1123,6 +1143,18 @@ class UiTests(unittest.IsolatedAsyncioTestCase):
                 app.hist_clock.clear()
                 self.assertEqual(app.chart_series(index, None)[1], 1)
 
+    async def test_row_highlight_after_the_inspector_is_gone_is_ignored(self):
+        # During teardown a queued RowHighlighted can arrive after the inspector was removed
+        # (observed on Windows 3.11 CI). It must not raise NoMatches out of run_test.
+        with patch.object(GpuTaskManager, "poll"):
+            app = GpuTaskManager()
+            async with app.run_test(size=(140, 42)) as pilot:
+                app.apply(snapshot())
+                await pilot.pause()
+                app.query_one("#inspector").remove()
+                await pilot.pause()
+                app.render_inspector()
+
     async def test_unavailable_device_metrics_render_as_na(self):
         with patch.object(GpuTaskManager, "poll"):
             app = GpuTaskManager()
@@ -1259,7 +1291,10 @@ class UiTests(unittest.IsolatedAsyncioTestCase):
                 collector.close.assert_called_once()
 
     async def test_explicit_gpu_keeps_single_device_layout(self):
-        with patch("gputaskman.app.Collector") as factory:
+        adapters = [Adapter(1, "first", 0x10DE, 16 * GiB, 0, False),
+                    Adapter(2, "second", 0x10DE, 8 * GiB, 0, False)]
+        with patch("gputaskman.app.enumerate_adapters", return_value=adapters), \
+                patch("gputaskman.app.Collector") as factory:
             factory.SCAN_BUDGET = 0.15
             factory.return_value.sample.side_effect = snapshot
             closed = threading.Event()

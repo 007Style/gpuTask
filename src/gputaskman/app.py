@@ -20,6 +20,7 @@ from textual.worker import get_current_worker
 from .collector import BACKEND, Collector, ProcRow, Snapshot, enumerate_adapters, ordered_adapters
 from .llm import gb
 from .nvml import NvDevice, format_metric
+from .recovery import LiveCollectors
 from .report import (DRM_RESIDENT_NOTE, METAL_NOTE, WSL_EMPTY, drm_note, has_engine_counters, has_spill_counters, has_wddm_counters,
                      inferred_note, vram_label, wsl_note)
 
@@ -274,6 +275,19 @@ class GpuTaskManager(App):
     @work(thread=True, exclusive=True)
     def poll(self) -> None:
         worker = get_current_worker()
+        if BACKEND == "wddm":
+            live = LiveCollectors(self.gpu_index, collector_factory=Collector, discover=enumerate_adapters)
+            try:
+                worker.cancelled_event.wait(0.5)
+                while not worker.is_cancelled:
+                    if not self.paused:
+                        snapshots = live.sample()
+                        if not worker.is_cancelled:
+                            self.call_from_thread(self.apply_all, snapshots)
+                    worker.cancelled_event.wait(self.interval)
+            finally:
+                live.close()
+            return
         indices = ([self.gpu_index] if self.gpu_index is not None else
                    list(range(len(ordered_adapters(enumerate_adapters())))) or [0])
         with ExitStack() as stack:
@@ -301,8 +315,13 @@ class GpuTaskManager(App):
     def apply_all(self, snapshots: list[Snapshot]) -> None:
         if not self.is_running:
             return  # A worker may finish sampling after shutdown has removed the widgets.
-        self.snapshots = snapshots
         multi = len(snapshots) > 1
+        if self.snapshots and multi != (len(self.snapshots) > 1) and self.selected_key is not None:
+            if multi:
+                self.selected_key = f"0:{self.selected_key}"
+            else:
+                self.selected_key = self.selected_key[2:] if self.selected_key.startswith("0:") else None
+        self.snapshots = snapshots
         table = self.query_one("#procs", DataTable)
         if multi and "GPU" not in table.columns:
             table.add_column("GPU", key="GPU")
@@ -615,7 +634,11 @@ class GpuTaskManager(App):
             t.border_subtitle = WSL_EMPTY
 
     def render_inspector(self) -> None:
-        panel = self.query_one("#inspector", Static)
+        # A queued RowHighlighted can arrive while the screen is being torn down, after the
+        # inspector is gone. Nothing is left to render then, so ignore it instead of raising.
+        panel = next(iter(self.query("#inspector")), None)
+        if panel is None:
+            return
         s = self._row_snapshots.get(self.selected_key, self.snap)
         r = next((x for x in s.procs if x.key == self.selected_key), None) if s else None
         if r is None:
@@ -740,7 +763,7 @@ class GpuTaskManager(App):
     # ------------------------------------------------------------------ events/actions
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
-        if event.row_key is not None and event.row_key.value is not None:
+        if self.is_running and event.row_key is not None and event.row_key.value is not None:
             self.selected_key = str(event.row_key.value)
             self.render_inspector()
 

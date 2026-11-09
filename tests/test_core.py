@@ -37,7 +37,7 @@ from gputaskman.pdh import AdapterGpu, GpuCounters, ProcGpu
 from gputaskman.procinfo import (AI_KINDS, MappedModel, ProcDetail, ProcInspector, _is_model_file, _match_runtimes,
                                 _models_from_cmdline, classify, file_key, installed_models, make_model)
 from gputaskman.report import to_dict, to_text
-from gputaskman.stores import store_name
+from gputaskman.stores import ollama_names, store_name
 from tools.capture_screenshots import for_publication
 
 
@@ -762,6 +762,42 @@ class IdentityTests(unittest.TestCase):
             self.assertIsNone(store_name(str(Path(root, "elsewhere", "a", "b.gguf")), [os.path.normcase(str(lms))]))
         hf = r"C:\x\hub\models--ggml-org--Laya-GGUF\snapshots\0123\Laya-Q8_0.gguf"
         self.assertEqual(store_name(hf, []), "ggml-org/Laya-GGUF")
+
+    @staticmethod
+    def _ollama_store(root: str, manifests: dict[str, str]) -> None:
+        for model, text in manifests.items():
+            folder = Path(root, "manifests", "registry.ollama.ai", "library", model)
+            folder.mkdir(parents=True)
+            (folder / "latest").write_text(text, encoding="utf-8")
+
+    def test_store_names_skip_unusable_manifests(self):
+        good, hidden = "ab" * 32, "cd" * 32
+        shapes = {
+            "layers null (a Go nil slice)": '{"layers": null}',
+            "layers missing": '{"config": {}}',
+            "layers not a list": json.dumps({"layers": {"digest": f"sha256:{hidden}"}}),
+            "layers is text": json.dumps({"layers": f"sha256:{hidden}"}),
+            "manifest not an object": json.dumps([{"digest": f"sha256:{hidden}"}]),
+            "layer not an object": json.dumps({"layers": [None, f"sha256:{hidden}", 7]}),
+            "digest not usable": json.dumps({"layers": [{"digest": None}, {"digest": 7}, {"digest": "sha256:"}, {}]}),
+            "not JSON": "{not json",
+            "empty file": "",
+        }
+        for shape, text in shapes.items():
+            with self.subTest(shape), tempfile.TemporaryDirectory() as root:
+                self._ollama_store(root, {"good": json.dumps({"layers": [{"digest": f"sha256:{good}"}]}), "odd": text})
+                self.assertEqual(set(ollama_names(root)), {good})
+                blob = make_model(str(Path(root, "blobs", f"sha256-{good}")), 1, 0, False, "cmdline")
+                self.assertEqual(blob.store_name, "good:latest")
+                self.assertIsNone(store_name(str(Path(root, "blobs", f"sha256-{hidden}"))))
+
+    def test_store_names_keep_good_layers_beside_bad_ones(self):
+        digest = "ef" * 32
+        layers = [None, "sha256:" + "01" * 32, {"digest": 7}, {"digest": f"sha256:{digest.upper()}"}]
+        with tempfile.TemporaryDirectory() as root:
+            self._ollama_store(root, {"mixed": json.dumps({"layers": layers})})
+            self.assertEqual(store_name(str(Path(root, "blobs", f"sha256-{digest}"))), "mixed:latest")
+            self.assertEqual(set(ollama_names(root)), {digest})
 
     def test_runtime_api_normalization(self):
         v1 = {"models": [

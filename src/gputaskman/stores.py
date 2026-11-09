@@ -17,6 +17,18 @@ _ollama_cache: dict[str, tuple[float, dict[str, list[str]]]] = {}
 _lms_cache: tuple[float, list[str]] | None = None
 
 
+def _layer_digests(manifest: object) -> list[str]:
+    """Digests an Ollama manifest lists. A null or malformed 'layers' (Go marshals a nil slice as null) lists none."""
+    layers = manifest.get("layers") if isinstance(manifest, dict) else None
+    digests = []
+    for layer in layers if isinstance(layers, list) else ():
+        digest = layer.get("digest") if isinstance(layer, dict) else None
+        digest = digest.removeprefix("sha256:").lower() if isinstance(digest, str) else ""
+        if digest:
+            digests.append(digest)
+    return digests
+
+
 def ollama_names(models_root: str) -> dict[str, list[str]]:
     """{sha256 hex: ["qwen3:14b", ...]} from <root>/manifests/<registry>/<namespace>/<model>/<tag>."""
     now = time.time()
@@ -35,13 +47,11 @@ def ollama_names(models_root: str) -> dict[str, list[str]]:
         for tag in files:
             try:
                 with open(os.path.join(dirpath, tag), encoding="utf-8") as f:
-                    layers = json.load(f).get("layers", [])
-            except (OSError, ValueError, AttributeError):
+                    manifest = json.load(f)
+            except (OSError, ValueError):
                 continue
-            for layer in layers:
-                digest = str(layer.get("digest", "")).removeprefix("sha256:").lower()
-                if digest:
-                    names.setdefault(digest, []).append(f"{prefix}{model}:{tag}")
+            for digest in _layer_digests(manifest):
+                names.setdefault(digest, []).append(f"{prefix}{model}:{tag}")
     _ollama_cache[models_root] = (now, names)
     return names
 

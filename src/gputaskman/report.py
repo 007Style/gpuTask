@@ -35,7 +35,8 @@ def has_wddm_counters(s: Snapshot, row: ProcRow) -> bool:
 
 
 def has_spill_counters(s: Snapshot, row: ProcRow) -> bool:
-    """Per-process GPU memory in system RAM: WDDM's non-local usage, or amdgpu's GTT on Linux."""
+    """Per-process GPU memory in system RAM: WDDM's non-local usage, or a DRM client's GTT (amdgpu) or
+    system0 (Intel) bytes on Linux."""
     return (has_wddm_counters(s, row) or (s.backend == "drm" and not row.host)) and "shared" in row.gpu.available
 
 
@@ -59,8 +60,9 @@ ORDER_NOTE = ("? order guess: the size is exact but several owners fit, so newer
 
 
 DRM_NOTES = {
-    "legacy": ("VRAM n/a: this kernel's amdgpu fdinfo has incomplete or unparseable drm-shared-* stats, so resident "
-               "memory may include buffers imported from other processes and would be counted once per importer."),
+    "legacy": ("VRAM n/a: this driver's fdinfo has missing or unparseable drm-shared-* stats (older amdgpu kernels, "
+               "Intel integrated GPUs, xe), so resident memory may include buffers imported from other processes "
+               "and would be counted once per importer."),
     "shared_client": ("VRAM and GPU% n/a: this process holds a DRM client other processes hold too (fd passing, "
                       "fork). fdinfo counts the client once and doesn't say which of them uses it."),
     "shared_buffers": ("VRAM n/a: this process's DRM client shares buffers with other clients (dma-buf, e.g. "
@@ -87,6 +89,23 @@ def inferred_note(g) -> str:
 METAL_NOTE = ("macOS: unified memory, so GPU memory is part of system RAM. Rows show each process's graphics "
               "footprint; other users' processes (WindowServer, daemons) show GPU% only, since reading their "
               "memory needs root.")
+INTEL_MEMORY_NOTE = ("Intel VRAM used is the sum of local memory resident in the processes gputaskman can inspect "
+                     "(the driver has no device-wide counter): buffers shared between processes can be counted "
+                     "twice, and kernel-owned memory and processes it can't inspect are missing. The total is the "
+                     "size of the card's local-memory PCI window, an estimate that can differ from its memory, so "
+                     "free memory is not shown.")
+
+
+def intel_memory_note(s: Snapshot) -> str:
+    """Intel's device VRAM used is a sum over visible DRM clients and its total a PCI window size: neither is a
+    device counter, so the output says so whenever it shows either."""
+    return INTEL_MEMORY_NOTE if (s.backend == "drm" and s.nv and s.nv.source == "Intel sysfs"
+                                 and (s.vram_used is not None or s.vram_total)) else ""
+
+
+def vram_total_label(s: Snapshot) -> str:
+    """A total of 0 means unknown (an Intel iGPU, or a card whose memory window can't be read), not 0 bytes."""
+    return gb(s.vram_total) if s.vram_total else "N/A"
 
 
 def to_dict(s: Snapshot) -> dict:
@@ -97,6 +116,7 @@ def to_dict(s: Snapshot) -> dict:
         engines = has_engine_counters(s, p)
         item = {
             "pid": p.pid, "host": p.origin if p.host else None, "name": p.name, "kind": p.kind, "runtimes": p.detail.runtimes,
+            "started_at": round(p.detail.create_time, 3) or None,  # unknown (protected process, WSL host row) is null
             "vram_attributed": p.gpu.attributed, "vram_inferred_bytes": p.gpu.inferred,
             "vram_inferred_by": p.gpu.inferred_by or None,
             "vram_bytes": int(p.gpu.dedicated) if p.gpu.attributed and "dedicated" in p.gpu.available else None,
@@ -136,10 +156,11 @@ def to_dict(s: Snapshot) -> dict:
     return {
         "taken": s.taken, "gpu": s.adapter.name if s.adapter else None, "driver": s.driver, "cuda": s.cuda,
         "adapter": dataclasses.asdict(s.adapter) if s.adapter else None,
-        "vram_total": s.vram_total, "vram_used": s.vram_used, "shared_used": s.shared_used,
+        "vram_total": s.vram_total or None, "vram_used": s.vram_used, "shared_used": s.shared_used,
         "attributed": s.attributed, "backend": s.backend, "shared_is_spill": s.shared_is_spill,
         "host_status": s.host_status or None,
         "process_status": s.process_status or None,
+        "memory_note": intel_memory_note(s) or None,
         "counter_status": s.counter_status or None, "counter_adapter_matched": s.counter_adapter_matched,
         "wsl_split": s.wsl_split or None, "device": nv, "processes": procs,
     }
@@ -163,12 +184,14 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
         out.append(f"{name}{info}  {nv.driver_model if nv else ''}")
         used = gb(s.vram_used) if s.vram_used is not None else "N/A"
         shared = gb(s.shared_used) if s.shared_used is not None else "N/A"
-        memory = f"VRAM {used} / {gb(s.vram_total)}"
+        memory = f"VRAM {used} / {vram_total_label(s)}"
         if s.backend in ("wddm", "drm") or s.host_data:
             memory += f"   shared (in system RAM) {shared}"
         out.append(memory)
     if s.backend == "wsl":
         out.append(wsl_note(s))
+    if intel_memory_note(s):
+        out.append(intel_memory_note(s))
     if s.counter_status:
         out.append(s.counter_status)
     if nv and s.backend != "metal":
@@ -250,5 +273,18 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
     return "\n".join(out)
 
 
-def dump(s: Snapshot, as_json: bool) -> str:
-    return json.dumps(to_dict(s), indent=2, default=str) if as_json else to_text(s)
+def dump(s: Snapshot, as_json: bool, system=None, system_error: str | None = None) -> str:
+    """system: an optional host.HostSample (OS-reported system RAM/CPU); system_error: why it is missing."""
+    from . import host as hostmod
+
+    if as_json:
+        d = to_dict(s)
+        if system is not None:
+            d["system"] = hostmod.to_dict(system)
+        elif system_error:
+            d["system"] = {"error": system_error}
+        return json.dumps(d, indent=2, default=str)
+    text = to_text(s)
+    if system is not None:
+        return text + "\n\n" + hostmod.to_text(system)
+    return text + (f"\n\nSystem RAM/CPU unavailable: {system_error}" if system_error else "")

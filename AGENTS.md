@@ -49,21 +49,24 @@ these rules:
 ```
 cli.py ──► Collector.sample()  (collector.py)
             ├─ adapters        dxgi.py (Windows) / linux.enumerate_adapters / macos.enumerate_adapters
-            ├─ counters        pdh.py GpuCounters (Windows PDH) / linux.py LinuxCounters (NVML, + drm.py for amdgpu) /
+            ├─ counters        pdh.py GpuCounters (Windows PDH) / linux.py LinuxCounters (NVML, + drm.py for amdgpu and Intel) /
             │                  macos.py MacCounters (IOKit Metal clients + footprint poller)
-            ├─ device metrics  nvml.py; drm.py read_device (AMD, Linux) (macOS: MacCounters.device from IOKit)
+            ├─ device metrics  nvml.py; drm.py read_device (AMD and Intel, Linux) (macOS: MacCounters.device from IOKit)
             ├─ WSL host        wslhost.py: HostStream (powershell PDH via interop), ContextTracker
             ├─ processes       procinfo.py: runtime DLLs, mapped files, cmdline, classify()
             ├─ model naming    stores.py (Ollama, LM Studio, Hugging Face), gguf.py (header, kind, sizes)
             ├─ LLM detail      llm.py: buffer logs, ServerProber (local APIs), build_view()
             └─ app adapters    handy.py (settings + bounded log tail)
          ──► Snapshot ──► app.py (Textual TUI) / report.py (text and JSON)
+cli.py ──► HostSampler.sample()  (host.py: system RAM/CPU, OS-reported; sampled beside the Collector, not in Snapshot)
 cli.py diff ──► diff.py: compares two saved --json snapshots (no collection)
 ```
 
 The backend is chosen at import time in `collector.py`: `BACKEND` is `wddm` on Windows, `nvml` on
 native Linux, `wsl` under WSL, and `metal` on macOS. On native Linux, `Collector.backend` becomes `drm`
-when the selected GPU is an amdgpu card (device readings from sysfs, processes from DRM fdinfo). One-shot
+when the selected GPU is an amdgpu or Intel i915 card (device readings from sysfs, processes from DRM
+fdinfo). An Intel card has no device-wide memory counter: its VRAM used is a sum over visible clients and
+its total is a PCI window size, so both carry `report.INTEL_MEMORY_NOTE`, and a total of 0 is unknown. One-shot
 output (`--once`, `--json`) uses `scan_budget=None` to
 identify everything immediately; the TUI spreads scans across refreshes.
 
@@ -77,7 +80,8 @@ identify everything immediately; the TUI spreads scans across refreshes.
 | Support an app that reads and closes its model | `handy.py` as the template | Read-only settings plus a bounded, mtime-cached log tail; never read transcription content. Generalize into data-driven adapters once a second app needs one |
 | Add a GPU vendor or backend | `dxgi.py`, `collector.py`, a new module | Pair devices by LUID or PCI bus ID, never by name or index; load vendor DLLs by absolute system path |
 | Add a column or JSON field | `report.py` and `app.py` | Follow the null rules above; update the README tables. If it is a measured byte count, consider adding it to `diff.py` `MEASURED` |
-| Change snapshot comparison | `diff.py` | Works only on saved `--json` files, never live state. Compare measured fields directly; keep runtime-reported and estimated values in their own sections; an absent row is `not listed`, not zero |
+| Change snapshot comparison | `diff.py` | Works only on saved `--json` files, never live state. Compare measured fields directly; keep runtime-reported and estimated values in their own sections; an absent row is `not listed`, not zero. Refuse only when both snapshots name conflicting adapters (vendor, PCI address, a non-Windows key); when they cannot be compared, warn (`name-only`) instead, because a Windows LUID changes at boot and `diff` has no override flag. A PID whose two `started_at` values are both valid and more than `SAME_PROCESS_SECS` apart is a different process: no pairing rule may join it (unknown or malformed start times never conflict, so older snapshots pair as before) |
+| Change system RAM/CPU | `host.py` | Machine memory and load as the OS reports them: never GPU bytes, never added to `Snapshot.attributed`, and `diff` ignores it. Unknown is `None`/`null` and a failure carries a reason, never zeros. The JSON key is `system` because `host` already means the WSL Windows host. Windows uses the NT process list (psutil per process takes about 6 s per pass for 1,000 processes), checked against psutil at startup; CPU rates are keyed by `(pid, create_time)` so a reused PID never inherits another process's history (on the psutil path, `is_running()` is what makes psutil drop its cached object for a reused PID; keep that call) |
 | Change WSL matching | `wslhost.py` `ContextTracker` | Keep `tests/test_wslhost.py` replays passing; they are measured sequences |
 
 ## Verify
@@ -134,8 +138,11 @@ workflow `release.yml`, and environment `pypi`. Only the isolated publishing job
 ## Known limits
 
 Validated live: Windows 11 with an RTX 4080 SUPER (WDDM, plus WSL2), a Linux container with an
-RTX 3060 Ti, macOS 26.3.1 on an M4 Mac mini (Metal; own-user processes, not run as root), and
+RTX 3060 Ti, macOS 26.3.1 on an M4 Mac mini (Metal; own-user processes, not run as root),
 bare-metal Linux with an amdgpu Radeon RX 9070-series card plus a Radeon 610M (DRM path), and
 bare-metal Linux on a laptop with an RTX 4050 Laptop GPU plus an AMD Phoenix iGPU (NVML and DRM side by side).
-Not yet validated on hardware: systems with two discrete GPUs, multi-GPU on Windows, and GPU-backed WinML on
-Copilot+ PCs. Planned work is listed under **Next** in the README.
+Intel i915 (an Arc A770 with resizable BAR plus a UHD 730) was validated by a contributor, not repeated by
+the maintainer.
+Not yet validated on hardware: systems with two discrete GPUs, multi-GPU on Windows, Intel `xe` and Arc cards
+without resizable BAR, and GPU-backed WinML on Copilot+ PCs. Planned work is listed under **Next** in the
+README.

@@ -2,7 +2,7 @@
 
 **An `htop` for what's inside your GPU, not just how full it is.**
 
-Windows + NVIDIA/AMD, with Linux and WSL support (NVIDIA everywhere, AMD on native Linux; see
+Windows + NVIDIA/AMD, with Linux and WSL support (NVIDIA everywhere, AMD and Intel on native Linux; see
 [Linux and WSL](#linux-and-wsl)) and macOS on Apple Silicon (see [macOS](#macos-apple-silicon)). A terminal UI
 that connects per-process GPU memory and engine activity with loaded runtimes, model files, and
 LLM buffer breakdowns.
@@ -118,7 +118,7 @@ skips the consistency check, so do not use it after changing dependencies.
 
 Tagged releases include portable Linux builds: `gputaskman-VERSION-linux-x64.tar.gz` and
 `gputaskman-VERSION-linux-arm64.tar.gz`. They need glibc 2.35 or newer (Ubuntu 22.04, Debian 12,
-or newer) and an NVIDIA driver (or, on native Linux, an AMD GPU on the `amdgpu` driver), and work
+or newer) and an NVIDIA driver (or, on native Linux, an AMD GPU on the `amdgpu` driver or an Intel GPU on `i915`), and work
 natively, in containers, and in WSL:
 
 ```bash
@@ -207,7 +207,8 @@ up without double counting. Otherwise the process shows VRAM and SPILL as `n/a` 
   resident minus shared is not private memory and is never computed.
 - **Primary node** (`/dev/dri/card*`, typically a compositor): root-owned logind keeps a copy of that
   fd, which a normal user can't see, so a single holder can't be proven.
-- **Legacy**: older kernels whose amdgpu fdinfo lacks `drm-shared-vram`/`drm-shared-gtt`.
+- **Legacy**: older kernels whose amdgpu fdinfo lacks `drm-shared-vram`/`drm-shared-gtt`, and Intel integrated GPUs
+  and `xe` (below).
 - **Incomplete**: some of the process's fds or fdinfo could not be read (GPU% is `n/a` too).
 - **Partial scan**: the TUI's 50 ms listing budget ran out this refresh, so a process it skipped might
   hold the same client (GPU% is `n/a` too). Expected to be rare on a desktop (~9 ms for ~8,000 fds,
@@ -239,6 +240,29 @@ for it, which is why ROCm rows show engines as `n/a`. PyTorch-ROCm has not been 
 That check predates the stricter attribution above (no subtraction of shared bytes; render-node,
 single-holder and complete-scan requirements; per-client timestamps; PID-reuse checks), which is
 covered by unit tests only and **not yet validated on AMD hardware**.
+
+**Intel GPUs on native Linux** (the `i915` driver) use the same DRM fdinfo path, with these differences:
+
+| | Source |
+|---|---|
+| Device temperature, power, GT clock | `hwmon` and `gt/gt0` under `/sys/class/drm/card*`. Power is the rate of the cumulative energy counter between two refreshes, so it is `n/a` on the first |
+| Device VRAM total | The size of the local-memory PCI window (`resource2`), an **estimate**: kernel-owned memory is missing from the sysfs view, resizable BAR rounds to a power of two, and a partial window can be smaller than the card, so the total can differ from the card's memory. A window under 1 GiB (an integrated GPU, or a discrete card without resizable BAR) shows `N/A` (`null` in JSON). Free memory is never shown for Intel |
+| Device VRAM used | The sum of its clients' resident local memory: i915 has no device-wide counter, so buffers shared between processes can be counted twice, and kernel-owned memory and processes gputaskman can't inspect are missing. The UI, `--once`, `--json` (`memory_note`) and `gputaskman diff` all say so. `n/a` when any client's local memory is unknown |
+| Integrated or discrete | An iGPU has no `local0`, so a card with a local-memory window of 1 GiB or more is discrete, and so is any card whose fdinfo reports local memory, even when its window is smaller |
+| Per-process VRAM and SPILL | `drm-resident-local0` and `drm-resident-system0`, plus their `stolen-` regions (the firmware-reserved part of each), under the same private-client rules as AMD. `system0` is memory the GPU's buffers currently sit in, including buffers placed there on purpose, so SPILL here (like AMD's GTT) is where they are, not proof they were pushed out of VRAM. Both `drm-shared-local0` and `drm-shared-system0` must be present to charge a process, so an integrated GPU (no `local0`) shows `n/a` (`legacy`). A region value that can't be parsed makes that figure `n/a`, not a smaller number |
+| Per-process engine load (3d, compute, copy, video) | `drm-engine-render`, `-compute`, `-copy`, `-video`, `-video-enhance` busy time, sampled twice. `n/a` where the driver reports none (before Gen 8). A class with several identical engines (`drm-engine-capacity-*`, such as video on an Arc) is not divided by its capacity, so one busy engine reads 100% |
+
+Device GPU load, memory bandwidth, and the PCIe link are `n/a`: i915 has no device-wide busy counter, and its
+sysfs link fields can report the power-on default instead of the live link. The GT clock is read but not shown yet, and
+what is read (`rps_cur_freq_mhz`) is the frequency the driver last *requested*; the kernel's actual frequency is `rps_act_freq_mhz`.
+`xe` cards are detected, but its fdinfo uses other keys (`drm-cycles-*`, `drm-resident-vram0`/`-gtt`), so its
+per-process rows show `n/a` until they are decoded on hardware.
+
+Live check, reported by the contributor and not repeated by the maintainer: Linux 6.12, an Arc A770 (discrete, 16 GiB
+BAR) and a UHD 730 (integrated) on `i915`. Both cards were found, named, and selectable with `--gpu`; the Arc showed
+per-process VRAM and engine load, and the TUI rendered both. The fdinfo formats of both drivers, taken from the kernel
+sources, are covered by unit tests. **Not validated on hardware:** `xe`, Arc cards without resizable BAR, and
+multi-GPU systems other than that pair.
 
 **WSL** is different, because Windows owns the GPU. Linux cannot see how much VRAM its own
 processes use: `nvidia-smi` lists no processes, NVML's per-process samples carry *Windows* PIDs
@@ -311,7 +335,7 @@ Build both `gputaskman` and its `gtm` alias with `nix build path:.` (executables
 pins nixpkgs. Dependencies come from nixpkgs, independently of `uv.lock`. No pip installation,
 virtual environment, CUDA Toolkit, or ROCm installation is needed. GPU drivers remain supplied by
 the host, never bundled with the package. NVIDIA's nixpkgs Python binding finds NVML through
-`/run/opengl-driver/lib`; AMD uses kernel sysfs and DRM fdinfo interfaces directly. On WSL2 the
+`/run/opengl-driver/lib`; AMD and Intel use kernel sysfs and DRM fdinfo interfaces directly. On WSL2 the
 host driver lives in `/usr/lib/wsl/lib` instead, and the wrappers add that directory to
 `LD_LIBRARY_PATH` (it is ignored when absent, so NixOS is unaffected).
 
@@ -372,6 +396,8 @@ for a privacy consent prompt.
   video-engine clock, and responsive history charts with an all-charts or single-metric view.
 - **Process view:** local GPU memory, GPU-accessible system RAM, estimated non-resident commit,
   engine activity, and detected runtimes such as CUDA, HIP, Vulkan, Direct3D, ggml and ONNX Runtime.
+- **System RAM and CPU:** a panel plus RAM and CPU% columns, as the OS reports them: machine memory
+  and load, never GPU memory (see [System RAM and CPU](#system-ram-and-cpu)).
 - **Model inspector:** which model each process holds (LLM, decision, embedding, speech, or diffusion), how
   it was identified, architecture, quantization, layer count, weights, estimated KV cost, and
   buffer sizes from compatible load logs.
@@ -407,13 +433,14 @@ uv run --locked gputaskman --once       # one text snapshot
 uv run --locked gputaskman --json       # one JSON snapshot; implies --once
 uv run --locked gputaskman diff before.json after.json   # compare two --json snapshots
 uv run --locked gputaskman --no-host    # WSL: don't read Windows host counters through interop
+uv run --locked gputaskman --no-system  # don't sample system RAM/CPU: no panel, columns, or JSON section
 uv run --locked gputaskman --help
 ```
 
 | Key | Action |
 |---|---|
 | Up / Down | Select a process and inspect it |
-| `s` | Cycle sort: VRAM, GPU%, spill, paged, name |
+| `s` | Cycle sort: VRAM, GPU%, spill, paged, name (then RAM, CPU% unless `--no-system`) |
 | `c` | Cycle all charts or a single metric (also available in the **Charts** dropdown) |
 | `a` | Switch between top and all collected processes |
 | `m` | Toggle full diagnostics / slim monitoring |
@@ -522,6 +549,42 @@ different adapter/render GUID from DXGI's `0x4BB7`; it was not a proven alias fo
 The portable build's `--once` explanation and `--json` unmatched status were verified in the guest.
 Other Hyper-V GPU-PV configurations have not been validated.
 
+### System RAM and CPU
+
+A **System** panel under the GPU header, and **RAM** and **CPU%** columns in the process table, show what
+each process costs the *machine*, as the OS reports it. The numbers come from psutil; on Windows the process
+list comes from `NtQuerySystemInformation`, because psutil's per-process calls take about 6 s per pass for
+~1,000 processes there. `s` sorts by them, unknown values last. Full diagnostics also shows a per-thread strip, 60-sample CPU and
+RAM histories, and the top processes by RAM and CPU; slim monitoring keeps two lines (the RAM and CPU bars).
+`--no-system` removes the panel, the columns and the sampling.
+
+These are system-memory figures, never GPU bytes. They are not added to any GPU total or to the attributed VRAM:
+
+- **RAM** is the process's working set (Linux: resident set), which includes pages shared with other processes,
+  so it will not match Task Manager's default *Memory (active private working set)* column. `PRIVATE` in
+  `--once` (`private` in `--json`) is the Windows commit charged to the process; it is `n/a` (`null`) elsewhere.
+- **CPU%** is a share of the whole machine, like Task Manager: one busy thread on a 32-thread machine is about
+  3%. It is a rate between two samples, so a new process (or one whose PID was reused) shows `…` for one
+  refresh. Below 0.5% it is blank.
+- **`n/a`** means the OS would not say (a protected process), the PID now belongs to a different process than the
+  one the GPU row describes (compared by creation time when both are known), or the row is a Windows process
+  listed from WSL, whose PID is not a Linux PID.
+- Inside WSL the panel describes the Linux VM, and its border says so.
+- When the numbers cannot be read, the panel, `--once` and `--json` say why, and the GPU view is unaffected.
+  That covers 32-bit Python on Windows and a Windows build whose process-list layout does not match: the layout
+  is checked against psutil for gputaskman's own process at startup instead of being trusted.
+
+`--json` adds a `system` section: `cpu`, `ram` (with swap or pagefile), the top 10 processes machine-wide by
+`rss` and by `cpu_pct`, `denied` (processes the OS would not describe) and `cost_ms`. Unknown values are `null`;
+if sampling failed the section is `{"error": "<reason>"}`. `--once` and `--json` take their CPU readings inside
+the second they already wait for GPU engine rates. `gputaskman diff` compares GPU memory only and ignores this
+section.
+
+Live checks: Windows 11 on the RTX 4080 SUPER machine with 995 processes (the process list matched psutil for the
+same process; the TUI and `--json` ran), and Linux under WSL2 on the same machine (totals matched `/proc/meminfo`,
+gputaskman's own resident size matched `VmRSS` within 1%, and a single busy thread read 3.12% of the machine
+against the expected 100/32 = 3.1%). **Not validated on hardware:** macOS, Windows on ARM64, and bare-metal Linux.
+
 ### Comparing snapshots
 
 To see which memory bucket actually grew when you load a model or change the context length, save
@@ -537,12 +600,30 @@ uv run --locked gputaskman diff before.json after.json          # add --json for
 The device and process tables compare **measured** counters only. Runtime-reported segments
 (llama.cpp buffer logs) and estimates (KV cache from GGUF metadata and `-c`) are listed separately
 under each process and are never added to measured totals. A model file that appears in a process
-is listed as evidence that the process opened or named it, not as GPU growth.
+is listed as evidence that the process opened or named it, not as GPU growth. The `system` section
+(machine RAM and CPU) is not compared.
 
 Processes are paired by PID, then by name and listening ports, then by a unique name, because a
 model reload often restarts the server under a new PID. A process missing from one snapshot shows
 `not listed`, not zero: it was not running or used too little GPU to be listed. Processes that
 moved by less than 16 MB are hidden from the text output but included in `--json`.
+
+A PID is not an identity, because both Windows and Linux reuse them. Each process in `--json` carries
+`started_at` (its creation time in Unix seconds, taken from data the monitor already reads). The same
+PID with start times more than 2 seconds apart is a different process, so no rule pairs it: the old
+one shows as `gone`, the new one as `new`, and the device totals still compare normally. A missing or
+`null` `started_at` (a protected process, a WSL host row, or a snapshot from an older version) never
+counts as a conflict, so those rows are paired as described above. Linux derives start times from the
+boot time in whole seconds, hence the 2-second allowance; a larger clock step can make one live
+process look reused, which shows as `gone` plus `new` and never as a wrong change.
+
+Two cards of one model share a name, so `diff` also compares the adapter each snapshot recorded.
+It refuses a pair whose vendor ID, PCI address or (off Windows) adapter key conflicts. A Windows
+adapter key changes at boot and when an adapter is re-enabled, so there it only produces a warning.
+`adapter_check` in `--json` says what was compared: `pci`, `key` or `name-only`. `name-only` means
+the snapshots (older ones, for example) do not both say which adapter they came from, so they were
+matched by GPU name and backend alone, and the text output warns. These identifiers tell GPUs apart
+within one machine; they do not prove two snapshots came from the same computer.
 
 Take the "after" snapshot once the model has answered one request: CUDA and Vulkan can allocate
 lazily, and allocators keep freed memory cached, so shrinkage may appear late. On an RTX 4080 SUPER
@@ -693,10 +774,11 @@ Identification is designed to stay cheap. Measured on one Windows machine:
 | GGUF header, model-store manifests | ms, cached | Once per file / every 60 s |
 | Local API probes | ms, local only | llama-server `/v1/models` only when its model path changes |
 | `psutil.open_files()` | 0.6-2.5 s per process | Never |
-| AMD on Linux: DRM fdinfo scan (`readlink` every fd, read fdinfo of `/dev/dri` ones) | ~9 ms for ~8,000 fds (Linux desktop) | Every refresh, only when an amdgpu card is shown; listing fds is bounded to 50 ms in the TUI and resumes next refresh, known GPU fds are still read |
+| AMD and Intel on Linux: DRM fdinfo scan (`readlink` every fd, read fdinfo of `/dev/dri` ones) | ~9 ms for ~8,000 fds (AMD, Linux desktop; Intel not measured) | Every refresh, only when an amdgpu or Intel card is shown; listing fds is bounded to 50 ms in the TUI and resumes next refresh, known GPU fds are still read |
 | macOS: `ioreg` device stats + Metal clients | ~10 ms | Every refresh |
 | macOS: memory-map scan (`proc_pidinfo` region walk) | ~4 ms per process | Same policy as the memory-map scan above |
 | macOS: `footprint` GPU memory | ~70 ms per process, background thread | Busy and new processes every ~2 s, idle ones every 30 s (54 runs in 40 s with 27 GPU processes, M4 Mac mini) |
+| System RAM/CPU: process list + psutil totals | Windows (`NtQuerySystemInformation`): ~28 ms median for 995 processes (Windows 11, RTX 4080 SUPER machine, 32 threads); the contributor measured ~6 ms for ~480 processes (Windows 11, i9-13900K). Linux under WSL2 (psutil): ~3.4 ms median for 44 processes, ~9.5 ms for the first sample of 123; the per-pid reuse check (`is_running()`) adds ~0.3 ms for 44 processes, about 7 µs each | Every refresh; `--no-system` turns it off. psutil's per-process `memory_info`/`cpu_times` took ~6 s per pass for 995 processes on Windows, so it is only the non-Windows path. macOS unmeasured |
 
 With two llama-servers running, a steady refresh costs roughly 15-30 ms of CPU (about 340 ms before
 process details were cached).
@@ -716,6 +798,13 @@ The collector probes existing local listening ports with GET requests to `/props
 `/metrics`, `/v1/models`, `/api/ps`, `/api/v1/models`, and `/api/v0/models`. Endpoints may be
 absent, disabled, or authenticated; other evidence is still useful. It does not launch `ollama`,
 `lms`, or an inference request. Throughput may update only after a request completes.
+
+If llama-server was started with `--api-key`, the probe sends that key as a bearer token to the same
+server's own port, and never follows a redirect with it. The key is never stored, printed, or written
+to JSON, and the inspector shows it as `***`. A key in `--api-key-file` or `LLAMA_API_KEY` is not used:
+gputaskman does not open a path taken from another process's command line, and an environment variable
+can't be seen from outside the process. In that case the probe stops at the first 401, so the server logs
+one rejected request every 30 seconds, and the inspector says why server details are missing.
 
 Ollama's local `server.log` is considered when one Ollama runner is detected. Log formats,
 rotation, and stale load blocks can affect attribution, so compare the reported model and
@@ -832,7 +921,7 @@ downloads are bundled in this repository.
 |---|---|
 | `pdh.py` / `dxgi.py` | Windows counters and adapter enumeration |
 | `linux.py` | Linux backend: NVML adapters and per-process usage, container PID matching, WSL detection, `/dev/dxg` holders |
-| `drm.py` | AMD on native Linux: amdgpu cards and device readings from sysfs, per-process VRAM/GTT/engine time from DRM fdinfo |
+| `drm.py` | AMD and Intel on native Linux: amdgpu and i915 cards and device readings from sysfs, per-process VRAM/GTT/engine time from DRM fdinfo |
 | `wslhost.py` | WSL: interop check, Windows host counter stream, adapter pairing, context matching |
 | `macos.py` | macOS backend: IOKit device stats and per-process GPU time, `footprint` GPU memory poller, libproc memory maps |
 | `nvml.py` | NVIDIA device readings |
@@ -841,6 +930,7 @@ downloads are bundled in this repository.
 | `stores.py` | Friendly names from Ollama, LM Studio, and Hugging Face model stores |
 | `gguf.py` | Model metadata, kind, and size estimates |
 | `llm.py` | Buffer logs, local server probing, and breakdowns |
+| `host.py` | System RAM and CPU as the OS reports them: psutil totals, per-process RAM and CPU%, and the Windows process-list reader |
 | `collector.py` | Shared snapshot collection |
 | `app.py` / `report.py` / `cli.py` | TUI, text/JSON, and command-line entry points |
 | `diff.py` | Before/after comparison of two `--json` snapshots |
@@ -850,7 +940,8 @@ downloads are bundled in this repository.
 - Model identity for non-GGUF runtimes (ONNX Runtime, PyTorch, TensorRT) beyond installed candidates.
 - Explicit provenance and availability for every counter and estimate.
 - Reliable multi-GPU matching and per-device model placement.
-- Intel GPUs (`i915`/`xe`) through the same DRM fdinfo path as AMD.
+- Intel `xe` per-process memory and load (`drm-cycles-*`), the Intel GT clock in the device panel, and Intel
+  validation beyond the Arc A770 / UHD 730 pair.
 - macOS: a portable build, Ollama/llama.cpp/MLX validation, and compressed GPU memory (footprint's
   `swapped`) as the paged column.
 - WSL: per-process GPU load for Linux rows, and Ollama's systemd journal as a log source.

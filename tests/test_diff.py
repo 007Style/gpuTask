@@ -15,16 +15,27 @@ GiB = 1 << 30
 MiB = 1 << 20
 
 
-def proc(pid, name, vram=None, shared=0, host=None, ports=(), llm=None, files=(), inferred=None):
+def proc(pid, name, vram=None, shared=0, host=None, ports=(), llm=None, files=(), inferred=None, started=...):
     return {"pid": pid, "host": host, "name": name, "vram_bytes": vram, "shared_bytes": shared,
             "committed_bytes": None, "paged_out_bytes": None, "vram_inferred_bytes": inferred,
             "ports": list(ports), "model_files": [{"path": f, "sources": ["mapped"]} for f in files],
+            **({} if started is ... else {"started_at": started}),  # absent: a snapshot from before started_at existed
             **({"llm": llm} if llm else {})}
 
 
-def snap(procs, used, attributed, taken=100.0, gpu="RTX", backend="wddm"):
+def pairs(before, after):
+    return {(b and b["pid"], a and a["pid"], how) for b, a, how in match(before, after)}
+
+
+def snap(procs, used, attributed, taken=100.0, gpu="RTX", backend="wddm", adapter=...):
     return {"taken": taken, "gpu": gpu, "backend": backend, "vram_used": used, "shared_used": 0,
-            "attributed": attributed, "processes": procs}
+            "attributed": attributed, "processes": procs, **({} if adapter is ... else {"adapter": adapter})}
+
+
+def gpu_adapter(luid=0x4BB7, pci=(1, 0, 0), vendor=0x10DE):
+    """The adapter block of a --json snapshot (a dataclass dump: the PCI address is a list)."""
+    return {"luid": luid, "name": "RTX", "vendor_id": vendor, "dedicated_vram": 16 * GiB, "shared_system": 0,
+            "software": False, "pci_address": list(pci) if pci else None}
 
 
 def llm(n_ctx, kv, exact=False):
@@ -57,6 +68,51 @@ class MatchTests(unittest.TestCase):
         d = diff(snap(before, 0, 0), snap(after, 0, 0))
         self.assertIn("H:9", to_text(d))
         self.assertIn("W:41", to_text(d))
+
+
+class PidReuseTests(unittest.TestCase):
+    """A PID that comes back with a different start time is another process, however alike the rows look."""
+
+    def test_a_reused_pid_is_gone_and_new_with_or_without_ports(self):
+        for ports in ([8080], []):  # name+ports and unique-name fallbacks must not pair them either
+            with self.subTest(ports=ports):
+                before = [proc(42, "llama-server", ports=ports, started=100.0)]
+                after = [proc(42, "llama-server", ports=ports, started=200.0)]
+                self.assertEqual(pairs(before, after), {(None, 42, "new"), (42, None, "gone")})
+
+    def test_one_lifetime_still_pairs_by_pid_within_the_rounding_tolerance(self):
+        for later in (100.0, 101.9, 102.0, 98.0):
+            with self.subTest(later=later):
+                self.assertEqual(pairs([proc(42, "a.exe", started=100.0)], [proc(42, "a.exe", started=later)]),
+                                 {(42, 42, "pid")})
+        self.assertEqual(pairs([proc(42, "a.exe", started=100.0)], [proc(42, "a.exe", started=102.5)]),
+                         {(None, 42, "new"), (42, None, "gone")})
+
+    def test_unknown_or_malformed_start_times_keep_the_old_heuristic_pairing(self):
+        # ... means the key is absent (an older snapshot); the rest are values a snapshot could carry
+        for before_value, after_value in ((..., 200.0), (100.0, ...), (None, None), (None, 200.0), (0.0, 200.0),
+                                          (-5.0, 200.0), (True, 200.0), ("100", 200.0), ([100.0], 200.0),
+                                          (float("nan"), 200.0), (float("inf"), 200.0)):
+            with self.subTest(before=before_value, after=after_value):
+                before = [proc(42, "a.exe", started=before_value)]
+                after = [proc(42, "a.exe", started=after_value)]
+                self.assertEqual(pairs(before, after), {(42, 42, "pid")})
+        # no PID means no reuse to speak of: rows without one are still paired by name alone
+        self.assertEqual({how for _, _, how in match([proc(None, "a", started=100.0)], [proc(None, "a", started=200.0)])},
+                         {"name"})
+        before = [proc(42, "llama-server", ports=[8080], started=100.0), proc(50, "solo.exe", started=100.0)]
+        after = [proc(77, "llama-server", ports=[8080], started=200.0), proc(60, "solo.exe", started=200.0)]
+        self.assertEqual(pairs(before, after), {(42, 77, "name+ports"), (50, 60, "name")})
+
+    def test_a_refused_pair_does_not_make_the_other_rows_less_ambiguous(self):
+        before = [proc(42, "llama-server", started=100.0)]
+        after = [proc(42, "llama-server", started=200.0), proc(77, "llama-server", started=300.0)]
+        self.assertEqual(pairs(before, after), {(None, 42, "new"), (None, 77, "new"), (42, None, "gone")})
+
+    def test_reuse_is_judged_inside_one_pid_namespace(self):
+        before = [proc(42, "x", started=100.0), proc(42, "x", host="windows")]
+        after = [proc(42, "x", started=200.0), proc(42, "x", host="windows")]
+        self.assertEqual(pairs(before, after), {(None, 42, "new"), (42, None, "gone"), (42, 42, "pid")})
 
 
 class DiffTests(unittest.TestCase):
@@ -104,6 +160,18 @@ class DiffTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "different GPUs"):
             diff(snap([], 0, 0, gpu="A"), snap([], 0, 0, gpu="B"))
 
+    def test_memory_note_follows_the_snapshots_into_the_comparison(self):
+        note = "Intel VRAM used is a sum over the processes gputaskman can inspect."
+        noted = {**snap([], 3 * GiB, 0, taken=130.0, backend="drm", gpu="Arc"), "memory_note": note}
+        older = snap([], 2 * GiB, 0, backend="drm", gpu="Arc")  # saved by a version that had no note
+        for before, after in ((older, noted), (noted, older), (noted, noted)):
+            d = diff(before, after)
+            self.assertEqual(d["memory_note"], note)
+            self.assertIn(note, to_text(d))
+        plain = diff(snap([], 2 * GiB, 0), snap([], 3 * GiB, 0))  # every other GPU: nothing to add
+        self.assertIsNone(plain["memory_note"])
+        self.assertNotIn(note, to_text(plain))
+
     def test_remainder_segments_follow_the_noise_threshold(self):
         def server(runtime):
             view = {"n_ctx": 4096, "segments": [{"label": "rest", "bytes": runtime, "kind": "runtime", "exact": False}]}
@@ -111,6 +179,69 @@ class DiffTests(unittest.TestCase):
         d = diff(snap([server(GiB)], 3 * GiB, 2 * GiB), snap([server(GiB + 4096)], 3 * GiB, 2 * GiB))
         self.assertIn("(no process changed by 16 MB or more)", to_text(d))
         self.assertNotIn("llama (1)", to_text(d))
+
+    def test_a_reused_pid_keeps_the_device_change_but_makes_no_process_delta(self):
+        before = snap([proc(42, "llama-server", vram=4 * GiB, ports=[8080], started=100.0)], 5 * GiB, 4 * GiB)
+        after = snap([proc(42, "llama-server", vram=8 * GiB, ports=[8080], started=200.0)], 9 * GiB, 8 * GiB)
+        d = diff(before, after)
+        self.assertEqual(d["device"]["vram_used"]["delta"], 4 * GiB)  # the device-wide change is still measured
+        self.assertEqual(sorted(p["match"] for p in d["processes"]), ["gone", "new"])
+        self.assertTrue(all(p["measured"]["vram_bytes"]["delta"] is None for p in d["processes"]))
+        rows = [line for line in to_text(d).splitlines() if line.startswith("llama-server")]
+        self.assertEqual(len(rows), 2)  # one row per lifetime, each absent from the other snapshot
+        self.assertTrue(all("not listed" in row for row in rows))
+
+
+class AdapterGuardTests(unittest.TestCase):
+    def pair(self, before, after, backend="wddm"):
+        return diff(snap([], 0, 0, backend=backend, adapter=before), snap([], 0, 0, backend=backend, adapter=after))
+
+    def test_same_name_but_different_pci_addresses_are_not_one_gpu(self):
+        with self.assertRaisesRegex(ValueError, r"different adapters.*'RTX'.*PCI 01:00\.0 vs 02:00\.0"):
+            self.pair(gpu_adapter(pci=(1, 0, 0)), gpu_adapter(pci=(2, 0, 0)))
+
+    def test_a_matching_pci_address_survives_a_changed_luid(self):
+        d = self.pair(gpu_adapter(luid=0x4BB7), gpu_adapter(luid=0x5A01))  # a reboot, or the adapter was re-enabled
+        self.assertEqual((d["adapter_check"], d["adapter_note"]), ("pci", None))
+        self.assertNotIn("Warning", to_text(d))
+
+    def test_conflicting_vendors_are_refused_without_pci_addresses(self):
+        with self.assertRaisesRegex(ValueError, "vendor 0x10de vs 0x1002"):
+            self.pair(gpu_adapter(pci=None, vendor=0x10DE), gpu_adapter(pci=None, vendor=0x1002))
+
+    def test_stable_adapter_keys_separate_identical_gpus_off_windows(self):
+        # Linux and macOS keys derive from the PCI slot, so they hold from one snapshot to the next
+        with self.assertRaisesRegex(ValueError, "adapter key 0x1000 vs 0x2000"):
+            self.pair(gpu_adapter(luid=0x1000, pci=None), gpu_adapter(luid=0x2000, pci=None), backend="nvml")
+        d = self.pair(gpu_adapter(luid=0x1000, pci=None), gpu_adapter(luid=0x1000, pci=None), backend="nvml")
+        self.assertEqual((d["adapter_check"], d["adapter_note"]), ("key", None))
+
+    def test_a_windows_luid_alone_never_refuses_a_diff(self):
+        # Windows reassigns LUIDs at boot: without a PCI address on both sides a changed one proves nothing
+        d = self.pair(gpu_adapter(luid=0x4BB7, pci=None), gpu_adapter(luid=0x5A01, pci=None))
+        self.assertEqual(d["adapter_check"], "name-only")
+        self.assertIn("one GPU or two of the same model", d["adapter_note"])
+        self.assertIn("Warning: Their adapter keys differ", to_text(d))
+        mixed = self.pair(gpu_adapter(pci=(1, 0, 0)), gpu_adapter(pci=None))  # a PCI address on one side only
+        self.assertEqual(mixed["adapter_check"], "key")
+
+    def test_snapshots_with_nothing_to_compare_fall_back_to_name_and_backend_with_a_warning(self):
+        legacy = snap([], 0, 0)  # saved by a version that wrote no adapter details
+        for before, after in ((legacy, legacy), (legacy, {**legacy, "adapter": gpu_adapter()}),
+                              ({**legacy, "adapter": None}, {**legacy, "adapter": None})):
+            d = diff(before, after)
+            self.assertEqual(d["adapter_check"], "name-only")
+            self.assertIn("matched by GPU name and backend only", d["adapter_note"])
+            self.assertIn("Warning: These snapshots do not both say which adapter", to_text(d))
+
+    def test_zero_and_malformed_details_are_unknown_not_identities(self):
+        unknown = [{"luid": 0, "vendor_id": 0, "pci_address": None},  # zero means unknown, not "adapter 0"
+                   {"luid": "4BB7", "vendor_id": True, "pci_address": [1, 0]},  # wrong types, wrong length
+                   {"luid": None, "vendor_id": None, "pci_address": [1, 0, -1]}, "RTX", 7, []]
+        for backend in ("wddm", "nvml"):  # on nvml a real key mismatch would be refused
+            for bad in unknown:
+                d = self.pair(bad, gpu_adapter(luid=0x4BB7), backend=backend)
+                self.assertEqual(d["adapter_check"], "name-only", (backend, bad))
 
 
 class LoadAndCliTests(unittest.TestCase):
@@ -147,6 +278,21 @@ class LoadAndCliTests(unittest.TestCase):
                 contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
             main()
         self.assertIn("missing.json", err.getvalue())
+
+    def test_cli_refuses_conflicting_adapters_and_reports_what_was_compared(self):
+        a = self.write("a.json", snap([], 0, 0, adapter=gpu_adapter(pci=(1, 0, 0))), "utf-8")
+        b = self.write("b.json", snap([], 0, 0, adapter=gpu_adapter(pci=(2, 0, 0))), "utf-8")
+        err = io.StringIO()
+        with patch("sys.argv", ["gputaskman", "diff", a, b]), contextlib.redirect_stderr(err), \
+                self.assertRaises(SystemExit) as stop:
+            main()
+        self.assertEqual(stop.exception.code, 2)
+        self.assertIn("different adapters", err.getvalue())
+        c = self.write("c.json", snap([], 0, 0, adapter=gpu_adapter(luid=0x5A01)), "utf-16")  # same PCI slot, new boot
+        out = io.StringIO()
+        with patch("sys.argv", ["gputaskman", "diff", a, c, "--json"]), contextlib.redirect_stdout(out):
+            main()
+        self.assertEqual(json.loads(out.getvalue())["adapter_check"], "pci")
 
 
 if __name__ == "__main__":

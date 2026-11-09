@@ -12,9 +12,9 @@ import psutil
 
 from .amdsmi import AmdSmi, _bdf
 from .adl import Adl
-from .dxgi import VENDOR_NVIDIA, Adapter
+from .dxgi import VENDOR_AMD, VENDOR_NVIDIA, Adapter
 from .handy import HandyEvidence, inspect_handy
-from .llm import LlmView, ServerProber, build_view, gb, ollama_log_path
+from .llm import LlmView, ServerProber, api_key, build_view, gb, ollama_log_path
 from . import nvml as nvml_mod
 from .nvml import Nvml, NvDevice
 from .pdh import ProcGpu
@@ -54,6 +54,8 @@ class ProcRow:
     host: bool = False  # pid is from another PID namespace, never a local one (see origin)
     origin: str = ""  # with host: "windows" (a Windows process seen from WSL) | "outside" (outside this container)
     gpu_index: int | None = None
+    ram: int | None = None  # system RAM (working set) from host.py; None = unknown, not zero
+    cpu: float | None = None  # % of the whole machine from host.py; None until the second sample
 
     @property
     def key(self) -> str:
@@ -115,8 +117,8 @@ class Snapshot:
     vram_used: int | None  # WDDM adapter-wide dedicated usage
     shared_used: int | None
     procs: list[ProcRow] = field(default_factory=list)
-    backend: str = "wddm"  # wddm (Windows) | nvml (native Linux, NVIDIA) | drm (native Linux, AMD) | wsl (device-wide only) | metal (macOS)
-    process_status: str = ""  # amdgpu only: what the DRM process scan couldn't cover; empty when it saw everything
+    backend: str = "wddm"  # wddm (Windows) | nvml (native Linux, NVIDIA) | drm (native Linux, AMD or Intel) | wsl (device-wide only) | metal (macOS)
+    process_status: str = ""  # drm backend only: what the DRM process scan couldn't cover; empty when it saw everything
     host_status: str = ""  # WSL only: Windows host counters via interop -- ok | starting | off (...) | ...
     wsl_split: str = ""  # WSL only: why Linux rows have no (inferred) VRAM, when they don't
     # False on an APU (amdgpu iGPU): its GTT is ordinary GPU memory, not spill from a full VRAM.
@@ -182,7 +184,7 @@ class Collector:
     DEEP_TOP_N = 25  # memory-map candidates: the top N VRAM users plus anything busy
     _mac_driver = ""  # "macOS 26.3.1" on the metal backend, read once at startup
     SCAN_BUDGET = 0.15  # seconds of memory-map scanning per sample; leftovers wait for the next sample
-    drm_card = None  # the selected GPU's amdgpu card, when it is one (drm.DrmCard)
+    drm_card = None  # the selected GPU's AMD or Intel card, when it is one (drm.DrmCard)
 
     @property
     def backend(self) -> str:
@@ -203,7 +205,8 @@ class Collector:
             resources.callback(self.adl.close)
             resources.pop_all()
         self._mac_driver = f"macOS {macos_version()}".strip() if BACKEND == "metal" else ""
-        # Native Linux on an AMD GPU: device metrics from amdgpu's sysfs, processes from DRM fdinfo.
+        # Native Linux on an AMD or Intel GPU: device metrics from the driver's sysfs (Intel's are
+        # partial and get their fdinfo-derived used-memory stamp), processes from DRM fdinfo.
         drm = getattr(self.counters, "drm", None)
         if drm is not None and self.adapter and self.adapter.vendor_id != VENDOR_NVIDIA:
             self.drm_card = next((c for c in drm.cards if c.key == self.adapter.luid), None)
@@ -258,11 +261,12 @@ class Collector:
             from .drm import read_device
 
             nv = read_device(self.drm_card, self.gpu_index)
+        elif self.adapter and self.adapter.vendor_id != VENDOR_NVIDIA:
+            # NVML can't describe this GPU, and a sweep of every NVIDIA device costs ~60 ms per device.
+            nv = (self.adl.sample() or self.amdsmi.sample()) if self.adapter.vendor_id == VENDOR_AMD else None
         else:
             nvs = self.nvml.sample() if self.nvml.ok else []
             nv = select_nv_device(self.adapter, nvs, self.gpu_index, self.adapters)
-            if self.adapter and self.adapter.vendor_id == 0x1002:
-                nv = self.adl.sample() or self.amdsmi.sample()
         total = (nv.mem_total if nv else 0) or (self.adapter.dedicated_vram if self.adapter else 0)
 
         snap = Snapshot(
@@ -332,7 +336,9 @@ class Collector:
             if (row.detail.is_diffusion or row.kind not in AI_KINDS or not (row.detail.models or row.kind == "LLM")
                     or not {"dedicated", "shared"} <= row.gpu.available):
                 continue
-            own = self.prober.get(self.inspector.exclusive_ports(row.pid))
+            ports = self.inspector.exclusive_ports(row.pid)
+            key = api_key(row.detail.cmdline)
+            own = self.prober.get(ports, key)
             host = self.prober.get(self._parent_ports(row.pid))  # Ollama / LM Studio front-end process
             log = ollama_log_path() if row in ollama_runners and len(ollama_runners) == 1 else None
             # On an APU, GTT is the GPU's ordinary memory (often most of it), not spill: count it as held memory.
@@ -340,6 +346,12 @@ class Collector:
             row.llm = build_view(row.detail, held, row.gpu.shared if snap.shared_is_spill else 0,
                                  own or host, log, host=host if own else None,
                                  attributed=row.gpu.shown_vram is not None)
+            locked = None if own else self.prober.locked_port(ports)
+            if locked:
+                why = ("rejected the key from the launch arguments" if key else
+                       "wants an API key, and none was found in the launch arguments (keys from LLAMA_API_KEY "
+                       "or --api-key-file are not read)")
+                row.llm.notes.append(f"Local API on port {locked} {why}. Server details are skipped.")
 
         self.inspector.prune(set(procs))
         return snap

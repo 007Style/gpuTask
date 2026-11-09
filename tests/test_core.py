@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import asyncio
 import ctypes
 import io
@@ -27,12 +28,14 @@ from gputaskman.collector import Collector, ProcRow, Snapshot, select_adapter, s
 from gputaskman.dxgi import Adapter
 from gputaskman.gguf import GgufInfo, read_gguf
 from gputaskman.handy import HandyEvidence, inspect_handy, _log_cache, _settings_cache
-from gputaskman.llm import (LlmView, ServerInfo, build_view, is_gpu_device, llama_server_models, lmstudio_models,
-                            parse_flags, parse_load_log, probe_server)
+from gputaskman.host import HostSample
+from gputaskman.llm import (LlmView, ServerInfo, ServerProber, _get, api_key, build_view, is_gpu_device,
+                            llama_server_models, lmstudio_models, parse_flags, parse_load_log, probe_server,
+                            redact_cmdline)
 from gputaskman.nvml import NvDevice, Nvml
 from gputaskman.pdh import AdapterGpu, GpuCounters, ProcGpu
 from gputaskman.procinfo import (AI_KINDS, MappedModel, ProcDetail, ProcInspector, _is_model_file, _match_runtimes,
-                                _models_from_cmdline, classify, installed_models, make_model)
+                                _models_from_cmdline, classify, file_key, installed_models, make_model)
 from gputaskman.report import to_dict, to_text
 from gputaskman.stores import store_name
 from tools.capture_screenshots import for_publication
@@ -250,6 +253,27 @@ class MemoryTests(unittest.TestCase):
         Console(file=output, width=160).print(GpuTaskManager().render_device(s))
         self.assertIn("could not be matched", output.getvalue())
 
+    def test_nvml_is_swept_only_for_an_nvidia_adapter(self):
+        amd_telemetry = NvDevice(index=0, source="AMD ADL", util_gpu=5)
+        for vendor, swept, expected in ((0x1002, False, amd_telemetry), (0x8086, False, None),
+                                        (0x10DE, True, None)):
+            with self.subTest(vendor=hex(vendor)):
+                c = Collector.__new__(Collector)
+                c.adapter = Adapter(1, "GPU", vendor, 16 * GiB, 0, False, (1, 0, 0))
+                c.adapters = [c.adapter]
+                c.gpu_index, c.scan_budget, c.host, c.host_status = 0, None, None, ""
+                c.nvml = Mock(ok=True)
+                c.nvml.sample.return_value = []
+                c.adl, c.amdsmi = Mock(), Mock()
+                c.adl.sample.return_value = amd_telemetry
+                c.counters = Mock(outside={})
+                c.counters.sample.return_value = ({1: {}}, {1: AdapterGpu(dedicated=0, shared=0)})
+                c.inspector, c.prober = Mock(), Mock()
+                with patch("gputaskman.collector.BACKEND", "wddm"):
+                    s = c.sample()
+                self.assertEqual(c.nvml.sample.called, swept)
+                self.assertIs(s.nv, expected)
+
     def test_lost_nvml_telemetry_is_explained_not_silent(self):
         c = Collector.__new__(Collector)
         c.adapter = Adapter(1, "RTX 3060", 0x10DE, 12 * GiB, 0, False, (5, 0, 0))
@@ -335,6 +359,15 @@ class MemoryTests(unittest.TestCase):
         self.assertIn("N/A", to_text(s))
         s.procs[0].gpu.available.clear()
         self.assertIsNone(to_dict(s)["attributed"])
+
+    def test_started_at_is_the_creation_time_and_unknown_is_null(self):
+        s = snapshot()
+        s.procs[0].detail.create_time = 1762680123.4567891
+        s.procs.append(ProcRow(30, "browser.exe", "browser", ProcGpu(dedicated=GiB), ProcDetail(30, "browser.exe"),
+                               host=True, origin="windows"))
+        rows = to_dict(s)["processes"]
+        self.assertEqual(rows[0]["started_at"], 1762680123.457)
+        self.assertEqual([r["started_at"] for r in rows[1:]], [None, None])  # no creation time (0.0) is unknown, not 1970
 
     def test_missing_adapter_memory_is_not_reported_as_zero(self):
         s = snapshot()
@@ -746,10 +779,106 @@ class IdentityTests(unittest.TestCase):
                            "meta": {"ftype": "Q8_0", "n_ctx": 8192, "size": 447}}]}
         self.assertEqual(llama_server_models(llama, r"C:\m\Laya-Q8_0.gguf")[0]["type"], "decision")
 
+    def test_api_key_from_launch_arguments(self):
+        self.assertEqual(api_key(["llama-server", "--api-key", "abc"]), "abc")
+        self.assertEqual(api_key(["llama-server", "--api-key=abc,def"]), "abc")
+        self.assertIsNone(api_key(["llama-server", "-m", "x.gguf"]))
+        self.assertIsNone(api_key(["llama-server", "--api-key"]))
+        with tempfile.TemporaryDirectory() as root:  # a path from another process's command line is never opened
+            path = os.path.join(root, "keys.txt")
+            Path(path).write_text("file-key\n", encoding="utf-8")
+            self.assertIsNone(api_key(["llama-server", "--api-key-file", path]))
+            self.assertIsNone(api_key(["llama-server", f"--api-key-file={path}"]))
+            self.assertEqual(api_key(["llama-server", "--api-key-file", path, "--api-key", "abc"]), "abc")
+        self.assertEqual(redact_cmdline(["llama-server", "--api-key", "abc", "--api-key-file=/k", "--port", "8080"]),
+                         ["llama-server", "--api-key", "***", "--api-key-file=***", "--port", "8080"])
+        self.assertNotIn("api_key", str(parse_flags(["--api-key", "abc"])))
+
+    def test_llama_server_with_api_key(self):
+        """A real local HTTP server that only answers when the bearer token matches, like llama-server --api-key."""
+        import http.server
+        seen: list[tuple[str, str | None]] = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                auth = self.headers.get("Authorization")
+                seen.append((self.path, auth))
+                if auth != "Bearer s3cret":
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                body = {"/props": {"model_path": "/m/x.gguf", "total_slots": 2,
+                                   "default_generation_settings": {"n_ctx": 4096}},
+                        "/slots": [{"is_processing": True}, {"is_processing": False}]}.get(self.path)
+                self.send_response(200 if body is not None else 404)
+                self.end_headers()
+                if body is not None:
+                    self.wfile.write(json.dumps(body).encode())
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        port = server.server_address[1]
+        try:
+            prober = ServerProber()
+            self.assertIsNone(prober.get([port]))
+            self.assertEqual(prober.locked, {port})
+            self.assertEqual([p for p, _ in seen], ["/props"])  # stops at the first 401, no LM Studio/Ollama probes
+            seen.clear()
+            s = probe_server(port, key="s3cret")
+            self.assertEqual((s.kind, s.n_ctx, s.slots_busy, s.slots_total), ("llama-server", 4096, 1, 2))
+            self.assertTrue(all(auth == "Bearer s3cret" for _, auth in seen))
+            self.assertNotIn("s3cret", json.dumps(dataclasses.asdict(s)))
+            prober._cache.clear()
+            self.assertIsNotNone(prober.get([port], "s3cret"))
+            self.assertEqual(prober.locked, set())
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_api_key_is_not_forwarded_by_a_redirect(self):
+        import http.server
+        seen: dict[str, list[str | None]] = {"first": [], "other": []}
+
+        def handler(name, redirect_to=None):
+            class Handler(http.server.BaseHTTPRequestHandler):
+                def do_GET(self):
+                    seen[name].append(self.headers.get("Authorization"))
+                    self.send_response(302 if redirect_to else 200)
+                    if redirect_to:
+                        self.send_header("Location", redirect_to)
+                    self.end_headers()
+                    if not redirect_to:
+                        self.wfile.write(b"{}")
+
+                def log_message(self, *args):
+                    pass
+            return Handler
+
+        other = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler("other"))
+        first = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), handler("first", f"http://127.0.0.1:{other.server_address[1]}/props"))
+        for server in (other, first):
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            url = f"http://127.0.0.1:{first.server_address[1]}/props"
+            self.assertIsNone(_get(url, key="s3cret"))
+            self.assertEqual(len(seen["first"]), 1)
+            self.assertIsNotNone(seen["first"][0])  # the server the key belongs to did get it
+            self.assertEqual(seen["other"], [])  # the redirect target was never contacted
+            self.assertEqual(_get(url), {})  # requests without a key behave as before
+            self.assertEqual(seen["other"], [None])
+        finally:
+            for server in (other, first):
+                server.shutdown()
+                server.server_close()
+
     def test_lmstudio_falls_back_to_v0_when_v1_is_an_error(self):
         replies = {"/api/v1/models": {"error": "Unexpected endpoint or method. (GET /api/v1/models)"},
                    "/api/v0/models": {"data": [{"id": "qwen", "state": "loaded", "max_context_length": 8192}]}}
-        with patch("gputaskman.llm._get", side_effect=lambda url: next(
+        with patch("gputaskman.llm._get", side_effect=lambda url, **_: next(
                 (v for k, v in replies.items() if url.endswith(k)), None)):
             s = probe_server(1234)
         self.assertEqual((s.kind, s.models[0]["name"]), ("lmstudio", "qwen"))
@@ -774,6 +903,55 @@ class IdentityTests(unittest.TestCase):
                 ProcInspector().scan(detail)
         self.assertEqual(len(detail.models), 1)
         self.assertEqual(detail.models[0].sources, ["cmdline"])
+
+    def assert_one_model_under_two_spellings(self, mapped_path, launch_path):
+        detail = ProcDetail(6, "llama-server", cmdline=["server", "-m", launch_path])
+        with patch("gputaskman.procinfo._memory_maps", return_value=[SimpleNamespace(path=mapped_path, rss=0)]):
+            ProcInspector().scan(detail)
+        self.assertEqual([m.sources for m in detail.models], [["mapped", "cmdline"]])
+        server = ServerInfo("llama-server", "http://127.0.0.1:1", model_path=launch_path)
+        v = build_view(detail, 4 * MiB, 0, server)
+        self.assertEqual([f.sources for f in v.files + v.other_files], [["mapped", "cmdline", "api"]])
+
+    @unittest.skipUnless(os.name == "nt", "\\\\?\\ paths are Windows syntax")
+    def test_extended_length_launch_path_does_not_duplicate_the_mapped_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "model.gguf")
+            Path(path).write_bytes(bytes(4 * MiB))
+            self.assert_one_model_under_two_spellings(path, "\\\\?\\" + path)
+
+    def test_a_second_name_for_the_same_file_does_not_duplicate_the_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path, alias = str(Path(directory) / "model.gguf"), str(Path(directory) / "alias.gguf")
+            Path(path).write_bytes(bytes(4 * MiB))
+            try:
+                os.link(path, alias)
+            except OSError as error:
+                self.skipTest(f"hard links are unavailable here: {error}")
+            self.assert_one_model_under_two_spellings(path, alias)
+
+    def test_different_files_are_not_merged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first, second = str(Path(directory) / "a.gguf"), str(Path(directory) / "b.gguf")
+            for path in (first, second):
+                Path(path).write_bytes(bytes(4 * MiB))  # same size and bytes, still two files
+            detail = ProcDetail(6, "llama-server", cmdline=["server", "-m", second])
+            with patch("gputaskman.procinfo._memory_maps", return_value=[SimpleNamespace(path=first, rss=0)]):
+                ProcInspector().scan(detail)
+        self.assertEqual(sorted(m.sources for m in detail.models), [["cmdline"], ["mapped"]])
+
+    def test_file_key_is_the_file_and_falls_back_to_the_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            a, b = os.path.join(directory, "a.gguf"), os.path.join(directory, "b.gguf")
+            for path in (a, b):
+                Path(path).write_bytes(b"x")
+            self.assertEqual(file_key(a), file_key(os.path.join(directory, ".", "a.gguf")))
+            self.assertNotEqual(file_key(a), file_key(b))
+            missing = os.path.join(directory, "missing.gguf")
+            self.assertEqual(file_key(missing), os.path.normcase(os.path.abspath(missing)))  # unreadable: the path
+            self.assertEqual(file_key("model\0.gguf"), os.path.normcase(os.path.abspath("model\0.gguf")))  # odd API data
+            with patch("gputaskman.procinfo.os.stat", return_value=SimpleNamespace(st_ino=0, st_dev=7)):
+                self.assertEqual(file_key(a), os.path.normcase(os.path.abspath(a)))  # no file id: the path
 
     def test_ambiguous_extensions_need_size_or_store(self):
         self.assertFalse(_is_model_file(".bin", 10 * MiB, False, None))  # e.g. a Start menu tile cache
@@ -900,6 +1078,12 @@ class UiTests(unittest.IsolatedAsyncioTestCase):
         backend = patch("gputaskman.app.BACKEND", "wddm")
         backend.start()
         self.addCleanup(backend.stop)
+        # The monitor must not query this machine's processes: a fixed sample keeps these tests hardware-independent.
+        sampler = patch("gputaskman.app.HostSampler")
+        sampler.start().return_value.sample.return_value = HostSample(
+            cpu_pct=10.0, per_core=[10.0], logical=1, physical=1, ram_total=16 * GiB, ram_used=4 * GiB,
+            ram_available=12 * GiB, swap_total=0, swap_used=0)
+        self.addCleanup(sampler.stop)
 
     def chart_text(self, app):
         widget = app.query_one("#charts", Static)
@@ -1414,7 +1598,7 @@ class UiTests(unittest.IsolatedAsyncioTestCase):
                 app.apply(snapshot())
                 await pilot.pause()
                 self.assertEqual(app.selected_pid, 20)
-                for _ in app.SORTS:
+                for _ in app.sorts:
                     await pilot.press("s")
                 self.assertEqual(app.sort_idx, 0)
                 await pilot.press("a", "p")

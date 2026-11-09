@@ -18,11 +18,12 @@ from textual.widgets import DataTable, Footer, Markdown, Select, Static
 from textual.worker import get_current_worker
 
 from .collector import BACKEND, Collector, ProcRow, Snapshot, enumerate_adapters, ordered_adapters
-from .llm import gb
+from .host import HostSample, HostSampler
+from .llm import gb, redact_cmdline
 from .nvml import NvDevice, format_metric
 from .recovery import LiveCollectors
 from .report import (DRM_RESIDENT_NOTE, METAL_NOTE, WSL_EMPTY, drm_note, has_engine_counters, has_spill_counters, has_wddm_counters,
-                     inferred_note, vram_label, wsl_note)
+                     inferred_note, intel_memory_note, vram_label, vram_total_label, wsl_note)
 
 KIND_STYLE = {
     "LLM": "bold magenta", "decision": "bold orchid", "decision?": "orchid",
@@ -66,8 +67,8 @@ This display-only choice applies to all GPUs and resets to full when the app res
 
 | Layer | Source | Works for |
 |---|---|---|
-| **Device** telemetry | NVML, AMD ADL, or optional AMD SMI; amdgpu sysfs on Linux | availability varies by GPU and driver |
-| **Per-process** VRAM, spill to RAM, per-engine load | Windows WDDM counters (dxgkrnl); DRM fdinfo for amdgpu on Linux | workloads visible to WDDM or DRM |
+| **Device** telemetry | NVML, AMD ADL, or optional AMD SMI; amdgpu or Intel (i915) sysfs on Linux | availability varies by GPU and driver |
+| **Per-process** VRAM, spill to RAM, per-engine load | Windows WDDM counters (dxgkrnl); DRM fdinfo for amdgpu or Intel (i915) on Linux | workloads visible to WDDM or DRM |
 | **Which runtime** (CUDA, HIP, Vulkan, D3D12, ggml, ONNX, PyTorch...) | DLLs mapped in the process | everything |
 | **Which model file** | memory-mapped files + command line | llama.cpp, stable-diffusion.cpp, LM Studio, Ollama |
 | **Model name & kind** (LLM, decision, embedding, speech) | GGUF header, Ollama/LM Studio/Hugging Face stores, local server APIs | GGUF family |
@@ -91,7 +92,12 @@ GTT (GPU memory in system RAM, shown as SPILL), and gfx/compute/video engine tim
 first sample and for ROCm/HIP processes: their compute runs on `/dev/kfd` queues the kernel doesn't time per
 process). VRAM and SPILL are charged to a process only when its DRM clients are provably private: one holder,
 opened through a render node, and no shared buffers. Otherwise they show `n/a` and the bytes stay unattributed;
-the inspector still shows the resident bytes it can reach (shared buffers included, so not added up). Only processes you can inspect are
+the inspector still shows the resident bytes it can reach (shared buffers included, so not added up). **Intel GPUs
+on Linux** (`i915`) take the same path: sysfs for the device, fdinfo for engine load and, on a discrete Arc, local-memory
+VRAM. An integrated GPU shows engine load only (VRAM `n/a`), `xe` cards are detected but their per-process fdinfo isn't
+decoded yet (rows show `n/a`). With no device-wide memory counter, an Intel card's VRAM used is a sum over the processes
+it can inspect (shared buffers can be counted twice; kernel-owned memory and uninspectable processes are missing), its total is
+the size of the card's local-memory PCI window (an estimate), and free memory is not shown. Only processes you can inspect are
 listed, and the header says how many it couldn't; run with `sudo` to see other users'. Under **WSL**, Windows
 charges all Linux GPU memory to the VM (`vmwp.exe`), so VRAM and load are device-wide only; rows
 are Linux processes with `/dev/dxg` open and show `n/a` rather than a made-up share. When WSL
@@ -121,6 +127,13 @@ not necessarily current residency. A game's textures cannot be enumerated here.
 **GPU%** = busiest engine (like Task Manager). On GeForce/WDDM, CUDA kernels are usually reported
 on the **3D** engine. AMD device GPU charts show graphics-engine activity, which is not
 necessarily equivalent to NVML GPU utilization. Vulkan does not expose another process's HIP internals.
+
+**System panel, RAM and CPU% columns** are reported by the OS (`NtQuerySystemInformation` on Windows,
+psutil elsewhere), not by the GPU. RAM is a process's working set, shared pages included, so rows can add up
+to more than the machine uses; CPU% is its share of the whole machine, like Task Manager. This is system memory:
+it is never GPU bytes and never added to a GPU total. `n/a` means the OS wouldn't say (or it is a Windows-side
+row seen from WSL); `…` means one more sample is needed. Inside WSL they describe the Linux VM.
+`--no-system` hides them.
 
 Keys: `↑/↓` select · `s` sort · `c` chart · `a` show all · `p` pause · `?` this help · `q` quit
 
@@ -175,6 +188,7 @@ class GpuTaskManager(App):
     CSS = """
     Screen { layout: vertical; }
     #dashboard { height: auto; max-height: 50%; }
+    #system { height: auto; border: round $success; padding: 0 1; }
     #device { height: auto; border: round $accent; padding: 0 1; }
     #history { height: auto; border: round $secondary; padding: 0 1; }
     #chart-controls { height: 1; }
@@ -199,6 +213,8 @@ class GpuTaskManager(App):
     SORTS = [("VRAM", lambda r: -(r.gpu.shown_vram or 0)), ("GPU%", lambda r: -r.gpu.gpu_pct),
              ("spill", lambda r: -r.gpu.shared), ("paged", lambda r: -r.gpu.paged_out),
              ("name", lambda r: r.name.lower())]
+    SYSTEM_SORTS = [("RAM", lambda r: (r.ram is None, -(r.ram or 0))),  # unknown last; a measured 0 is not unknown
+                    ("CPU%", lambda r: (r.cpu is None, -(r.cpu or 0)))]
     CHART_COLORS = {
         "GPU": "#4ade80",
         "SM clock": "#fb923c",
@@ -211,8 +227,16 @@ class GpuTaskManager(App):
     }
     CHARTS = tuple(CHART_COLORS)
 
-    def __init__(self, gpu_index: int | None = None, interval: float = 1.0, host: bool = True) -> None:
+    def __init__(self, gpu_index: int | None = None, interval: float = 1.0, host: bool = True,
+                 system: bool = True) -> None:
         super().__init__()
+        self.system = system
+        self.sorts = self.SORTS + self.SYSTEM_SORTS if system else self.SORTS
+        self.host_sample: HostSample | None = None
+        self.host_error: str | None = None
+        self._sampler: HostSampler | None = None
+        self.hist_cpu: deque = deque(maxlen=60)
+        self.hist_ram: deque = deque(maxlen=60)
         self.gpu_index = gpu_index
         self.interval = interval
         self.host = host
@@ -250,6 +274,8 @@ class GpuTaskManager(App):
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="dashboard"):
             yield Static("Sampling GPU counters...", id="device")
+            if self.system:
+                yield Static("Sampling RAM and CPU...", id="system")
             with Vertical(id="history"):
                 with Horizontal(id="chart-controls"):
                     yield Static("Charts", id="chart-label")
@@ -267,7 +293,10 @@ class GpuTaskManager(App):
 
     def on_mount(self) -> None:
         t = self.query_one("#procs", DataTable)
-        for col in ("PID", "Process", "Kind", "Runtime", "VRAM", "Spill", "Paged", "GPU%", "3D", "Copy", "Video", "What's inside"):
+        cols = ["PID", "Process", "Kind", "Runtime", "VRAM", "Spill", "Paged", "GPU%", "3D", "Copy", "Video"]
+        if self.system:
+            cols += ["RAM", "CPU%"]
+        for col in (*cols, "What's inside"):
             t.add_column(col, key=col)
         t.focus()
         self.poll()
@@ -275,6 +304,7 @@ class GpuTaskManager(App):
     @work(thread=True, exclusive=True)
     def poll(self) -> None:
         worker = get_current_worker()
+        self._sample_host()  # the first reading only primes the CPU rates
         if BACKEND == "wddm":
             live = LiveCollectors(self.gpu_index, collector_factory=Collector, discover=enumerate_adapters)
             try:
@@ -282,8 +312,9 @@ class GpuTaskManager(App):
                 while not worker.is_cancelled:
                     if not self.paused:
                         snapshots = live.sample()
+                        host = self._sample_host()
                         if not worker.is_cancelled:
-                            self.call_from_thread(self.apply_all, snapshots)
+                            self.call_from_thread(self.apply_all, snapshots, host)
                     worker.cancelled_event.wait(self.interval)
             finally:
                 live.close()
@@ -303,18 +334,40 @@ class GpuTaskManager(App):
             while not worker.is_cancelled:
                 if not self.paused:
                     snapshots = [collector.sample() for collector in collectors]
+                    host = self._sample_host()
                     if not worker.is_cancelled:
-                        self.call_from_thread(self.apply_all, snapshots)
+                        self.call_from_thread(self.apply_all, snapshots, host)
                 worker.cancelled_event.wait(self.interval)
+
+    def _sample_host(self) -> HostSample | None:
+        """The RAM/CPU panel is optional: a failed OS query shows its reason and never stops GPU sampling."""
+        if not self.system:
+            return None
+        try:
+            if self._sampler is None:
+                self._sampler = HostSampler()
+            host = self._sampler.sample()
+        except Exception as error:
+            self.host_error = f"{type(error).__name__}: {error}"
+            return None
+        self.host_error = None
+        return host
 
     # ------------------------------------------------------------------ rendering
 
     def apply(self, snap: Snapshot) -> None:
         self.apply_all([snap])
 
-    def apply_all(self, snapshots: list[Snapshot]) -> None:
+    def apply_all(self, snapshots: list[Snapshot], host: HostSample | None = None) -> None:
         if not self.is_running:
             return  # A worker may finish sampling after shutdown has removed the widgets.
+        self.host_sample = host  # None after a failed sample: a stale reading is not shown as current
+        self.hist_cpu.append(host.cpu_pct if host else None)
+        self.hist_ram.append(100 * host.ram_used / host.ram_total if host and host.ram_total else None)
+        for snap in snapshots:
+            for row in snap.procs:  # Windows (W:) / outside (H:) rows have no local pid: RAM/CPU stay unknown
+                hp = host.proc(row.pid, row.detail.create_time) if host and not row.host else None
+                row.ram, row.cpu = (hp.rss, hp.cpu_pct) if hp else (None, None)
         multi = len(snapshots) > 1
         if self.snapshots and multi != (len(self.snapshots) > 1) and self.selected_key is not None:
             if multi:
@@ -389,11 +442,74 @@ class GpuTaskManager(App):
             if len(self.snapshots) > 1:
                 devices.append(Text(f"GPU {index}", style="bold"))
             devices.append(self.render_device(snap))
+        if self.system:
+            system = self.query_one("#system", Static)
+            system.border_title = "System (WSL VM, OS-reported)" if BACKEND == "wsl" else "System (OS-reported)"
+            if self.host_sample:
+                system.update(self.render_system(self.host_sample))
+            elif self.host_error:
+                system.update(Text(f"RAM/CPU unavailable: {self.host_error}", style="yellow"))
         device = self.query_one("#device", Static)
         device.border_title = "Slim monitoring" if self.monitoring else "Full diagnostics"
         device.update(
             Group(*devices) if len(self.snapshots) > 1 else devices[0])
         self.render_charts()
+
+    def render_system(self, h: HostSample) -> Group:
+        """System RAM and CPU as the OS reports them: system memory, never GPU bytes and never in a GPU total."""
+        min_bar = 8
+        room = self.size.width - 12  # what a line has left once the label, panel border, padding and scrollbar are counted
+
+        def line(text: str = "") -> Text:
+            return Text(text, no_wrap=True, overflow="ellipsis")  # never wraps onto a second row
+
+        ram_pct = 100 * h.ram_used / h.ram_total if h.ram_total else 0
+        ram_tail = line()
+        ram_tail.append(f" {gb(h.ram_used)} / {gb(h.ram_total)}", style="bold")
+        ram_tail.append(f"  {ram_pct:.0f}%", style="grey62")
+        optional = [(f"  free {gb(h.ram_available)}", "grey62")]
+        if h.swap_total:
+            optional.append((f"  {'pagefile' if os.name == 'nt' else 'swap'} {gb(h.swap_used)}/{gb(h.swap_total)}",
+                             "yellow" if h.swap_used > h.swap_total / 4 else "grey62"))
+        for extra, style in optional:  # detail is dropped, not wrapped, in a narrow window
+            if ram_tail.cell_len + len(extra) + min_bar <= room:
+                ram_tail.append(extra, style=style)
+        cpu_tail = line()
+        cpu_tail.append(f" {h.cpu_pct:4.0f}%", style="bold")
+        threads = f"  {h.logical} threads" + (f"/{h.physical} cores" if h.physical else "")
+        if not self.monitoring and cpu_tail.cell_len + len(threads) + min_bar <= room:
+            cpu_tail.append(threads, style="grey62")
+        # Both bars share one width, sized so the longer line still fits on a single row.
+        width = max(min_bar, min(60, room - max(ram_tail.cell_len, cpu_tail.cell_len)))
+        ram = line("RAM  ")
+        ram.append_text(stacked_bar([(h.ram_used, "dodger_blue2")], h.ram_total, width))
+        ram.append_text(ram_tail)
+        cpu = line("CPU  ")
+        cpu.append_text(stacked_bar([(h.cpu_pct, "green3")], 100, width))
+        cpu.append_text(cpu_tail)
+        if self.monitoring:
+            return Group(ram, cpu)
+        cores = line("     ")
+        for v in h.per_core:
+            cores.append(SPARK[min(int(v / 100 * (len(SPARK) - 1) + 0.5), len(SPARK) - 1)],
+                         style="red" if v >= 90 else "yellow" if v >= 60 else "green3")
+        cores.append("  per-thread", style="grey50")
+        history = max(8, min(30, (room - 18) // 2))  # each sparkline's width: two of them plus their labels share a row
+        hist = line("     ")
+        hist.append(spark(self.hist_cpu, history), style="green3")
+        hist.append(" CPU 60s   ", style="grey50")
+        hist.append(spark(self.hist_ram, history), style="dodger_blue2")
+        hist.append(" RAM 60s", style="grey50")
+        top_ram = line()
+        top_ram.append("     top RAM: ", style="grey62")
+        top_ram.append("  ".join(f"{p.name} {gb(p.rss)}" for p in h.top("rss", 5)))
+        top_cpu = line()
+        top_cpu.append("     top CPU: ", style="grey62")
+        rated = h.top("cpu_pct", 5)
+        busy = [p for p in rated if p.cpu_pct >= 0.5]
+        # "…" until some process has a CPU reading: no reading yet is not the same as idle
+        top_cpu.append("  ".join(f"{p.name} {p.cpu_pct:.0f}%" for p in busy) if busy else "idle" if rated else "…")
+        return Group(ram, cpu, cores, hist, top_ram, top_cpu)
 
     def render_device(self, s: Snapshot) -> Group:
         nv = s.nv
@@ -424,7 +540,7 @@ class GpuTaskManager(App):
         vram = Text("GPU mem " if s.backend == "metal" else "VRAM ")
         vram.append_text(stacked_bar(parts, s.vram_total, width))
         used_label = gb(s.vram_used) if s.vram_used is not None else "N/A"
-        vram.append(f" {used_label} / {gb(s.vram_total)}", style="bold")
+        vram.append(f" {used_label} / {vram_total_label(s)}", style="bold")
         legend = Text("     ")
         for k, v in order[:7]:
             legend.append("■ ", style=KIND_STYLE.get(k, "white"))
@@ -432,7 +548,7 @@ class GpuTaskManager(App):
         if other > 32 << 20:
             legend.append("■ ", style="grey35")
             legend.append(f"unattributed {gb(other)}  ")
-        if s.vram_used is not None:
+        if s.vram_used is not None and s.vram_total and not intel_memory_note(s):
             legend.append(f"free {gb(max(s.vram_total - s.vram_used, 0))}", style="grey62")
         if s.shared_used is not None and s.shared_used > 64 << 20:
             legend.append(f"   shared(RAM) {gb(s.shared_used)}", style="yellow")
@@ -442,6 +558,8 @@ class GpuTaskManager(App):
             legend.append("\n     " + wsl_note(s), style="grey62")
         if s.backend == "metal":
             legend.append("\n     " + METAL_NOTE, style="grey62")
+        if intel_memory_note(s):
+            legend.append("\n     " + intel_memory_note(s), style="grey62")
         if s.counter_status:
             legend.append("\n     " + s.counter_status, style="grey62")
         if s.process_status:
@@ -569,9 +687,9 @@ class GpuTaskManager(App):
         if not self.show_all:
             rows = [r for r in rows if not r.gpu.attributed or r.gpu.dedicated >= 32 << 20 or r.gpu.gpu_pct >= 1 or r.gpu.shared >= 64 << 20
                     or r.gpu.paged_out >= 128 << 20 or r.llm]
-        rows = sorted(rows, key=self.SORTS[self.sort_idx][1])
+        rows = sorted(rows, key=self.sorts[self.sort_idx][1])
         vm = next((i for i, r in enumerate(rows) if r.kind == "wsl-vm"), None)
-        if vm is not None and self.SORTS[self.sort_idx][0] == "VRAM":
+        if vm is not None and self.sorts[self.sort_idx][0] == "VRAM":
             # Linux rows share the WSL VM row's total: keep them under it, ordered by their inferred sizes.
             linux = [r for r in rows if not r.gpu.attributed and not r.host]
             rest = [r for r in rows if r not in linux]
@@ -586,7 +704,7 @@ class GpuTaskManager(App):
             rows = [r for r in rows if not (
                 self._row_snapshots[r.key].backend == "wsl" and not r.host and r.gpu_index != 0)]
         if len(self.snapshots) > 1 and not any(snap.backend == "wsl" for snap in self.snapshots):
-            rows.sort(key=self.SORTS[self.sort_idx][1])
+            rows.sort(key=self.sorts[self.sort_idx][1])
         keep = self.selected_key
         t.clear()
 
@@ -609,6 +727,11 @@ class GpuTaskManager(App):
                 spill = Text("n/a", justify="right", style="grey62")
             if wddm and not r.gpu.paged_available:
                 paged = Text("n/a", justify="right", style="grey62")
+            system_cells = []
+            if self.system:
+                known = r.ram is not None  # "…": readable, CPU% needs one more sample; "n/a": the OS wouldn't say
+                system_cells = [Text(gb(r.ram) if known else "n/a", justify="right", style="" if known else "grey62"),
+                                Text("…", justify="right", style="grey62") if known and r.cpu is None else pct(r.cpu)]
             t.add_row(
                 Text(r.pid_label, justify="right", style="grey62" if r.host else ""),
                 Text(r.name),
@@ -619,6 +742,7 @@ class GpuTaskManager(App):
                 pct(e.get("3d", 0) + e.get("compute", 0) if split else None),
                 pct(e.get("copy", 0) if split else None),
                 pct(e.get("decode", 0) + e.get("encode", 0) + e.get("video", 0) if split else None),
+                *system_cells,
                 Text(r.inside, style="magenta" if r.llm else "grey62", overflow="ellipsis", no_wrap=True),
                 *([Text("?" if s.backend == "wsl" and not r.host else str(r.gpu_index))]
                   if len(self.snapshots) > 1 else []),
@@ -629,7 +753,7 @@ class GpuTaskManager(App):
                 t.move_cursor(row=t.get_row_index(keep), animate=False, scroll=False)
             except Exception:
                 pass
-        t.border_subtitle = f"sort: {self.SORTS[self.sort_idx][0]}  ·  {'all' if self.show_all else 'top'} processes"
+        t.border_subtitle = f"sort: {self.sorts[self.sort_idx][0]}  ·  {'all' if self.show_all else 'top'} processes"
         if s.backend == "wsl" and not any(not r.host for r in s.procs):
             t.border_subtitle = WSL_EMPTY
 
@@ -755,7 +879,7 @@ class GpuTaskManager(App):
         if r.detail.ports:
             out.append(Text("listening: " + ", ".join(map(str, r.detail.ports[:8])), style="grey50"))
         if r.detail.cmdline:
-            out.append(Text(" ".join(r.detail.cmdline)[:400], style="grey42", overflow="ellipsis"))
+            out.append(Text(" ".join(redact_cmdline(r.detail.cmdline))[:400], style="grey42", overflow="ellipsis"))
         elif r.detail.access_denied:
             out.append(Text("(protected process - run elevated for runtime/file details)", style="grey42"))
         panel.update(Group(*out))
@@ -768,7 +892,7 @@ class GpuTaskManager(App):
             self.render_inspector()
 
     def action_cycle_sort(self) -> None:
-        self.sort_idx = (self.sort_idx + 1) % len(self.SORTS)
+        self.sort_idx = (self.sort_idx + 1) % len(self.sorts)
         if self.snap:
             self.render_table(self.snap)
 

@@ -596,6 +596,14 @@ model reload often restarts the server under a new PID. A process missing from o
 `not listed`, not zero: it was not running or used too little GPU to be listed. Processes that
 moved by less than 16 MB are hidden from the text output but included in `--json`.
 
+Two cards of one model share a name, so `diff` also compares the adapter each snapshot recorded.
+It refuses a pair whose vendor ID, PCI address or (off Windows) adapter key conflicts. A Windows
+adapter key changes at boot and when an adapter is re-enabled, so there it only produces a warning.
+`adapter_check` in `--json` says what was compared: `pci`, `key` or `name-only`. `name-only` means
+the snapshots (older ones, for example) do not both say which adapter they came from, so they were
+matched by GPU name and backend alone, and the text output warns. These identifiers tell GPUs apart
+within one machine; they do not prove two snapshots came from the same computer.
+
 Take the "after" snapshot once the model has answered one request: CUDA and Vulkan can allocate
 lazily, and allocators keep freed memory cached, so shrinkage may appear late. On an RTX 4080 SUPER
 with Docker Model Runner's llama-server (Vulkan) and gemma-3-270m, changing `-c 4096` to `-c 32768`

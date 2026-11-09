@@ -596,6 +596,15 @@ model reload often restarts the server under a new PID. A process missing from o
 `not listed`, not zero: it was not running or used too little GPU to be listed. Processes that
 moved by less than 16 MB are hidden from the text output but included in `--json`.
 
+A PID is not an identity, because both Windows and Linux reuse them. Each process in `--json` carries
+`started_at` (its creation time in Unix seconds, taken from data the monitor already reads). The same
+PID with start times more than 2 seconds apart is a different process, so no rule pairs it: the old
+one shows as `gone`, the new one as `new`, and the device totals still compare normally. A missing or
+`null` `started_at` (a protected process, a WSL host row, or a snapshot from an older version) never
+counts as a conflict, so those rows are paired as described above. Linux derives start times from the
+boot time in whole seconds, hence the 2-second allowance; a larger clock step can make one live
+process look reused, which shows as `gone` plus `new` and never as a wrong change.
+
 Two cards of one model share a name, so `diff` also compares the adapter each snapshot recorded.
 It refuses a pair whose vendor ID, PCI address or (off Windows) adapter key conflicts. A Windows
 adapter key changes at boot and when an adapter is re-enabled, so there it only produces a warning.

@@ -16,6 +16,7 @@ import os
 import re
 import sys
 import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
@@ -116,15 +117,70 @@ def ollama_log_path() -> str:
 
 # ---------------------------------------------------------------- local servers
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
 _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+# urllib forwards the Authorization header across redirects, so a request that carries a key never follows one.
+_keyed_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
 
 
-def _get(url: str, timeout: float = 0.5):
+_SECRET_FLAGS = ("--api-key", "--api-key-file")
+UNAUTHORIZED = object()  # _get result for HTTP 401: the server wants a key
+
+
+def api_key(cmd: list[str]) -> str | None:
+    """llama-server's API key from its own launch arguments, if it was given one there.
+
+    `--api-key` may list several comma-separated keys; any of them works. `--api-key-file` is not read: its path
+    comes from another process's command line, and opening it would read a file on that process's behalf. A key
+    set only through the LLAMA_API_KEY environment variable can't be seen from outside the process.
+    The key is only sent back to that process's own localhost port and is never stored or shown.
+    """
+    for i, arg in enumerate(cmd):
+        key, val = arg, None
+        if "=" in arg and arg.startswith("--"):
+            key, val = arg.split("=", 1)
+        if key != "--api-key":
+            continue
+        if val is None and i + 1 < len(cmd):
+            val = cmd[i + 1]
+        if val:
+            return next((k.strip() for k in val.split(",") if k.strip()), None)
+    return None
+
+
+def redact_cmdline(cmd: list[str]) -> list[str]:
+    """Command line with API keys and key-file paths replaced, for display."""
+    out, hide = [], False
+    for arg in cmd:
+        if hide:
+            out.append("***")
+            hide = False
+        elif arg in _SECRET_FLAGS:
+            out.append(arg)
+            hide = True
+        elif "=" in arg and arg.split("=", 1)[0] in _SECRET_FLAGS:
+            out.append(arg.split("=", 1)[0] + "=***")
+        else:
+            out.append(arg)
+    return out
+
+
+def _get(url: str, timeout: float = 0.5, key: str | None = None):
+    headers = {"Accept": "application/json"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
     try:
-        with _opener.open(urllib.request.Request(url, headers={"Accept": "application/json"}), timeout=timeout) as r:
+        with (_keyed_opener if key else _opener).open(urllib.request.Request(url, headers=headers),
+                                                       timeout=timeout) as r:
             if r.status != 200:
                 return None
             body = r.read(4 << 20)
+    except urllib.error.HTTPError as e:
+        return UNAUTHORIZED if e.code == 401 else None
     except Exception:
         return None
     try:
@@ -195,10 +251,16 @@ def lmstudio_models(v1: dict | None, v0: dict | None) -> list[dict] | None:
     return None
 
 
-def probe_server(port: int, prev: ServerInfo | None = None) -> ServerInfo | None:
-    """Read-only GETs. Never calls inference, load or download endpoints."""
+def probe_server(port: int, prev: ServerInfo | None = None, key: str | None = None) -> ServerInfo | None:
+    """Read-only GETs. Never calls inference, load or download endpoints.
+
+    Returns UNAUTHORIZED when the port answers 401 and no key (or a wrong one) was sent. Probing stops there,
+    so a locked server logs one rejected request per probe instead of one per endpoint.
+    """
     base = f"http://127.0.0.1:{port}"
-    props = _get(base + "/props")
+    props = _get(base + "/props", key=key)
+    if props is UNAUTHORIZED:
+        return UNAUTHORIZED
     if isinstance(props, dict) and ("default_generation_settings" in props or "model_path" in props):
         s = ServerInfo("llama-server", base, model_path=props.get("model_path"))
         dgs = props.get("default_generation_settings") or {}
@@ -207,13 +269,13 @@ def probe_server(port: int, prev: ServerInfo | None = None) -> ServerInfo | None
         if prev and prev.kind == "llama-server" and prev.model_path == s.model_path:
             s.models = prev.models  # identity only changes when the model does
         else:
-            v1 = _get(base + "/v1/models")
+            v1 = _get(base + "/v1/models", key=key)
             s.models = llama_server_models(v1, s.model_path) if isinstance(v1, dict) else []
-        slots = _get(base + "/slots")
+        slots = _get(base + "/slots", key=key)
         if isinstance(slots, list):
             s.slots_total = len(slots)
             s.slots_busy = sum(1 for x in slots if x.get("is_processing"))
-        metrics = _get(base + "/metrics")
+        metrics = _get(base + "/metrics", key=key)
         if isinstance(metrics, str):
             s.gen_tok_s = _metric(metrics, "predicted_tokens_seconds")
             s.prompt_tok_s = _metric(metrics, "prompt_tokens_seconds")
@@ -238,21 +300,31 @@ class ServerProber:
     def __init__(self) -> None:
         self._cache: dict[int, tuple[float, ServerInfo | None]] = {}
         self._last: dict[int, ServerInfo] = {}
+        self.locked: set[int] = set()  # ports whose last probe was refused with 401
 
-    def get(self, ports: list[int]) -> ServerInfo | None:
+    def get(self, ports: list[int], key: str | None = None) -> ServerInfo | None:
         now = time.time()
         for port in ports:
             hit = self._cache.get(port)
             if hit and now - hit[0] < (self.TTL_HIT if hit[1] else self.TTL_MISS):
                 info = hit[1]
             else:
-                info = probe_server(port, self._last.get(port))
+                info = probe_server(port, self._last.get(port), key)
+                if info is UNAUTHORIZED:
+                    self.locked.add(port)
+                    info = None
+                else:
+                    self.locked.discard(port)
                 self._cache[port] = (now, info)
                 if info:
                     self._last[port] = info
             if info:
                 return info
         return None
+
+    def locked_port(self, ports: list[int]) -> int | None:
+        """First of these ports whose last probe was refused for a missing or wrong API key."""
+        return next((p for p in ports if p in self.locked), None)
 
 
 # ---------------------------------------------------------------- the breakdown

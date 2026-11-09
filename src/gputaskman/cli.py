@@ -38,6 +38,7 @@ def main() -> None:
     ap.add_argument("--list-gpus", action="store_true", help="list selectable GPU adapters and exit")
     ap.add_argument("--no-host", action="store_true",
                     help="WSL: don't read Windows host GPU counters through interop (WSL VM total, Windows apps)")
+    ap.add_argument("--no-system", action="store_true", help="hide the system RAM/CPU panel and columns")
     ap.add_argument("-i", "--interval", type=float, default=1.0, help="refresh seconds (default 1)")
     args = ap.parse_args()
     if args.gpu is not None and args.gpu < 0:
@@ -65,6 +66,7 @@ def main() -> None:
 
     if args.once or args.json:
         from .collector import Collector
+        from .host import HostSampler
         from .report import dump
 
         try:
@@ -76,12 +78,15 @@ def main() -> None:
                 c.host.wait(15.0)  # WSL: the first Windows counter sample takes several seconds
             if hasattr(c.counters, "warm_up"):
                 c.counters.warm_up(15.0)  # macOS: per-process GPU memory comes from a background footprint pass
+            hs = None if args.no_system else HostSampler()
+            if hs:
+                hs.sample()  # CPU% is a rate too; this primes it
             time.sleep(1.0)  # engine utilization is a rate; needs two samples
-            print(dump(c.sample(), args.json))
+            print(dump(c.sample(), args.json, hs.sample() if hs else None))
         finally:
             c.close()
         return
 
     from .app import GpuTaskManager
 
-    GpuTaskManager(gpu_index=args.gpu, interval=args.interval, host=not args.no_host).run()
+    GpuTaskManager(gpu_index=args.gpu, interval=args.interval, host=not args.no_host, system=not args.no_system).run()

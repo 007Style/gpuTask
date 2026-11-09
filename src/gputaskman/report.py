@@ -250,5 +250,13 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
     return "\n".join(out)
 
 
-def dump(s: Snapshot, as_json: bool) -> str:
-    return json.dumps(to_dict(s), indent=2, default=str) if as_json else to_text(s)
+def dump(s: Snapshot, as_json: bool, host=None) -> str:
+    """host: an optional host.HostSample (system RAM/CPU), added as a "host" section."""
+    from . import host as hostmod
+
+    if as_json:
+        d = to_dict(s)
+        if host is not None:
+            d["host"] = hostmod.to_dict(host)
+        return json.dumps(d, indent=2, default=str)
+    return to_text(s) + ("\n\n" + hostmod.to_text(host) if host is not None else "")

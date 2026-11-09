@@ -17,6 +17,7 @@ from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Markdown, Select, Static
 from textual.worker import get_current_worker
 
+from .host import HostSample, HostSampler
 from .collector import BACKEND, Collector, ProcRow, Snapshot, enumerate_adapters, ordered_adapters
 from .llm import gb
 from .nvml import NvDevice, format_metric
@@ -174,6 +175,7 @@ class GpuTaskManager(App):
     CSS = """
     Screen { layout: vertical; }
     #dashboard { height: auto; max-height: 50%; }
+    #system { height: auto; border: round $success; padding: 0 1; }
     #device { height: auto; border: round $accent; padding: 0 1; }
     #history { height: auto; border: round $secondary; padding: 0 1; }
     #chart-controls { height: 1; }
@@ -196,6 +198,7 @@ class GpuTaskManager(App):
         Binding("question_mark", "help", "Explain"),
     ]
     SORTS = [("VRAM", lambda r: -(r.gpu.shown_vram or 0)), ("GPU%", lambda r: -r.gpu.gpu_pct),
+             ("RAM", lambda r: -(r.ram or 0)), ("CPU%", lambda r: -(r.cpu or 0)),
              ("spill", lambda r: -r.gpu.shared), ("paged", lambda r: -r.gpu.paged_out),
              ("name", lambda r: r.name.lower())]
     CHART_COLORS = {
@@ -210,8 +213,13 @@ class GpuTaskManager(App):
     }
     CHARTS = tuple(CHART_COLORS)
 
-    def __init__(self, gpu_index: int | None = None, interval: float = 1.0, host: bool = True) -> None:
+    def __init__(self, gpu_index: int | None = None, interval: float = 1.0, host: bool = True,
+                 system: bool = True) -> None:
         super().__init__()
+        self.system = system
+        self.host_sample: HostSample | None = None
+        self.hist_cpu: deque = deque(maxlen=60)
+        self.hist_ram: deque = deque(maxlen=60)
         self.gpu_index = gpu_index
         self.interval = interval
         self.host = host
@@ -248,6 +256,8 @@ class GpuTaskManager(App):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="dashboard"):
+            if self.system:
+                yield Static("Sampling RAM and CPU...", id="system")
             yield Static("Sampling GPU counters...", id="device")
             with Vertical(id="history"):
                 with Horizontal(id="chart-controls"):
@@ -266,7 +276,10 @@ class GpuTaskManager(App):
 
     def on_mount(self) -> None:
         t = self.query_one("#procs", DataTable)
-        for col in ("PID", "Process", "Kind", "Runtime", "VRAM", "Spill", "Paged", "GPU%", "3D", "Copy", "Video", "What's inside"):
+        cols = ["PID", "Process", "Kind", "Runtime", "VRAM", "Spill", "Paged", "GPU%", "3D", "Copy", "Video"]
+        if self.system:
+            cols += ["RAM", "CPU%"]
+        for col in (*cols, "What's inside"):
             t.add_column(col, key=col)
         t.focus()
         self.poll()
@@ -285,12 +298,14 @@ class GpuTaskManager(App):
                     collector.host_status = "off (multi-GPU WSL host matching is not validated; use --gpu N)"
                 stack.callback(collector.close)
                 collectors.append(collector)
+            hs = HostSampler() if self.system else None
             worker.cancelled_event.wait(0.5)
             while not worker.is_cancelled:
                 if not self.paused:
                     snapshots = [collector.sample() for collector in collectors]
+                    host = hs.sample() if hs else None
                     if not worker.is_cancelled:
-                        self.call_from_thread(self.apply_all, snapshots)
+                        self.call_from_thread(self.apply_all, snapshots, host)
                 worker.cancelled_event.wait(self.interval)
 
     # ------------------------------------------------------------------ rendering
@@ -298,10 +313,18 @@ class GpuTaskManager(App):
     def apply(self, snap: Snapshot) -> None:
         self.apply_all([snap])
 
-    def apply_all(self, snapshots: list[Snapshot]) -> None:
+    def apply_all(self, snapshots: list[Snapshot], host: HostSample | None = None) -> None:
         if not self.is_running:
             return  # A worker may finish sampling after shutdown has removed the widgets.
         self.snapshots = snapshots
+        if host is not None:
+            self.host_sample = host
+            self.hist_cpu.append(host.cpu_pct)
+            self.hist_ram.append(100 * host.ram_used / host.ram_total if host.ram_total else None)
+        for snap in snapshots:
+            for row in snap.procs:  # Windows (W:) / outside (H:) rows have no local pid: RAM/CPU stay unknown
+                hp = self.host_sample.proc(row.pid) if self.host_sample and not row.host else None
+                row.ram, row.cpu = (hp.rss, hp.cpu_pct) if hp else (None, None)
         multi = len(snapshots) > 1
         table = self.query_one("#procs", DataTable)
         if multi and "GPU" not in table.columns:
@@ -370,11 +393,48 @@ class GpuTaskManager(App):
             if len(self.snapshots) > 1:
                 devices.append(Text(f"GPU {index}", style="bold"))
             devices.append(self.render_device(snap))
+        if self.system and self.host_sample:
+            self.query_one("#system", Static).update(self.render_system(self.host_sample))
         device = self.query_one("#device", Static)
         device.border_title = "Slim monitoring" if self.monitoring else "Full diagnostics"
         device.update(
             Group(*devices) if len(self.snapshots) > 1 else devices[0])
         self.render_charts()
+
+    def render_system(self, h: HostSample) -> Group:
+        """System RAM + CPU (fork addition). All values are OS-reported via psutil / NtQuerySystemInformation."""
+        width = max(min(self.size.width - 50, 80), 16)
+        ram_pct = 100 * h.ram_used / h.ram_total if h.ram_total else 0
+        ram = Text("RAM  ")
+        ram.append_text(stacked_bar([(h.ram_used, "dodger_blue2")], h.ram_total, width))
+        ram.append(f" {gb(h.ram_used)} / {gb(h.ram_total)}", style="bold")
+        ram.append(f"  {ram_pct:.0f}%  free {gb(h.ram_available)}", style="grey62")
+        if h.swap_total:
+            ram.append(f"  pagefile {gb(h.swap_used)}/{gb(h.swap_total)}",
+                       style="yellow" if h.swap_used > h.swap_total / 4 else "grey62")
+        cpu = Text("CPU  ")
+        cpu.append_text(stacked_bar([(h.cpu_pct, "green3")], 100, width))
+        cpu.append(f" {h.cpu_pct:4.0f}%", style="bold")
+        cpu.append(f"  {h.logical} threads" + (f"/{h.physical} cores" if h.physical else "")
+                   + (f"  {h.cpu_mhz:.0f} MHz" if h.cpu_mhz else ""), style="grey62")
+        cores = Text("     ")
+        for v in h.per_core:
+            cores.append(SPARK[min(int(v / 100 * (len(SPARK) - 1) + 0.5), len(SPARK) - 1)],
+                         style="red" if v >= 90 else "yellow" if v >= 60 else "green3")
+        cores.append("  per-thread", style="grey50")
+        hist = Text("     ")
+        hist.append(spark(self.hist_cpu, 30), style="green3")
+        hist.append(" CPU 60s   ", style="grey50")
+        hist.append(spark(self.hist_ram, 30), style="dodger_blue2")
+        hist.append(" RAM 60s", style="grey50")
+        lines = [ram, cpu, cores, hist]
+        if not self.monitoring:
+            top = Text("     top RAM: ", style="grey62")
+            top.append("  ".join(f"{p.name} {gb(p.rss)}" for p in h.top("rss", 5)))
+            top.append("\n     top CPU: ", style="grey62")
+            top.append("  ".join(f"{p.name} {p.cpu_pct:.0f}%" for p in h.top("cpu_pct", 5) if p.cpu_pct >= 0.5) or "idle")
+            lines.append(top)
+        return Group(*lines)
 
     def render_device(self, s: Snapshot) -> Group:
         nv = s.nv
@@ -600,6 +660,10 @@ class GpuTaskManager(App):
                 pct(e.get("3d", 0) + e.get("compute", 0) if split else None),
                 pct(e.get("copy", 0) if split else None),
                 pct(e.get("decode", 0) + e.get("encode", 0) + e.get("video", 0) if split else None),
+                *([Text(gb(r.ram) if r.ram is not None else "n/a", justify="right",
+                        style="" if r.ram is not None else "grey62"),
+                   pct(r.cpu) if r.cpu is not None or r.host else Text("…", justify="right", style="grey62")]
+                  if self.system else []),
                 Text(r.inside, style="magenta" if r.llm else "grey62", overflow="ellipsis", no_wrap=True),
                 *([Text("?" if s.backend == "wsl" and not r.host else str(r.gpu_index))]
                   if len(self.snapshots) > 1 else []),

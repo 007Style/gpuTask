@@ -656,6 +656,7 @@ Identification is designed to stay cheap. Measured on one Windows machine:
 | macOS: `ioreg` device stats + Metal clients | ~10 ms | Every refresh |
 | macOS: memory-map scan (`proc_pidinfo` region walk) | ~4 ms per process | Same policy as the memory-map scan above |
 | macOS: `footprint` GPU memory | ~70 ms per process, background thread | Busy and new processes every ~2 s, idle ones every 30 s (54 runs in 40 s with 27 GPU processes, M4 Mac mini) |
+| System RAM/CPU panel (fork): Windows `NtQuerySystemInformation` process list + psutil totals | ~6 ms for ~480 processes (Windows 11, i9-13900K) | Every refresh; `--no-system` turns it off. psutil per-process `memory_info`/`cpu_times` took ~1 s per pass here, so it is only the non-Windows fallback |
 
 With two llama-servers running, a steady refresh costs roughly 15-30 ms of CPU (about 340 ms before
 process details were cached).

@@ -144,17 +144,67 @@ def _size(p: dict) -> int:
     return v["after"] if v["after"] is not None else v["before"] or 0
 
 
+def _num(v) -> int | None:
+    return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+
+def _identity(s: dict) -> dict:
+    """What a snapshot says about its adapter that can be compared: vendor, PCI address, adapter key.
+
+    Missing, zero (unknown) and malformed values are left out, so they can never conflict."""
+    a = s.get("adapter")
+    a = a if isinstance(a, dict) else {}
+    out = {name: a[field] for field, name in (("vendor_id", "vendor"), ("luid", "key")) if _num(a.get(field))}
+    pci = a.get("pci_address")
+    if isinstance(pci, (list, tuple)) and len(pci) == 3 and all(_num(x) is not None and x >= 0 for x in pci):
+        out["pci"] = tuple(pci)
+    return out
+
+
+def check_adapter(before: dict, after: dict) -> tuple[str, str | None]:
+    """How firmly two snapshots with the same GPU name are tied to one adapter: ("pci" | "key" | "name-only", note).
+
+    Raises ValueError when both snapshots say which adapter they came from and the answers differ. A matching
+    PCI address wins over the adapter key, which Windows reassigns at boot and when an adapter is re-enabled,
+    so there a differing key is only a warning. Both identifiers are host-local: they tell two GPUs in one
+    machine apart, not two computers.
+    """
+    b, a = _identity(before), _identity(after)
+
+    def different(what: str) -> ValueError:
+        return ValueError(f"snapshots are from different adapters, though both are named {after.get('gpu')!r}: {what}")
+
+    if "vendor" in b and "vendor" in a and b["vendor"] != a["vendor"]:
+        raise different(f"vendor {b['vendor']:#06x} vs {a['vendor']:#06x}")
+    if "pci" in b and "pci" in a:
+        if b["pci"] != a["pci"]:
+            raise different("PCI " + " vs ".join("{:02x}:{:02x}.{}".format(*x) for x in (b["pci"], a["pci"])))
+        return "pci", None
+    if "key" in b and "key" in a:
+        if b["key"] == a["key"]:
+            return "key", None
+        if after.get("backend") != "wddm":
+            raise different(f"adapter key {b['key']:#x} vs {a['key']:#x}")
+        return "name-only", ("Their adapter keys differ and no PCI address is available to settle it. Windows changes "
+                             "those keys at boot, so this may be one GPU or two of the same model; they are matched "
+                             "by GPU name and backend only.")
+    return "name-only", ("These snapshots do not both say which adapter they came from (an older gputaskman, or no "
+                         "adapter details), so they are matched by GPU name and backend only.")
+
+
 def diff(before: dict, after: dict) -> dict:
     if before.get("gpu") != after.get("gpu") or before.get("backend") != after.get("backend"):
         raise ValueError(f"snapshots are from different GPUs or backends: "
                          f"{before.get('gpu')} ({before.get('backend')}) vs {after.get('gpu')} ({after.get('backend')})")
+    adapter_check, adapter_note = check_adapter(before, after)
     device = {k: change(before.get(k), after.get(k)) for k, _ in DEVICE if k != "unattributed"}
     device["unattributed"] = change(_unattributed(before), _unattributed(after))
     procs = [_proc(b, a, how) for b, a, how in match(before["processes"], after["processes"])]
     procs.sort(key=_size, reverse=True)
     taken_b, taken_a = before.get("taken"), after.get("taken")
     seconds = round(taken_a - taken_b, 1) if isinstance(taken_b, (int, float)) and isinstance(taken_a, (int, float)) else None
-    return {"gpu": after.get("gpu"), "backend": after.get("backend"), "seconds": seconds,
+    return {"gpu": after.get("gpu"), "backend": after.get("backend"),
+            "adapter_check": adapter_check, "adapter_note": adapter_note, "seconds": seconds,
             "memory_note": after.get("memory_note") or before.get("memory_note"),
             "device": device, "processes": procs}
 
@@ -205,8 +255,10 @@ def to_text(d: dict) -> str:
     when = f", {d['seconds']} s apart" if d["seconds"] is not None else ""
     out = [f"gputaskman diff: {d['gpu'] or 'unknown GPU'} ({d['backend']}){when}",
            "Measured counters are compared directly. Runtime-reported and estimated values are listed",
-           "separately and are not added to measured totals.", "",
-           f"{'DEVICE (measured)':<26}{'BEFORE':>11}{'AFTER':>11}{'CHANGE':>11}"]
+           "separately and are not added to measured totals."]
+    if d.get("adapter_note"):
+        out.append(f"Warning: {d['adapter_note']}")
+    out += ["", f"{'DEVICE (measured)':<26}{'BEFORE':>11}{'AFTER':>11}{'CHANGE':>11}"]
     for key, label in DEVICE:
         c = d["device"][key]
         out.append(f"{label:<26}{_gb(c['before']):>11}{_gb(c['after']):>11}{_signed(c['delta']):>11}")

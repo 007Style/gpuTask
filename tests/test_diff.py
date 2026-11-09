@@ -22,9 +22,15 @@ def proc(pid, name, vram=None, shared=0, host=None, ports=(), llm=None, files=()
             **({"llm": llm} if llm else {})}
 
 
-def snap(procs, used, attributed, taken=100.0, gpu="RTX", backend="wddm"):
+def snap(procs, used, attributed, taken=100.0, gpu="RTX", backend="wddm", adapter=...):
     return {"taken": taken, "gpu": gpu, "backend": backend, "vram_used": used, "shared_used": 0,
-            "attributed": attributed, "processes": procs}
+            "attributed": attributed, "processes": procs, **({} if adapter is ... else {"adapter": adapter})}
+
+
+def gpu_adapter(luid=0x4BB7, pci=(1, 0, 0), vendor=0x10DE):
+    """The adapter block of a --json snapshot (a dataclass dump: the PCI address is a list)."""
+    return {"luid": luid, "name": "RTX", "vendor_id": vendor, "dedicated_vram": 16 * GiB, "shared_system": 0,
+            "software": False, "pci_address": list(pci) if pci else None}
 
 
 def llm(n_ctx, kv, exact=False):
@@ -125,6 +131,58 @@ class DiffTests(unittest.TestCase):
         self.assertNotIn("llama (1)", to_text(d))
 
 
+class AdapterGuardTests(unittest.TestCase):
+    def pair(self, before, after, backend="wddm"):
+        return diff(snap([], 0, 0, backend=backend, adapter=before), snap([], 0, 0, backend=backend, adapter=after))
+
+    def test_same_name_but_different_pci_addresses_are_not_one_gpu(self):
+        with self.assertRaisesRegex(ValueError, r"different adapters.*'RTX'.*PCI 01:00\.0 vs 02:00\.0"):
+            self.pair(gpu_adapter(pci=(1, 0, 0)), gpu_adapter(pci=(2, 0, 0)))
+
+    def test_a_matching_pci_address_survives_a_changed_luid(self):
+        d = self.pair(gpu_adapter(luid=0x4BB7), gpu_adapter(luid=0x5A01))  # a reboot, or the adapter was re-enabled
+        self.assertEqual((d["adapter_check"], d["adapter_note"]), ("pci", None))
+        self.assertNotIn("Warning", to_text(d))
+
+    def test_conflicting_vendors_are_refused_without_pci_addresses(self):
+        with self.assertRaisesRegex(ValueError, "vendor 0x10de vs 0x1002"):
+            self.pair(gpu_adapter(pci=None, vendor=0x10DE), gpu_adapter(pci=None, vendor=0x1002))
+
+    def test_stable_adapter_keys_separate_identical_gpus_off_windows(self):
+        # Linux and macOS keys derive from the PCI slot, so they hold from one snapshot to the next
+        with self.assertRaisesRegex(ValueError, "adapter key 0x1000 vs 0x2000"):
+            self.pair(gpu_adapter(luid=0x1000, pci=None), gpu_adapter(luid=0x2000, pci=None), backend="nvml")
+        d = self.pair(gpu_adapter(luid=0x1000, pci=None), gpu_adapter(luid=0x1000, pci=None), backend="nvml")
+        self.assertEqual((d["adapter_check"], d["adapter_note"]), ("key", None))
+
+    def test_a_windows_luid_alone_never_refuses_a_diff(self):
+        # Windows reassigns LUIDs at boot: without a PCI address on both sides a changed one proves nothing
+        d = self.pair(gpu_adapter(luid=0x4BB7, pci=None), gpu_adapter(luid=0x5A01, pci=None))
+        self.assertEqual(d["adapter_check"], "name-only")
+        self.assertIn("one GPU or two of the same model", d["adapter_note"])
+        self.assertIn("Warning: Their adapter keys differ", to_text(d))
+        mixed = self.pair(gpu_adapter(pci=(1, 0, 0)), gpu_adapter(pci=None))  # a PCI address on one side only
+        self.assertEqual(mixed["adapter_check"], "key")
+
+    def test_snapshots_with_nothing_to_compare_fall_back_to_name_and_backend_with_a_warning(self):
+        legacy = snap([], 0, 0)  # saved by a version that wrote no adapter details
+        for before, after in ((legacy, legacy), (legacy, {**legacy, "adapter": gpu_adapter()}),
+                              ({**legacy, "adapter": None}, {**legacy, "adapter": None})):
+            d = diff(before, after)
+            self.assertEqual(d["adapter_check"], "name-only")
+            self.assertIn("matched by GPU name and backend only", d["adapter_note"])
+            self.assertIn("Warning: These snapshots do not both say which adapter", to_text(d))
+
+    def test_zero_and_malformed_details_are_unknown_not_identities(self):
+        unknown = [{"luid": 0, "vendor_id": 0, "pci_address": None},  # zero means unknown, not "adapter 0"
+                   {"luid": "4BB7", "vendor_id": True, "pci_address": [1, 0]},  # wrong types, wrong length
+                   {"luid": None, "vendor_id": None, "pci_address": [1, 0, -1]}, "RTX", 7, []]
+        for backend in ("wddm", "nvml"):  # on nvml a real key mismatch would be refused
+            for bad in unknown:
+                d = self.pair(bad, gpu_adapter(luid=0x4BB7), backend=backend)
+                self.assertEqual(d["adapter_check"], "name-only", (backend, bad))
+
+
 class LoadAndCliTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
@@ -159,6 +217,21 @@ class LoadAndCliTests(unittest.TestCase):
                 contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
             main()
         self.assertIn("missing.json", err.getvalue())
+
+    def test_cli_refuses_conflicting_adapters_and_reports_what_was_compared(self):
+        a = self.write("a.json", snap([], 0, 0, adapter=gpu_adapter(pci=(1, 0, 0))), "utf-8")
+        b = self.write("b.json", snap([], 0, 0, adapter=gpu_adapter(pci=(2, 0, 0))), "utf-8")
+        err = io.StringIO()
+        with patch("sys.argv", ["gputaskman", "diff", a, b]), contextlib.redirect_stderr(err), \
+                self.assertRaises(SystemExit) as stop:
+            main()
+        self.assertEqual(stop.exception.code, 2)
+        self.assertIn("different adapters", err.getvalue())
+        c = self.write("c.json", snap([], 0, 0, adapter=gpu_adapter(luid=0x5A01)), "utf-16")  # same PCI slot, new boot
+        out = io.StringIO()
+        with patch("sys.argv", ["gputaskman", "diff", a, c, "--json"]), contextlib.redirect_stdout(out):
+            main()
+        self.assertEqual(json.loads(out.getvalue())["adapter_check"], "pci")
 
 
 if __name__ == "__main__":

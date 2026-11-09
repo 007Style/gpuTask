@@ -79,7 +79,7 @@ identify everything immediately; the TUI spreads scans across refreshes.
 | Support an app that reads and closes its model | `handy.py` as the template | Read-only settings plus a bounded, mtime-cached log tail; never read transcription content. Generalize into data-driven adapters once a second app needs one |
 | Add a GPU vendor or backend | `dxgi.py`, `collector.py`, a new module | Pair devices by LUID or PCI bus ID, never by name or index; load vendor DLLs by absolute system path |
 | Add a column or JSON field | `report.py` and `app.py` | Follow the null rules above; update the README tables. If it is a measured byte count, consider adding it to `diff.py` `MEASURED` |
-| Change snapshot comparison | `diff.py` | Works only on saved `--json` files, never live state. Compare measured fields directly; keep runtime-reported and estimated values in their own sections; an absent row is `not listed`, not zero |
+| Change snapshot comparison | `diff.py` | Works only on saved `--json` files, never live state. Compare measured fields directly; keep runtime-reported and estimated values in their own sections; an absent row is `not listed`, not zero. Refuse only when both snapshots name conflicting adapters (vendor, PCI address, a non-Windows key); when they cannot be compared, warn (`name-only`) instead, because a Windows LUID changes at boot and `diff` has no override flag |
 | Change WSL matching | `wslhost.py` `ContextTracker` | Keep `tests/test_wslhost.py` replays passing; they are measured sequences |
 
 ## Verify

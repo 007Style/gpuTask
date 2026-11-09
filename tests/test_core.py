@@ -250,6 +250,25 @@ class MemoryTests(unittest.TestCase):
         Console(file=output, width=160).print(GpuTaskManager().render_device(s))
         self.assertIn("could not be matched", output.getvalue())
 
+    def test_lost_nvml_telemetry_is_explained_not_silent(self):
+        c = Collector.__new__(Collector)
+        c.adapter = Adapter(1, "RTX 3060", 0x10DE, 12 * GiB, 0, False, (5, 0, 0))
+        c.adapters = [c.adapter]
+        c.gpu_index, c.scan_budget, c.host, c.host_status = 0, None, None, ""
+        c.nvml = Mock(ok=True, driver="", cuda_version="")
+        c.nvml.sample.return_value = []
+        c.counters = Mock(outside={})
+        c.counters.sample.return_value = ({1: {}}, {1: AdapterGpu(dedicated=GiB, shared=0)})
+        c.inspector, c.prober = Mock(), Mock()
+        with patch("gputaskman.collector.BACKEND", "wddm"), \
+                patch("gputaskman.collector.sys.platform", "win32"), \
+                patch("gputaskman.nvml.LOST", {"00000000:05:00.0"}):
+            s = c.sample()
+        self.assertIsNone(s.nv)
+        self.assertTrue(s.nv_lost)
+        self.assertIn("restart gputaskman", s.counter_status)
+        self.assertEqual(s.vram_used, GiB)
+
     def test_windows_matching_counter_zero_is_not_unavailable(self):
         c = Collector.__new__(Collector)
         c.adapter = Adapter(1, "GPU", 0x10DE, 16 * GiB, 0, False)

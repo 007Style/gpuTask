@@ -24,6 +24,17 @@ _THROTTLE = {
 }
 _RESET_ERRORS = (1, 9, 15)  # uninitialized, driver not loaded, GPU lost
 
+# NVML is one session per process. After Windows disables and re-enables a GPU, reads for that GPU
+# can fault inside nvml.dll and nvmlShutdown() can hang (reported on an RTX 3060, driver 610.88).
+LOST: set[str] = set()  # PCI bus IDs whose reads faulted; never read again in this process
+_unsafe = False
+
+
+def mark_unsafe() -> None:
+    """An NVIDIA adapter went away: skip nvmlShutdown() from now on and let process exit clean up."""
+    global _unsafe
+    _unsafe = True
+
 
 def _try(fn, *a, default=None):
     try:
@@ -39,6 +50,7 @@ class Nvml:
         self.cuda_version = ""
         self.handles = []
         self.needs_reset = False
+        self._faulted = False
         self.refresh()
 
     def refresh(self) -> None:
@@ -78,6 +90,9 @@ class Nvml:
     def _read(self, fn, *args, default=None):
         try:
             return fn(*args)
+        except OSError:  # access violation inside nvml.dll, not an NVML error code
+            self._faulted = True
+            return default
         except Exception as error:
             if getattr(error, "value", None) in _RESET_ERRORS:
                 self.needs_reset = True
@@ -86,11 +101,14 @@ class Nvml:
     def sample(self) -> list[NvDevice]:
         out = []
         for i, h in self.handles:
+            self._faulted = False
             d = NvDevice(index=i)
             d.name = self._read(N.nvmlDeviceGetName, h, default="?")
             pci = self._read(N.nvmlDeviceGetPciInfo, h)
             if pci is not None:
                 d.pci_bus = pci.busId.decode() if isinstance(pci.busId, bytes) else str(pci.busId)
+            if d.pci_bus in LOST or self._faulted:
+                continue
             dm = self._read(N.nvmlDeviceGetDriverModel, h)
             if dm:
                 d.driver_model = {0: "WDDM", 1: "TCC", 2: "MCDM"}.get(dm[0], str(dm[0]))
@@ -128,10 +146,16 @@ class Nvml:
             cc = self._read(N.nvmlDeviceGetCudaComputeCapability, h)
             if cc:
                 d.compute_cap = f"{cc[0]}.{cc[1]}"
+            if self._faulted:
+                if d.pci_bus:
+                    LOST.add(d.pci_bus)
+                mark_unsafe()
+                continue
             out.append(d)
         return out
 
     def close(self) -> None:
         if self.ok:
-            _try(N.nvmlShutdown)
+            if not _unsafe:
+                _try(N.nvmlShutdown)
             self.ok = False

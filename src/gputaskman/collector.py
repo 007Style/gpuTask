@@ -15,6 +15,7 @@ from .adl import Adl
 from .dxgi import VENDOR_NVIDIA, Adapter
 from .handy import HandyEvidence, inspect_handy
 from .llm import LlmView, ServerProber, build_view, gb, ollama_log_path
+from . import nvml as nvml_mod
 from .nvml import Nvml, NvDevice
 from .pdh import ProcGpu
 from .procinfo import AI_KINDS, ProcDetail, ProcInspector, classify
@@ -122,7 +123,7 @@ class Snapshot:
     shared_is_spill: bool = True
     counter_status: str = ""  # Windows counter availability or adapter matching problem
     counter_adapter_matched: bool | None = None  # Windows PDH LUID matched the selected DXGI adapter
-
+    nv_lost: bool = False  # NVML faulted for this GPU after a disable/re-enable; restart restores it
     @property
     def host_data(self) -> bool:
         return self.host_status.startswith("ok")
@@ -285,6 +286,12 @@ class Collector:
             elif a is None or a.dedicated is None or a.shared is None:
                 snap.counter_status = ("Some Windows adapter memory counters are unavailable; "
                                        "GPU-PV VMs may not expose them.")
+            if (nv is None and self.adapter.vendor_id == VENDOR_NVIDIA and self.adapter.pci_address
+                    and any(_bdf(b) == self.adapter.pci_address for b in nvml_mod.LOST)):
+                snap.nv_lost = True
+                snap.counter_status = " ".join(filter(None, (
+                    snap.counter_status, "NVIDIA telemetry stopped after this GPU was re-enabled; "
+                                         "restart gputaskman to restore it.")))
         if self.drm_card is not None:
             snap.process_status = self.counters.drm.status
         live = [(pid, g) for pid, g in procs.items() if _is_live(g)]

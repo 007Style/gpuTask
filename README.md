@@ -453,7 +453,14 @@ failures back off to at most one reconstruction per minute; a reappearing or cha
 Discovery errors retain the last known topology with a warning, not invented zero usage.
 Pausing suspends discovery as well as sampling; resume performs an overdue check.
 This recovery is covered by mocks, **not validated with hardware disable/re-enable** on the
-reporter's hybrid AMD/NVIDIA laptop or locally. It is not a claim of physical hot-swap support.
+reporter's hybrid AMD/NVIDIA laptop. On a three-GPU desktop (RTX 5060 Ti, RTX 3060, AMD iGPU;
+Windows 11 build 26200, NVIDIA driver 610.88), disabling and re-enabling the RTX 3060 recovered
+its slot, history, VRAM and processes, but NVML reads for that GPU then faulted inside `nvml.dll`
+and `nvmlShutdown()` hung on exit. A fresh process read it normally. gputaskman therefore stops
+reading NVML for a GPU whose reads fault, shows "restart gputaskman to restore it", and skips
+`nvmlShutdown()` once an NVIDIA adapter has gone away (process exit releases the session). That
+mitigation is covered by mocks and not yet validated on that hardware. It is not a claim of
+physical hot-swap support.
 Other backends and one-shot output retain startup-only discovery.
 Under multi-GPU WSL, host attribution is disabled with a reason rather than risking matching
 two devices by memory usage; Linux processes are listed once with GPU `?`, because `/dev/dxg`

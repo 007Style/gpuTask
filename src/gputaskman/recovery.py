@@ -5,8 +5,9 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
-from .collector import Collector, Snapshot, ordered_adapters, select_adapter
+from .collector import VENDOR_NVIDIA, Collector, Snapshot, ordered_adapters, select_adapter
 from .dxgi import Adapter, enumerate_adapters
+from .nvml import mark_unsafe
 
 
 @dataclass
@@ -80,6 +81,8 @@ class LiveCollectors:
         remaining = list(adapters)
         for slot in self.slots:
             old = slot.adapter
+            if old is not None and old.vendor_id == VENDOR_NVIDIA and all(a.luid != old.luid for a in adapters):
+                mark_unsafe()
             match = next((a for a in remaining if old and a.luid == old.luid), None)
             if match is None and old is not None:
                 location = _location(old)
@@ -144,7 +147,7 @@ class LiveCollectors:
                 try:
                     snap = slot.collector.sample()
                     slot.retry = (snap.counter_adapter_matched is False
-                                  or (slot.had_telemetry and snap.nv is None))
+                                  or (slot.had_telemetry and snap.nv is None and not snap.nv_lost))
                     slot.had_telemetry |= snap.nv is not None
                     if not slot.retry:
                         slot.retry_after = slot.retry_delay = 0.0

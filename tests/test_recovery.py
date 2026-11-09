@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import Mock, patch
 
+from gputaskman import nvml
 from gputaskman.app import GpuTaskManager
 from gputaskman.collector import Collector, ProcRow, Snapshot, select_nv_device
 from gputaskman.dxgi import Adapter, enumerate_adapters
@@ -28,6 +29,10 @@ def snapshot(a, value=10):
 
 class RecoveryTests(TestCase):
     def setUp(self):
+        for name, value in (("_unsafe", False), ("LOST", set())):
+            patcher = patch(f"gputaskman.nvml.{name}", value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.first, self.second = adapter(1), adapter(2, 0x1002, 2)
         self.topology = [self.first, self.second]
         self.created = []
@@ -70,6 +75,27 @@ class RecoveryTests(TestCase):
         self.assertIs(live.slots[1].collector, survivor)
         self.assertEqual(len(self.created), 4)
         self.assertAlmostEqual(survivor.scan_budget, Collector.SCAN_BUDGET / 3)
+
+    def test_nvidia_adapter_loss_marks_nvml_unsafe_and_lost_telemetry_does_not_rebuild(self):
+        live = self.live()
+        self.topology = [self.second]
+        self.rediscover(live)
+        self.assertTrue(nvml._unsafe)
+        readded = adapter(11)
+        self.topology = [readded, self.second]
+        self.rediscover(live)
+        lost = snapshot(readded)
+        lost.nv, lost.nv_lost = None, True
+        live.slots[0].had_telemetry = True
+        self.created[-1].sample.side_effect = lambda: lost
+        live.sample(now=live.next_discovery - 1)
+        self.assertFalse(live.slots[0].retry)
+
+    def test_amd_adapter_loss_keeps_nvml_shutdown(self):
+        live = self.live()
+        self.topology = [self.first]
+        self.rediscover(live)
+        self.assertFalse(nvml._unsafe)
 
     def test_explicit_gpu_pins_original_identity_not_current_index(self):
         live = self.live(1)
@@ -264,6 +290,12 @@ class RecoveryTests(TestCase):
 
 
 class NvmlRecoveryTests(TestCase):
+    def setUp(self):
+        for name, value in (("_unsafe", False), ("LOST", set())):
+            patcher = patch(f"gputaskman.nvml.{name}", value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def api(self):
         return SimpleNamespace(
             nvmlInit=Mock(), nvmlShutdown=Mock(), nvmlDeviceGetCount=Mock(return_value=2),
@@ -438,6 +470,36 @@ class NvmlRecoveryTests(TestCase):
             self.assertIsNone(nv._read(Mock(side_effect=Error("not supported"))))
             self.assertFalse(nv.needs_reset)
             nv.close()
+
+    def test_access_violation_stops_reading_that_gpu_and_skips_hanging_shutdown(self):
+        class Api(SimpleNamespace):
+            def __getattr__(self, name):
+                return 0 if name.startswith("NVML_") else lambda *args: None
+
+        def temperature(handle, _kind):
+            if handle == "second":
+                raise OSError("exception: access violation reading 0x20C25D65908")
+            return 40
+
+        api = Api(**vars(self.api()))
+        api.nvmlDeviceGetPciInfo = Mock(side_effect=lambda h: SimpleNamespace(
+            busId=b"00000000:01:00.0" if h == "first" else b"00000000:05:00.0"))
+        api.nvmlDeviceGetTemperature = Mock(side_effect=temperature)
+        with patch("gputaskman.nvml.N", api):
+            nv = Nvml()
+            self.assertEqual([(d.pci_bus, d.temp) for d in nv.sample()], [("00000000:01:00.0", 40)])
+            self.assertEqual(nvml.LOST, {"00000000:05:00.0"})
+            calls = api.nvmlDeviceGetTemperature.call_count
+            self.assertEqual(len(nv.sample()), 1)
+            self.assertEqual(api.nvmlDeviceGetTemperature.call_count, calls + 1)  # the lost GPU is skipped
+            nv.close()
+            api.nvmlShutdown.assert_not_called()
+
+    def test_healthy_session_still_shuts_down(self):
+        api = self.api()
+        with patch("gputaskman.nvml.N", api):
+            Nvml().close()
+            api.nvmlShutdown.assert_called_once()
 
 
 class DiscoveryTests(TestCase):

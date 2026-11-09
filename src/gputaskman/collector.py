@@ -12,7 +12,7 @@ import psutil
 
 from .amdsmi import AmdSmi, _bdf
 from .adl import Adl
-from .dxgi import VENDOR_NVIDIA, Adapter
+from .dxgi import VENDOR_AMD, VENDOR_NVIDIA, Adapter
 from .handy import HandyEvidence, inspect_handy
 from .llm import LlmView, ServerProber, build_view, gb, ollama_log_path
 from . import nvml as nvml_mod
@@ -258,11 +258,12 @@ class Collector:
             from .drm import read_device
 
             nv = read_device(self.drm_card, self.gpu_index)
+        elif self.adapter and self.adapter.vendor_id != VENDOR_NVIDIA:
+            # NVML can't describe this GPU, and a sweep of every NVIDIA device costs ~60 ms per device.
+            nv = (self.adl.sample() or self.amdsmi.sample()) if self.adapter.vendor_id == VENDOR_AMD else None
         else:
             nvs = self.nvml.sample() if self.nvml.ok else []
             nv = select_nv_device(self.adapter, nvs, self.gpu_index, self.adapters)
-            if self.adapter and self.adapter.vendor_id == 0x1002:
-                nv = self.adl.sample() or self.amdsmi.sample()
         total = (nv.mem_total if nv else 0) or (self.adapter.dedicated_vram if self.adapter else 0)
 
         snap = Snapshot(

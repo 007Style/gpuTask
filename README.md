@@ -765,13 +765,17 @@ cloud-hosted. The GPU counters belong to whichever process holds/uses the GPU re
 Parent-PID lookup currently helps find Ollama/LM Studio and local vLLM APIs; it is not a general cross-process
 ownership graph for shared Windows services.
 
-For vLLM, `vllm serve`, `python -m vllm.entrypoints.openai.api_server`, `VLLM::EngineCore`
-and `VLLM::Worker_TP<n>` are detection hints, not loading evidence. An inherited launch command
+For vLLM, `vllm serve`, `python -m vllm.entrypoints.openai.api_server`, `VLLM::EngineCore`,
+`VLLM::Worker` and `VLLM::Worker_TP<n>` are detection hints, not loading evidence. An inherited launch command
 also works without process titles. Worker discovery checks at most two live ancestors, their
 creation times and their signatures. Only one exclusively owned listening port on one recognized
 server is accepted; shared/multiple listeners, unrelated or inaccessible ancestry and explicit
 distributed/data-parallel options give no association. There is no port scanning or matching by
 model name. Processes outside the visible PID namespace are not linked to local servers.
+Source-grounded fixtures follow upstream vLLM commit
+[`499a3d1`](https://github.com/vllm-project/vllm/tree/499a3d1e1e338e3e866c0719cfe1f429e2b0b762):
+the default single-API launcher keeps its command line, starts EngineCore, and EngineCore starts
+TP workers. `VLLM::APIServer_<index>` belongs to the separate multi-API path and is not supported.
 
 The table, inspector and text label these identifiers as API-reported, with **parent process**
 when applicable. JSON has `llm.server_source` (`"process"`, `"parent"`, or `null`) alongside

@@ -69,7 +69,7 @@ MODEL_KINDS = {"LLM": "LLM", "decision model": "decision", "embedding model": "e
                "reranker": "embedding", "speech model": "speech"}
 AI_KINDS = {"LLM", "decision", "decision?", "embedding", "speech", "diffusion", "AI"}
 _DECISION_NAME = re.compile(r"(?<![a-z0-9])(?:openjev|laya|julia-1|lev|kev)(?![a-z0-9])", re.I)
-_VLLM_WORKER = re.compile(r"VLLM::(?:EngineCore|Worker_TP[0-9]+)")
+_VLLM_WORKER = re.compile(r"VLLM::(?:EngineCore|Worker(?:_TP[0-9]+)?)")
 MiB = 1 << 20
 INSTALLED_TTL = 300.0
 _SKIP_DIRS = {"ebwebview", "cache", "code cache", "gpucache", "node_modules", "logs", "crashpad", "locales", "__pycache__"}

@@ -24,6 +24,9 @@ from gputaskman.report import to_dict, to_text
 
 MiB = 1 << 20
 LAUNCH = ["vllm", "serve", "org/model"]
+# Title/layout fixtures follow vllm-project/vllm at 499a3d1e1e338e3e866c0719cfe1f429e2b0b762:
+# utils/system_utils.py:set_process_title, v1/executor/multiproc_executor.py:setup_proc_title_and_log_prefix,
+# entrypoints/cli/serve.py:cmd, and entrypoints/launchers/api_server/entry.py:run_server.
 
 
 @contextlib.contextmanager
@@ -94,6 +97,7 @@ class VllmTests(unittest.TestCase):
             ("python3", ["/env/bin/python3", "/env/bin/vllm", "serve", "org/model"], "server"),
             ("python", ["python", "-u", "-m", "vllm.entrypoints.openai.api_server", "--model", "org/model"], "server"),
             ("VLLM::EngineCore", [], "worker"),
+            ("VLLM::Worker", [], "worker"),
             ("VLLM::Worker_TP12", [], "worker"),
             ("python", ["VLLM::Worker_TP0"], "worker"),
             ("python", LAUNCH, "server"),  # inherited command line when setproctitle is absent
@@ -102,6 +106,9 @@ class VllmTests(unittest.TestCase):
             ("echo", ["echo", "-m", "vllm.entrypoints.openai.api_server"], ""),
             ("VLLM::Worker_TP0-extra", [], ""),
             ("VLLM::EngineCore_DP0", [], ""),
+            ("VLLM::Worker_DP0_TP0", [], ""),
+            ("VLLM::Worker_PP0_TP0", [], ""),
+            ("VLLM::APIServer_0", [], ""),
             ("vllm-helper", [], ""),
         ]
         for name, cmd, role in cases:
@@ -186,6 +193,21 @@ class VllmTests(unittest.TestCase):
         self.assertIn("parent process", text)
         self.assertIn("API-reported model ID: org/model", text)
         self.assertIn("do not prove this process's model residency", text)
+
+    def test_upstream_default_single_gpu_and_tp_layouts(self):
+        # Default CLI calls run_server in the launcher process (no set_process_title there).
+        # APIServer_<index> titles belong to APIServerProcessManager's multi-API worker path.
+        with listener() as (port, seen):
+            for name in ("VLLM::EngineCore", "VLLM::Worker", "VLLM::Worker_TP0", "VLLM::Worker_TP1"):
+                with self.subTest(name=name):
+                    details = {10: ProcDetail(10, name, create_time=3),
+                               20: ProcDetail(20, "VLLM::EngineCore", create_time=2),
+                               30: ProcDetail(30, "python", cmdline=LAUNCH, create_time=1)}
+                    parents = {10: 30} if name == "VLLM::EngineCore" else {10: 20, 20: 30}
+                    _, snap = self.sample(details, {30: [port]}, parents)
+                    self.assertEqual(snap.procs[0].llm.server_source, "parent")
+                    self.assertEqual(snap.procs[0].llm.server.models[0]["name"], "org/model")
+            self.assertEqual(seen, [("/v1/models", None)] * 4)
 
     def test_unclear_ancestry_or_listeners_never_probe(self):
         for reason in ("two servers", "shared port", "two ports", "unrelated parent",

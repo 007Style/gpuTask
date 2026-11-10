@@ -513,7 +513,8 @@ Under multi-GPU WSL, host attribution is disabled with a reason rather than risk
 two devices by memory usage; Linux processes are listed once with GPU `?`, because `/dev/dxg`
 does not identify their GPU. `--gpu N` retains the existing single-device host matching.
 
-`--list-gpus` lists selectable hardware adapters with their vendor and LUID. `--gpu N` selects
+`--list-gpus` lists selectable non-software DXGI adapters on Windows (including root-enumerated
+display adapters), or hardware adapters on other platforms, with their vendor and adapter key. `--gpu N` selects
 one of these adapters: NVIDIA adapters are listed first, followed by other vendors, with each
 group ordered by dedicated memory. An out-of-range
 index is rejected rather than silently selecting another device. Compute-only devices such as an
@@ -524,6 +525,20 @@ Device telemetry is matched to WDDM adapters by PCI location, not display name o
 If a unique match cannot be established, telemetry is unavailable; buffer logs can still span devices,
 so model-buffer attribution across GPUs is not yet reliable. This conservative matching also applies
 to NVIDIA and may suppress telemetry when Windows does not expose a usable PCI address.
+
+On Windows, each exact DXGI LUID is also resolved through `DisplayConfigGetDeviceInfo` to its
+PnP device interface, including inactive displays, then read through SetupAPI. A `ROOT\DISPLAY`
+instance uses its PnP friendly name (device description as fallback) and is labelled `ROOT display
+adapter` in `--list-gpus`, rather than inheriting the physical GPU's DXGI name or vendor label.
+It stays selectable at the same index, is not paired with PCI telemetry, and still needs matching
+LUID counters to show usage. A missing PnP name gives an explicit root-display label; a failed
+identity lookup retains the DXGI description with a reason in the list, text, TUI and JSON
+`counter_status`. JSON `adapter.device_instance_id` records the resolved instance (empty if unknown);
+`adapter.identity_status` records lookup limitations. Physical adapter names and ordering are unchanged.
+The StarDesk inactive virtual-display case is covered by mocked API regressions, **not yet validated
+with StarDesk installed**. Read-only live checks on Windows 11 build 28000, NVIDIA RTX Spark N1X,
+driver 32.0.16.2114 confirmed its physical PCI identity and unchanged display name; no display
+configuration or drivers were changed.
 
 AMD adapters can be selected and use the existing Windows GPU process counters; HIP runtime DLLs
 are recognized as runtime evidence. On supported drivers, the AMD Display Library supplied by the
@@ -813,7 +828,7 @@ Identification is designed to stay cheap. Measured on one Windows machine:
 | Probe | Cost | Used |
 |---|---|---|
 | Process list, command line, listening ports | under 1 ms | Once per process / every 5 s |
-| Windows adapter discovery (DXGI + PCI location, no telemetry sample) | ~0.40 ms median; first/cold call up to 14.1 ms in 30 reads (Windows 11 build 26340, RTX 4080 SUPER, NVIDIA 630.20) | TUI only, every 5 s; synchronous OS calls, not a hard latency bound. Other drivers/multi-GPU laptops unmeasured; provider reconstruction after changes/errors has additional driver-dependent cost |
+| Windows adapter discovery (DXGI + exact-LUID PnP identity + PCI location, no telemetry sample) | ~0.86 ms median, 2.60 ms max in 30 warm reads, 26.1 ms first/cold call (Windows 11 build 28000, RTX Spark N1X, driver 32.0.16.2114); same machine without the PnP probe: ~0.36 ms median | Once at startup; TUI rediscovery every 5 s. PnP uses fixed buffers, one interface lookup per adapter and at most two name-property reads, no path/device enumeration or retries. Synchronous OS calls are not a hard latency bound. Other drivers, virtual displays and multi-GPU laptops unmeasured; provider reconstruction has additional driver-dependent cost |
 | Windows NVML handle reacquisition (no telemetry sample) | ~8.7 ms median, 9.3 ms max in 30 reads on the same machine | Every 5 s per active collector; retries initialization after NVML session-loss errors. Other drivers unmeasured |
 | Memory-map scan (DLLs + mapped files) | 1-50 ms per process | New processes, a 64 MiB / 10% memory change, or every 2 min; at most 150 ms per refresh |
 | GGUF header, model-store manifests | ms, cached | Once per file / every 60 s |

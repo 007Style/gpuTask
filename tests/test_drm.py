@@ -102,6 +102,31 @@ drm-engine-video:\t300000000 ns
 drm-engine-video-enhance:\t0 ns
 """
 
+# The Vivobook's vkmark client (Xe-LP iGPU, i915) under load: resident system memory, part of it
+# shared with the compositor, so the bytes are measurable but not attributable to the process.
+I915_IGPU_SHARED_FDINFO = """pos:\t0
+flags:\t02100002
+mnt_id:\t41
+ino:\t427
+drm-driver:\ti915
+drm-client-id:\t54
+drm-pdev:\t0000:00:02.0
+drm-total-system0:\t37476 KiB
+drm-shared-system0:\t8576 KiB
+drm-active-system0:\t0
+drm-resident-system0:\t37476 KiB
+drm-purgeable-system0:\t156 KiB
+drm-total-stolen-system0:\t0
+drm-shared-stolen-system0:\t0
+drm-active-stolen-system0:\t0
+drm-resident-stolen-system0:\t0
+drm-purgeable-stolen-system0:\t0
+drm-engine-render:\t8242337792 ns
+drm-engine-copy:\t0 ns
+drm-engine-video:\t0 ns
+drm-engine-video-enhance:\t0 ns
+"""
+
 # i915 before Gen8 prints the memory stats but no drm-engine lines at all.
 I915_GEN7_FDINFO = """drm-driver:\ti915
 drm-pdev:\t0000:00:02.0
@@ -471,6 +496,72 @@ class ReadDeviceTests(unittest.TestCase):
             with patch.object(drm, "_cpu_package_temp", return_value=55):
                 d = drm.read_device(card, 0)
             self.assertEqual((d.temp, d.temp_kind), (55, "CPU package"))
+
+    def test_read_device_intel_clock_and_throttle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            card_sysfs = Path(tmp) / "card1"
+            dev = card_sysfs / "device"
+            dev.mkdir(parents=True)
+            gt = card_sysfs / "gt" / "gt0"
+            gt.mkdir(parents=True)
+            (gt / "rps_act_freq_mhz").write_text("300\n")
+            (gt / "rps_cur_freq_mhz").write_text("350\n")
+            (gt / "rps_RP0_freq_mhz").write_text("1250\n")
+            (gt / "throttle_reason_pl1").write_text("1\n")
+            (gt / "throttle_reason_pl2").write_text("0\n")
+            (gt / "throttle_reason_thermal").write_text("0\n")
+
+            card = drm.DrmCard(key=32, pdev="0000:00:02.0", sysfs=str(dev), driver="i915",
+                               vendor_id=0x8086, device_id=0xA7AD, name="Intel Intel Graphics",
+                               vram_total=0, integrated=True, intel=True)
+            d = drm.read_device(card, 0)
+
+            self.assertEqual(d.sm_clock, 300)  # the actual frequency, not the requested one
+            self.assertEqual(d.gfx_clock, 350)
+            self.assertEqual(d.sm_clock_max, 1250)
+            self.assertEqual(d.throttle, ["PL1"])
+            self.assertEqual(d.source, "Intel sysfs")
+
+    def test_read_device_intel_clock_falls_back_to_requested(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            card_sysfs = Path(tmp) / "card1"
+            dev = card_sysfs / "device"
+            dev.mkdir(parents=True)
+            gt = card_sysfs / "gt" / "gt0"
+            gt.mkdir(parents=True)
+            (gt / "rps_cur_freq_mhz").write_text("300\n")
+            (gt / "rps_RP0_freq_mhz").write_text("1250\n")
+
+            card = drm.DrmCard(key=32, pdev="0000:00:02.0", sysfs=str(dev), driver="i915",
+                               vendor_id=0x8086, device_id=0xA7AD, name="Intel Intel Graphics",
+                               vram_total=0, integrated=True, intel=True)
+            d = drm.read_device(card, 0)
+
+            self.assertEqual(d.sm_clock, 300)
+            # No throttle node is readable here: unknown, not "no throttling".
+            self.assertIsNone(d.throttle)
+
+    def test_read_device_intel_throttle_all_idle_is_empty_not_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            card_sysfs = Path(tmp) / "card1"
+            dev = card_sysfs / "device"
+            dev.mkdir(parents=True)
+            gt = card_sysfs / "gt" / "gt0"
+            gt.mkdir(parents=True)
+            (gt / "throttle_reason_pl1").write_text("0\n")
+            (gt / "throttle_reason_thermal").write_text("0\n")
+
+            card = drm.DrmCard(key=32, pdev="0000:00:02.0", sysfs=str(dev), driver="i915",
+                               vendor_id=0x8086, device_id=0xA7AD, name="Intel Intel Graphics",
+                               vram_total=0, integrated=True, intel=True)
+            self.assertEqual(drm.read_device(card, 0).throttle, [])
+
+    def test_intel_throttle_skips_unreadable_nodes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gt = Path(tmp)
+            (gt / "throttle_reason_pl2").write_text("1\n")
+            (gt / "throttle_reason_thermal").write_text("lots\n")  # unparseable: unknown, not active
+            self.assertEqual(drm._intel_throttle(str(gt)), ["PL2"])
 
     def test_read_device_intel_gpu_sensor_wins_over_cpu_package(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1140,8 +1231,23 @@ class IntelFdinfoTests(unittest.TestCase):
         info = drm.parse_fdinfo(I915_IGPU_FDINFO)
         self.assertIsNone(info["vram"])  # no local0 on an integrated GPU: unknown, not 0
         self.assertEqual(info["gtt"], 60 * MiB)  # system0 plus an empty stolen-system0
-        self.assertIsNone(info["shared"])  # no drm-shared-local0, so the shared-buffer gate stays closed
+        self.assertEqual(info["shared"], 0)  # no local0 to require: the gate needs only system0, empty here
         self.assertEqual(set(info["engines"]), {"render", "copy", "video", "video-enhance"})
+
+    def test_i915_integrated_client_with_shared_buffers(self):
+        # The Vivobook's vkmark client under load: resident system memory, some of it shared
+        # (the compositor imports the window), so the bytes stay unattributed but measurable.
+        info = drm.parse_fdinfo(I915_IGPU_SHARED_FDINFO)
+        self.assertIsNone(info["vram"])
+        self.assertEqual(info["gtt"], 37476 * KiB)
+        self.assertEqual(info["shared"], 8576 * KiB)
+
+    def test_i915_discrete_client_missing_shared_local0_stays_legacy(self):
+        # A discrete card prints local0 regions, so a missing drm-shared-local0 is a kernel gap,
+        # not an integrated GPU: the gate stays closed.
+        text = "\n".join(line for line in I915_FDINFO.splitlines() if "drm-shared-local0" not in line)
+        self.assertIn("drm-resident-local0", text)
+        self.assertIsNone(drm.parse_fdinfo(text)["shared"])
 
     def test_i915_without_engine_lines_has_unknown_load(self):
         info = drm.parse_fdinfo(I915_GEN7_FDINFO)
@@ -1295,7 +1401,8 @@ class IntelScanTests(unittest.TestCase):
             self.assertIn("dedicated", g.available)  # and that has no bearing on the memory
             self.assertEqual(g.dedicated, 64 * MiB)
 
-    def test_integrated_gpu_load_is_measured_while_its_vram_is_n_a(self):
+    def test_integrated_gpu_charges_private_system_memory(self):
+        # An integrated GPU has no local memory: a private client's system0 bytes are its GPU memory.
         pdev = "0000:00:02.0"
         with tempfile.TemporaryDirectory() as tmp:
             proc = Path(tmp) / "proc"
@@ -1311,11 +1418,54 @@ class IntelScanTests(unittest.TestCase):
             _write_fd(proc, 100, 5, I915_IGPU_FDINFO.replace("render:\t1200000000", "render:\t1700000000"))
             procs, adapters = counters.sample()
             g = procs[card.key][100]
-            self.assertEqual(g.drm_reason, drm.REASON_LEGACY)  # shared buffers can't be ruled out
-            self.assertNotIn("dedicated", g.available)
+            self.assertEqual((g.drm_reason, g.dedicated), ("", 60 * MiB))
+            self.assertNotIn("shared", g.available)  # system0 is memory here, not spill
             self.assertIn("engine", g.available)
             self.assertEqual(g.engines["3d"], 50.0)
-            self.assertIsNone(adapters[card.key].dedicated)
+            self.assertEqual(adapters[card.key].dedicated, 60 * MiB)  # the stamped device total
+
+    def test_integrated_gpu_with_shared_buffers_stays_unattributed(self):
+        # The shared case from the Vivobook: measurable and referenced, but charged to nobody.
+        pdev = "0000:00:02.0"
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = Path(tmp) / "proc"
+            proc.mkdir()
+            card = drm.DrmCard(key=drm.pci_key(pdev), pdev=pdev, sysfs=str(Path(tmp) / "card0" / "device"),
+                               driver="i915", vendor_id=0x8086, device_id=0xA782, name="Intel UHD Graphics",
+                               vram_total=0, integrated=True, intel=True)
+            counters = drm.DrmCounters(found=[card], proc=str(proc), clock=Clock())
+            _write_fd(proc, 100, 5, I915_IGPU_SHARED_FDINFO)
+            procs, adapters = counters.sample()
+            g = procs[card.key][100]
+            self.assertEqual(g.drm_reason, drm.REASON_SHARED_BUFFERS)
+            self.assertNotIn("dedicated", g.available)
+            self.assertEqual(g.resident_gtt, 37476 * KiB)  # still shown as a reference
+            # The stamped device total sums resident system memory (shared buffers can double-count it).
+            self.assertEqual(adapters[card.key].dedicated, 37476 * KiB)
+
+    def test_mixed_discrete_and_integrated_cards_charge_each_by_its_rule(self):
+        disc_pdev = "0000:03:00.0"
+        igpu_pdev = "0000:00:02.0"
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = Path(tmp) / "proc"
+            proc.mkdir()
+            disc = drm.DrmCard(key=drm.pci_key(disc_pdev), pdev=disc_pdev, sysfs=str(Path(tmp) / "d" / "device"),
+                               driver="i915", vendor_id=0x8086, device_id=0x56A0, name="Intel Arc A770",
+                               vram_total=16 * GiB, integrated=False, intel=True)
+            igpu = drm.DrmCard(key=drm.pci_key(igpu_pdev), pdev=igpu_pdev, sysfs=str(Path(tmp) / "i" / "device"),
+                               driver="i915", vendor_id=0x8086, device_id=0xA782, name="Intel UHD Graphics",
+                               vram_total=0, integrated=True, intel=True)
+            counters = drm.DrmCounters(found=[disc, igpu], proc=str(proc), clock=Clock())
+            _write_fd(proc, 100, 5, _i915_fdinfo(1, disc_pdev, local_mib=64, system_mib=8))
+            _write_fd(proc, 200, 6, I915_IGPU_FDINFO)
+            procs, adapters = counters.sample()
+            g_disc = procs[disc.key][100]
+            self.assertEqual((g_disc.dedicated, g_disc.shared), (64 * MiB, 8 * MiB))
+            g_igpu = procs[igpu.key][200]
+            self.assertEqual(g_igpu.dedicated, 60 * MiB)
+            self.assertNotIn("shared", g_igpu.available)
+            self.assertEqual(adapters[disc.key].dedicated, 64 * MiB)
+            self.assertEqual(adapters[igpu.key].dedicated, 60 * MiB)
 
     def test_device_used_sums_each_client_once_and_is_unknown_when_incomplete(self):
         with tempfile.TemporaryDirectory() as tmp:

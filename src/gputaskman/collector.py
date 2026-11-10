@@ -180,6 +180,17 @@ def select_nv_device(adapter: Adapter | None, devices: list[NvDevice], gpu_index
     return matches[0] if len(matches) == 1 else None
 
 
+def _llm_wanted(row, shared_is_spill: bool) -> bool:
+    """Whether a process row gets an LLM breakdown: an AI-kind process with models (or kind LLM),
+    not diffusion, and with measured GPU memory. Where spilled system memory is a counter of its own
+    (WDDM, discrete DRM cards) both the dedicated and shared counters must be present; on an integrated
+    GPU system memory is the memory and there is no spill counter, so dedicated alone suffices."""
+    if row.detail.is_diffusion or row.kind not in AI_KINDS or not (row.detail.models or row.kind == "LLM"):
+        return False
+    need = {"dedicated", "shared"} if shared_is_spill else {"dedicated"}
+    return need <= row.gpu.available
+
+
 class Collector:
     DEEP_TOP_N = 25  # memory-map candidates: the top N VRAM users plus anything busy
     _mac_driver = ""  # "macOS 26.3.1" on the metal backend, read once at startup
@@ -333,8 +344,7 @@ class Collector:
                 continue
             if os.path.basename(row.detail.exe).lower() in ("handy.exe", "handy"):
                 row.handy = inspect_handy(row.detail.create_time)
-            if (row.detail.is_diffusion or row.kind not in AI_KINDS or not (row.detail.models or row.kind == "LLM")
-                    or not {"dedicated", "shared"} <= row.gpu.available):
+            if not _llm_wanted(row, snap.shared_is_spill):
                 continue
             ports = self.inspector.exclusive_ports(row.pid)
             key = api_key(row.detail.cmdline)
@@ -342,7 +352,7 @@ class Collector:
             host = self.prober.get(self._parent_ports(row.pid))  # Ollama / LM Studio front-end process
             log = ollama_log_path() if row in ollama_runners and len(ollama_runners) == 1 else None
             # On an APU, GTT is the GPU's ordinary memory (often most of it), not spill: count it as held memory.
-            held = (row.gpu.shown_vram or 0) + (0 if snap.shared_is_spill else row.gpu.shared)
+            held = (row.gpu.shown_vram or 0) + (0 if snap.shared_is_spill else (row.gpu.shared or 0))
             row.llm = build_view(row.detail, held, row.gpu.shared if snap.shared_is_spill else 0,
                                  own or host, log, host=host if own else None,
                                  attributed=row.gpu.shown_vram is not None)

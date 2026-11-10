@@ -1,6 +1,6 @@
 [project]
 name = "gputaskman"
-version = "0.3.4"
+version = "0.3.5"
 description = "An htop for what's inside your GPU: per-process VRAM, engine load, and LLM weights / KV cache breakdown"
 readme = "README.md"
 license = "MIT"

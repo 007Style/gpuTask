@@ -205,8 +205,9 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
                  f"GT {format_metric(nv.sm_clock)}" if is_intel else
                  f"SM {format_metric(nv.sm_clock)}")
         power_kind = f" ({nv.power_kind})" if nv.power_kind else ""
+        temp_label = f" ({nv.temp_kind})" if nv.temp_kind else ""
         out.append(f"{label} {format_metric(nv.util_gpu, unit='%')}  mem-bandwidth {format_metric(nv.util_mem, unit='%')}  "
-                   f"{format_metric(nv.temp, unit='C')}  {format_metric(nv.power_w, '.0f')}/"
+                   f"{format_metric(nv.temp, unit='C')}{temp_label}  {format_metric(nv.power_w, '.0f')}/"
                    f"{format_metric(nv.power_limit_w, '.0f')} W{power_kind}  {pstate}  "
                    f"{clock} MHz  "
                    f"video {format_metric(nv.video_clock)} MHz  "

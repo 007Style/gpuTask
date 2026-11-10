@@ -447,6 +447,56 @@ class ReadDeviceTests(unittest.TestCase):
             self.assertIsNone(d.enc)
             self.assertIsNone(d.dec)
 
+    def test_cpu_package_temp_prefers_package_id_0(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nvme = root / "hwmon0"
+            nvme.mkdir()
+            (nvme / "name").write_text("nvme\n")
+            cpu = root / "hwmon1"
+            cpu.mkdir()
+            (cpu / "name").write_text("coretemp\n")
+            (cpu / "temp1_label").write_text("Package id 0\n")
+            (cpu / "temp1_input").write_text("55000\n")
+            (cpu / "temp2_label").write_text("Core 0\n")
+            (cpu / "temp2_input").write_text("99000\n")  # a core is not the package
+            self.assertEqual(drm._cpu_package_temp(str(root)), 55)
+
+    def test_cpu_package_temp_missing_is_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cpu = root / "hwmon0"
+            cpu.mkdir()
+            (cpu / "name").write_text("coretemp\n")
+            (cpu / "temp1_label").write_text("Core 0\n")  # no package sensor: no guessing from cores
+            (cpu / "temp1_input").write_text("99000\n")
+            self.assertIsNone(drm._cpu_package_temp(str(root)))
+            self.assertIsNone(drm._cpu_package_temp(str(root / "no-such-dir")))
+
+    def test_cpu_package_temp_skips_torn_readings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cpu = root / "hwmon0"
+            cpu.mkdir()
+            (cpu / "name").write_text("coretemp\n")
+            (cpu / "temp1_label").write_text("Package id 0\n")
+            (cpu / "temp1_input").write_text("lots\n")  # torn: try the other sensors
+            (cpu / "temp2_label").write_text("Package id 1\n")
+            (cpu / "temp2_input").write_text("48000\n")
+            self.assertEqual(drm._cpu_package_temp(str(root)), 48)
+
+    def test_read_device_intel_falls_back_to_cpu_package_temp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            card_sysfs = Path(tmp) / "card1"
+            dev = card_sysfs / "device"
+            dev.mkdir(parents=True)
+            card = drm.DrmCard(key=32, pdev="0000:00:02.0", sysfs=str(dev), driver="i915",
+                               vendor_id=0x8086, device_id=0xA7AD, name="Intel Intel Graphics",
+                               vram_total=0, integrated=True, intel=True)
+            with patch.object(drm, "_cpu_package_temp", return_value=55):
+                d = drm.read_device(card, 0)
+            self.assertEqual((d.temp, d.temp_kind), (55, "CPU package"))
+
     def test_read_device_intel_clock_and_throttle(self):
         with tempfile.TemporaryDirectory() as tmp:
             card_sysfs = Path(tmp) / "card1"
@@ -512,6 +562,36 @@ class ReadDeviceTests(unittest.TestCase):
             (gt / "throttle_reason_pl2").write_text("1\n")
             (gt / "throttle_reason_thermal").write_text("lots\n")  # unparseable: unknown, not active
             self.assertEqual(drm._intel_throttle(str(gt)), ["PL2"])
+
+    def test_read_device_intel_gpu_sensor_wins_over_cpu_package(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            card_sysfs = Path(tmp) / "card1"
+            dev = card_sysfs / "device"
+            dev.mkdir(parents=True)
+            hwmon = dev / "hwmon" / "hwmon0"
+            hwmon.mkdir(parents=True)
+            (hwmon / "temp1_label").write_text("edge\n")
+            (hwmon / "temp1_input").write_text("61000\n")
+            card = drm.DrmCard(key=32, pdev="0000:00:02.0", sysfs=str(dev), driver="i915",
+                               vendor_id=0x8086, device_id=0xA7AD, name="Intel Intel Graphics",
+                               vram_total=0, integrated=True, intel=True)
+            with patch.object(drm, "_cpu_package_temp", return_value=55):
+                d = drm.read_device(card, 0)
+            self.assertEqual((d.temp, d.temp_kind), (61, ""))
+
+    def test_read_device_discrete_intel_without_sensor_stays_unknown(self):
+        # The CPU package shares a die with an integrated GPU only; on a discrete card it is
+        # not the GPU's temperature, so there is no fallback.
+        with tempfile.TemporaryDirectory() as tmp:
+            card_sysfs = Path(tmp) / "card1"
+            dev = card_sysfs / "device"
+            dev.mkdir(parents=True)
+            card = drm.DrmCard(key=12288, pdev="0000:03:00.0", sysfs=str(dev), driver="i915",
+                               vendor_id=0x8086, device_id=0x56A0, name="Intel Arc A770",
+                               vram_total=16 * GiB, integrated=False, intel=True)
+            with patch.object(drm, "_cpu_package_temp", return_value=55):
+                d = drm.read_device(card, 0)
+            self.assertEqual((d.temp, d.temp_kind), (None, ""))
 
 
 class DrmCountersTests(unittest.TestCase):

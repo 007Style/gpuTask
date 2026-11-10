@@ -19,6 +19,7 @@ class DeviceTelemetry:
     enc: float | None = None
     dec: float | None = None
     temp: float | None = None
+    temp_kind: str = ""  # where a fallback temperature comes from ("CPU package"), else its own sensor
     power_w: float | None = None
     power_kind: str = ""
     power_limit_w: float | None = None

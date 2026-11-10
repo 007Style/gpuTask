@@ -111,6 +111,8 @@ def main() -> None:
 
         for i, adapter in enumerate(ordered_adapters(enumerate_adapters())):
             print(f"{i}: {adapter.name} ({adapter.vendor}, LUID 0x{adapter.luid & 0xffffffffffffffff:016x})")
+            if adapter.identity_status:
+                print(f"   {adapter.identity_status}")
         return
 
     _check_gpu(ap, args.gpu)

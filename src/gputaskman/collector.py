@@ -307,6 +307,7 @@ class Collector:
                 snap.counter_status = " ".join(filter(None, (
                     snap.counter_status, "NVIDIA telemetry stopped after this GPU was re-enabled; "
                                          "restart gputaskman to restore it.")))
+            snap.counter_status = " ".join(filter(None, (snap.counter_status, self.adapter.identity_status)))
         if self.drm_card is not None:
             snap.process_status = self.counters.drm.status
         live = [(pid, g) for pid, g in procs.items() if _is_live(g)]

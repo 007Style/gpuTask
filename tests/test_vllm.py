@@ -190,7 +190,8 @@ class VllmTests(unittest.TestCase):
     def test_unclear_ancestry_or_listeners_never_probe(self):
         for reason in ("two servers", "shared port", "two ports", "unrelated parent",
                        "newer parent", "reused parent", "reused worker", "unknown start", "cycle",
-                       "distributed parent", "distributed worker", "protected parent", "no parent"):
+                       "distributed parent", "distributed worker", "protected parent", "no parent",
+                       "own and parent", "worker listener"):
             with self.subTest(reason=reason):
                 details = {10: ProcDetail(10, "VLLM::Worker_TP0", create_time=3),
                            20: ProcDetail(20, "python", cmdline=list(LAUNCH), create_time=2),
@@ -214,6 +215,10 @@ class VllmTests(unittest.TestCase):
                     details[20 if reason.endswith("parent") else 10].cmdline += ["--data-parallel-size", "2"]
                 elif reason == "no parent":
                     parents = {}
+                elif reason == "own and parent":
+                    ports[10] = [8001]
+                elif reason == "worker listener":
+                    details[20].name, details[20].cmdline = "VLLM::EngineCore", []
                 nodes = chain(details, parents)
                 if reason in ("reused parent", "reused worker"):
                     nodes[20 if reason.endswith("parent") else 10].create_time.return_value = 99

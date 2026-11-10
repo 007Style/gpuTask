@@ -279,6 +279,8 @@ class Collector:
                     ports = self.inspector.exclusive_ports(p.pid)
                     if parent.ports and set(parent.ports) != set(ports):
                         return []  # a shared listener cannot identify a server
+                    if parent.vllm_role == "worker" and ports:
+                        return []
                     if parent.vllm_role == "server":
                         candidates.extend(ports)
                 return candidates if len(candidates) == 1 else []
@@ -394,6 +396,8 @@ class Collector:
                 parent_ports = []
             else:
                 parent_ports = self._parent_ports(row.pid, vllm=vllm)
+            if vllm and ports and parent_ports:
+                ports, parent_ports = [], []  # two possible server processes: do not pick one
             parent_origin = ("parent", tuple((pid, self.inspector.get(pid).create_time)
                                             for pid in row.detail.parents or []))
             own = self.prober.get(ports, key, kind=kind, origin=own_origin)

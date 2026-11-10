@@ -89,11 +89,12 @@ def inferred_note(g) -> str:
 METAL_NOTE = ("macOS: unified memory, so GPU memory is part of system RAM. Rows show each process's graphics "
               "footprint; other users' processes (WindowServer, daemons) show GPU% only, since reading their "
               "memory needs root.")
-INTEL_MEMORY_NOTE = ("Intel VRAM used is the sum of local memory resident in the processes gputaskman can inspect "
-                     "(the driver has no device-wide counter): buffers shared between processes can be counted "
-                     "twice, and kernel-owned memory and processes it can't inspect are missing. The total is the "
-                     "size of the card's local-memory PCI window, an estimate that can differ from its memory, so "
-                     "free memory is not shown.")
+INTEL_MEMORY_NOTE = ("Intel VRAM used is the sum of memory resident in the processes gputaskman can inspect "
+                     "(the driver has no device-wide counter): local memory on a discrete card, system memory on "
+                     "an integrated GPU. Buffers shared between processes can be counted twice, and kernel-owned "
+                     "memory and processes it can't inspect are missing. The total is the size of the card's "
+                     "local-memory PCI window, an estimate that can differ from its memory (0 on an integrated "
+                     "GPU, whose total is unknown), so free memory is not shown.")
 
 
 def intel_memory_note(s: Snapshot) -> str:
@@ -198,8 +199,10 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
         rx = nv.pcie_rx_kbs / 1024 if nv.pcie_rx_kbs is not None else None
         tx = nv.pcie_tx_kbs / 1024 if nv.pcie_tx_kbs is not None else None
         pstate = f"P{nv.pstate}" if nv.pstate is not None else "P N/A"
-        label = "AMD gfx" if nv.source.startswith("AMD ") else "GPU"
+        is_intel = nv.source == "Intel sysfs"
+        label = "AMD gfx" if nv.source.startswith("AMD ") else ("Intel GT" if is_intel else "GPU")
         clock = (f"gfx {format_metric(nv.gfx_clock)}" if nv.source.startswith("AMD ") else
+                 f"GT {format_metric(nv.sm_clock)}" if is_intel else
                  f"SM {format_metric(nv.sm_clock)}")
         power_kind = f" ({nv.power_kind})" if nv.power_kind else ""
         out.append(f"{label} {format_metric(nv.util_gpu, unit='%')}  mem-bandwidth {format_metric(nv.util_mem, unit='%')}  "

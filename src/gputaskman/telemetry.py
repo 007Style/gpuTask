@@ -33,6 +33,6 @@ class DeviceTelemetry:
     pcie_tx_kbs: int | None = None
     pcie_gen: int | None = None
     pcie_width: int | None = None
-    throttle: list[str] = field(default_factory=list)
+    throttle: list[str] | None = field(default_factory=list)  # None = unreadable (unknown), [] = readable and idle
     compute_cap: str = ""
     source: str = "NVML"

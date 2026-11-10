@@ -61,8 +61,9 @@ class DrmCard:
     # BAR) window, an estimate of the card's memory; 0 means unknown (an integrated GPU, or a discrete card
     # whose window is under 1 GiB). Per-process bytes still come from fdinfo.
     intel: bool = False
-    # Intel only: used local memory, stamped in each DrmCounters.sample() as the sum of the card's
-    # clients' local bytes (shared buffers can double-count); None = no readable client, unknown.
+    # Intel only: used memory, stamped in each DrmCounters.sample() as the sum of the card's
+    # clients' resident bytes (local bytes on a discrete card, system bytes on an integrated one;
+    # shared buffers can double-count); None = no readable client, unknown.
     vram_used: int | None = None
 
 
@@ -157,6 +158,13 @@ def parse_fdinfo(text: str) -> dict | None:
         # system0 includes buffers placed there on purpose, not only memory that spilled from local0.
         # There is no separate CPU-only region. These are i915's names; xe calls them vram0/gtt/system, so
         # its memory stays unknown until validated.
+        has_local = any("local0" in key for key in fields)
+        if fields["drm-driver"] == "i915" and not has_local:
+            # An integrated GPU has no local0 region at all, so there is no shared-local0 to require:
+            # the gate needs only the system0 region the device has. xe keeps the old gate (unknown keys).
+            required_shared = ("drm-shared-system0",)
+        else:
+            required_shared = ("drm-shared-local0", "drm-shared-system0")
         return {
             "driver": fields["drm-driver"],
             "client_id": client_id,
@@ -164,7 +172,7 @@ def parse_fdinfo(text: str) -> dict | None:
             # The shared-buffer gate needs every shared region present and parseable: any ambiguity keeps
             # the gate closed (None) instead of risking shared buffers being charged as private.
             "shared": (sum(shared_values) if shared_keys and None not in shared_values
-                       and all(k in fields for k in ("drm-shared-local0", "drm-shared-system0")) else None),
+                       and all(k in fields for k in required_shared) else None),
             "vram": intel_resident("drm-resident-local0", "drm-resident-stolen-local0"),
             "gtt": intel_resident("drm-resident-system0", "drm-resident-stolen-system0"),
             "cpu": None,
@@ -388,6 +396,39 @@ def _hwmon_clock(hwmon: str, label: str) -> int | None:
 _PCIE_GEN = {2.5: 1, 5.0: 2, 8.0: 3, 16.0: 4, 32.0: 5, 64.0: 6}
 
 
+# Active i915/xe throttle reasons, in a fixed order: each throttle_reason_* sysfs node holds 1 while
+# that limit holds the GPU back, 0 otherwise. An unreadable or unparseable node is skipped (unknown,
+# not inactive), so a partial read never reports "no throttling".
+_INTEL_THROTTLE = (
+    ("throttle_reason_pl1", "PL1"),
+    ("throttle_reason_pl2", "PL2"),
+    ("throttle_reason_pl4", "PL4"),
+    ("throttle_reason_prochot", "PROCHOT"),
+    ("throttle_reason_ratl", "RATL"),
+    ("throttle_reason_thermal", "thermal"),
+    ("throttle_reason_vr_tdc", "VR-TDC"),
+    ("throttle_reason_vr_thermalert", "VR-therm"),
+)
+
+
+def _intel_throttle(gt: str) -> list[str] | None:
+    """Names of the limits currently throttling an Intel GPU; empty when none is active.
+
+    _int already turns an unreadable or unparseable node into None, so those are skipped. None when no
+    node was readable at all: unknown, not "no throttling" (an empty list means readable and idle).
+    """
+    seen = False
+    active = []
+    for node, label in _INTEL_THROTTLE:
+        value = _int(os.path.join(gt, node))
+        if value is None:
+            continue
+        seen = True
+        if value:
+            active.append(label)
+    return active if seen else None
+
+
 def read_device(card: DrmCard, index: int) -> DeviceTelemetry:
     """NVIDIA-shaped device metrics for one AMD or Intel card, read from sysfs."""
     d = card.sysfs
@@ -432,12 +473,17 @@ def read_device(card: DrmCard, index: int) -> DeviceTelemetry:
     if card.intel:
         # The gt nodes hang off the DRM card itself (/sys/class/drm/cardN/gt/gt0), not the PCI device.
         gt = os.path.join(os.path.dirname(d), "gt", "gt0")
+        act = _int(os.path.join(gt, "rps_act_freq_mhz"))
         cur = _int(os.path.join(gt, "rps_cur_freq_mhz"))
+        # rps_act_freq_mhz is the actual frequency; rps_cur_freq_mhz is what the driver last requested
+        # (per the kernel's intel_gt_sysfs_pm.c). The actual one can read 0 while the GPU idles in RC6,
+        # which is a real reading, not a missing one; fall back to the requested one on kernels without it.
+        dev.sm_clock = act if act is not None else cur
         if cur is not None:
-            # rps_cur_freq_mhz is the frequency the driver last requested (rps_act_freq_mhz is the actual one,
-            # per the kernel's intel_gt_sysfs_pm.c); hwmon has no sclk on Intel. Not displayed yet.
+            # hwmon has no sclk on Intel; keep the requested frequency too, for the JSON.
             dev.gfx_clock = cur
         dev.sm_clock_max = _int(os.path.join(gt, "rps_RP0_freq_mhz"))
+        dev.throttle = _intel_throttle(gt)
         # sysfs current_link_* on i915/xe can report the power-on default instead of the live link
         # (2.5 GT/s x1 shown while a measured DMA transfer ran at ~19 GB/s), so both stay unset:
         # unknown beats a confidently wrong number.
@@ -577,19 +623,24 @@ class DrmCounters:
         return out
 
     def _stamp_intel_memory(self, clients: dict[tuple, list]) -> None:
-        """Intel cards expose no device-wide memory sysfs: used local memory is the sum of the card's
-        clients' resident local bytes, counted once per client even when several processes share it
+        """Intel cards expose no device-wide memory sysfs: used memory is the sum of the card's
+        clients' resident bytes, counted once per client even when several processes share it
         (buffers shared between clients can double-count, and clients that can't be inspected are missing;
         report.INTEL_MEMORY_NOTE says so). With no readable client the sum is None -- unknown, not 0."""
         for card in self.cards:
             if not card.intel:
                 continue
-            used = [c[1]["vram"] for _key, c in clients.items() if c[1]["pdev"] == card.pdev]
-            card.vram_used = sum(used) if used and None not in used else None
-            if any(v is not None for v in used):
+            local = [c[1]["vram"] for _key, c in clients.items() if c[1]["pdev"] == card.pdev]
+            card.vram_used = sum(local) if local and None not in local else None
+            if any(v is not None for v in local):
                 # A client reports local memory, so the card has some: discrete, whatever its BAR window says
                 # (a card without resizable BAR has a small window and no known total).
                 card.integrated = False
+            elif card.integrated:
+                # No local memory on an integrated GPU: its memory is the system memory its clients sit in.
+                # Sum that instead, with the same double-count caveat (an over-estimate, never a device reading).
+                gtt = [c[1]["gtt"] for _key, c in clients.items() if c[1]["pdev"] == card.pdev]
+                card.vram_used = sum(gtt) if gtt and None not in gtt else None
 
     def _start_time(self, pid: int) -> str | None:
         """Field 22 of /proc/<pid>/stat: tells a reused pid from the process cached under it."""
@@ -723,6 +774,7 @@ class DrmCounters:
 
     def sample(self) -> tuple[dict[int, dict[int, ProcGpu]], dict[int, AdapterGpu]]:
         by_pdev = {c.pdev: c.key for c in self.cards}
+        by_key = {c.key: c for c in self.cards}
         unified = {c.pdev for c in self.cards if c.unified_video}
         intel_pdevs = {c.pdev for c in self.cards if c.intel}
         procs: dict[int, dict[int, ProcGpu]] = {c.key: {} for c in self.cards}
@@ -757,6 +809,12 @@ class DrmCounters:
             infos = [c[1] for _k, c in held]
             vram = [i["vram"] for i in infos]
             gtt = [i["gtt"] for i in infos]
+            # An integrated Intel GPU has no local memory: system0 is its memory, not spill and not
+            # dedicated VRAM, so there is no shared (spill) counter for it. The bytes it holds are charged
+            # as the process's GPU memory in the VRAM column when provably private (below).
+            integrated_intel = by_key[key].intel and by_key[key].integrated
+            if integrated_intel:
+                proc.available.discard("shared")
             # Every buffer this process can reach, shared ones included: a reference, never summed (rule 1).
             complete = pid not in incomplete  # otherwise any sum would be a partial total that looks whole
             proc.resident_vram = float(sum(vram)) if complete and None not in vram else None
@@ -776,7 +834,8 @@ class DrmCounters:
                 reason = REASON_SHARED_BUFFERS
             elif not all(c[2] for _k, c in held):
                 reason = REASON_PRIMARY
-            elif proc.resident_vram is None or proc.resident_gtt is None:
+            elif proc.resident_gtt is None or (proc.resident_vram is None and not integrated_intel):
+                # No local memory on an integrated GPU, so only the system figure has to be known.
                 reason = REASON_LEGACY
             elif self.partial:
                 reason = REASON_PARTIAL_SCAN
@@ -784,6 +843,11 @@ class DrmCounters:
             if reason:
                 proc.attributed = False
                 proc.available -= {"dedicated", "shared"}
+            elif integrated_intel:
+                # Unified memory: the same system bytes are the charge (vram_bytes) and the reachable
+                # reference (gtt_resident_bytes). Both are measured and labelled; diff.py compares
+                # per-field and never sums them.
+                proc.dedicated = proc.resident_gtt
             else:
                 proc.dedicated = proc.resident_vram
                 proc.shared = proc.resident_gtt

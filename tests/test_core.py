@@ -24,7 +24,7 @@ from gputaskman.amdsmi import AmdSmi
 from gputaskman.adl import Adl, _Metrics
 from gputaskman.app import GpuTaskManager, spark, stacked_bar
 from gputaskman.cli import main
-from gputaskman.collector import Collector, ProcRow, Snapshot, select_adapter, select_nv_device
+from gputaskman.collector import Collector, ProcRow, Snapshot, _llm_wanted, select_adapter, select_nv_device
 from gputaskman.dxgi import Adapter
 from gputaskman.gguf import GgufInfo, read_gguf
 from gputaskman.handy import HandyEvidence, inspect_handy, _log_cache, _settings_cache
@@ -1106,6 +1106,36 @@ class ChartTests(unittest.TestCase):
         s.nv = NvDevice(index=0, util_gpu=0, util_mem=0)
         metrics = next(line for line in app.render_device(s).renderables if "Mem activity" in line.plain)
         self.assertTrue(any(span.style == colors["Mem activity"] for span in metrics.spans))
+
+
+class LlmWantedTests(unittest.TestCase):
+    """The LLM-breakdown gate: what measured memory a row needs on spill vs integrated GPUs."""
+
+    def _row(self, kind="LLM", models=("m.gguf",), diffusion=False, available=("dedicated", "shared")):
+        return SimpleNamespace(
+            kind=kind,
+            detail=SimpleNamespace(is_diffusion=diffusion, models=list(models)),
+            gpu=SimpleNamespace(available=set(available)),
+        )
+
+    def test_spill_backend_needs_both_counters(self):
+        self.assertTrue(_llm_wanted(self._row(), True))
+        row = self._row(available=("dedicated",))
+        self.assertFalse(_llm_wanted(row, True))  # discrete card without a spill counter: no breakdown
+        row = self._row(available=("shared",))
+        self.assertFalse(_llm_wanted(row, True))
+
+    def test_integrated_gpu_needs_only_dedicated(self):
+        # An integrated GPU has no spill counter; a provably private client's memory suffices.
+        self.assertTrue(_llm_wanted(self._row(available=("dedicated",)), False))
+        row = self._row(available=set())
+        self.assertFalse(_llm_wanted(row, False))
+
+    def test_non_ai_and_diffusion_rows_are_out(self):
+        self.assertFalse(_llm_wanted(self._row(kind="3D/game"), False))
+        self.assertFalse(_llm_wanted(self._row(diffusion=True), True))
+        # Kind LLM alone still wants a view when its counters are measured.
+        self.assertTrue(_llm_wanted(self._row(kind="LLM", models=()), True))
 
 
 class UiTests(unittest.IsolatedAsyncioTestCase):

@@ -69,6 +69,7 @@ MODEL_KINDS = {"LLM": "LLM", "decision model": "decision", "embedding model": "e
                "reranker": "embedding", "speech model": "speech"}
 AI_KINDS = {"LLM", "decision", "decision?", "embedding", "speech", "diffusion", "AI"}
 _DECISION_NAME = re.compile(r"(?<![a-z0-9])(?:openjev|laya|julia-1|lev|kev)(?![a-z0-9])", re.I)
+_VLLM_WORKER = re.compile(r"VLLM::(?:EngineCore|Worker_TP[0-9]+)")
 MiB = 1 << 20
 INSTALLED_TTL = 300.0
 _SKIP_DIRS = {"ebwebview", "cache", "code cache", "gpucache", "node_modules", "logs", "crashpad", "locales", "__pycache__"}
@@ -132,6 +133,33 @@ class ProcDetail:
     @property
     def is_diffusion(self) -> bool:
         return _is_diffusion_cmdline(self.cmdline)
+
+    @property
+    def vllm_role(self) -> str:
+        """A process signature, not evidence that a model is resident in this process."""
+        if any(_VLLM_WORKER.fullmatch(s) for s in (self.name, *self.cmdline[:1])):
+            return "worker"
+        cmd = self.cmdline
+        names = [arg.replace("\\", "/").rsplit("/", 1)[-1] for arg in cmd[:2]]
+        if len(cmd) >= 2 and names[0] in ("vllm", "vllm.exe") and cmd[1] == "serve":
+            return "server"
+        if names and re.fullmatch(r"python(?:[0-9]+(?:\.[0-9]+)*)?(?:\.exe)?", names[0]):
+            if len(cmd) >= 3 and names[1] in ("vllm", "vllm.exe") and cmd[2] == "serve":
+                return "server"
+            args = cmd[1:]
+            while args and args[0] in ("-u", "-B", "-E", "-s", "-S", "-I", "-O", "-OO"):
+                args = args[1:]
+            if args[:2] == ["-m", "vllm.entrypoints.openai.api_server"]:
+                return "server"
+        return ""
+
+    @property
+    def vllm_ambiguous(self) -> bool:
+        # Distributed/data-parallel layouts need an ownership graph, not just two ancestors.
+        return any(arg.split("=", 1)[0].startswith("--data-parallel") or
+                   arg.split("=", 1)[0] in ("--distributed-executor-backend", "--nnodes", "--node-rank",
+                                          "--headless", "--api-server-count")
+                   for arg in self.cmdline)
 
 
 def _lib_name(base: str) -> str | None:
@@ -447,7 +475,7 @@ def classify(d: ProcDetail, engines: dict[str, float]) -> str:
             return k
     if any(m.kind_hint == "decision model" for m in d.models):
         return "decision?"
-    if "llama.cpp" in d.runtimes or n.startswith(LLM_NAMES):
+    if d.vllm_role or "llama.cpp" in d.runtimes or n.startswith(LLM_NAMES):
         return "LLM"
     video = engines.get("decode", 0) + engines.get("encode", 0) + engines.get("video", 0) > 1
     if d.is_ai and not video:

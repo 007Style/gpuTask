@@ -11,6 +11,7 @@ The process's real VRAM total always comes from Windows, so the remainder is nev
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import os
 import re
@@ -169,12 +170,12 @@ def redact_cmdline(cmd: list[str]) -> list[str]:
     return out
 
 
-def _get(url: str, timeout: float = 0.5, key: str | None = None):
+def _get(url: str, timeout: float = 0.5, key: str | None = None, redirects: bool = True):
     headers = {"Accept": "application/json"}
     if key:
         headers["Authorization"] = f"Bearer {key}"
     try:
-        with (_keyed_opener if key else _opener).open(urllib.request.Request(url, headers=headers),
+        with (_keyed_opener if key or not redirects else _opener).open(urllib.request.Request(url, headers=headers),
                                                        timeout=timeout) as r:
             if r.status != 200:
                 return None
@@ -191,7 +192,7 @@ def _get(url: str, timeout: float = 0.5, key: str | None = None):
 
 @dataclass
 class ServerInfo:
-    kind: str  # llama-server | ollama | lmstudio
+    kind: str  # llama-server | ollama | lmstudio | vllm
     url: str
     n_ctx: int | None = None
     slots_total: int | None = None
@@ -251,13 +252,30 @@ def lmstudio_models(v1: dict | None, v0: dict | None) -> list[dict] | None:
     return None
 
 
-def probe_server(port: int, prev: ServerInfo | None = None, key: str | None = None) -> ServerInfo | None:
+def vllm_models(response) -> list[dict] | None:
+    """Model identifiers only: the OpenAI list says nothing about bytes or worker placement."""
+    if not isinstance(response, dict) or not isinstance(response.get("data"), list):
+        return None
+    entries = response["data"]
+    if any(not isinstance(m, dict) or not isinstance(m.get("id"), str) or not m["id"].strip() for m in entries):
+        return None
+    return [_model_entry(m["id"]) for m in entries]
+
+
+def probe_server(port: int, prev: ServerInfo | None = None, key: str | None = None,
+                 kind: str | None = None) -> ServerInfo | None:
     """Read-only GETs. Never calls inference, load or download endpoints.
 
     Returns UNAUTHORIZED when the port answers 401 and no key (or a wrong one) was sent. Probing stops there,
     so a locked server logs one rejected request per probe instead of one per endpoint.
     """
     base = f"http://127.0.0.1:{port}"
+    if kind == "vllm":
+        response = _get(base + "/v1/models", key=key, redirects=False)
+        if response is UNAUTHORIZED:
+            return UNAUTHORIZED
+        models = vllm_models(response)
+        return ServerInfo("vllm", base, models=models) if models is not None else None
     props = _get(base + "/props", key=key)
     if props is UNAUTHORIZED:
         return UNAUTHORIZED
@@ -298,33 +316,44 @@ class ServerProber:
     TTL_HIT, TTL_MISS = 3.0, 30.0
 
     def __init__(self) -> None:
-        self._cache: dict[int, tuple[float, ServerInfo | None]] = {}
-        self._last: dict[int, ServerInfo] = {}
+        self._cache: dict[tuple, tuple[float, ServerInfo | None]] = {}
+        self._last: dict[tuple, ServerInfo] = {}
+        self._locked: set[tuple] = set()
         self.locked: set[int] = set()  # ports whose last probe was refused with 401
 
-    def get(self, ports: list[int], key: str | None = None) -> ServerInfo | None:
+    @staticmethod
+    def _identity(port: int, key: str | None, kind: str | None, origin: object) -> tuple:
+        # Never retain the key itself; authenticated own-port results cannot satisfy a parent probe.
+        return port, kind, origin, hashlib.sha256(key.encode()).digest() if key else None
+
+    def get(self, ports: list[int], key: str | None = None, *, kind: str | None = None,
+            origin: object = "process") -> ServerInfo | None:
         now = time.time()
         for port in ports:
-            hit = self._cache.get(port)
+            identity = self._identity(port, key, kind, origin)
+            hit = self._cache.get(identity)
             if hit and now - hit[0] < (self.TTL_HIT if hit[1] else self.TTL_MISS):
                 info = hit[1]
             else:
-                info = probe_server(port, self._last.get(port), key)
+                info = probe_server(port, self._last.get(identity), key, kind=kind)
                 if info is UNAUTHORIZED:
+                    self._locked.add(identity)
                     self.locked.add(port)
                     info = None
                 else:
+                    self._locked.discard(identity)
                     self.locked.discard(port)
-                self._cache[port] = (now, info)
+                self._cache[identity] = (now, info)
                 if info:
-                    self._last[port] = info
+                    self._last[identity] = info
             if info:
                 return info
         return None
 
-    def locked_port(self, ports: list[int]) -> int | None:
+    def locked_port(self, ports: list[int], key: str | None = None, *, kind: str | None = None,
+                    origin: object = "process") -> int | None:
         """First of these ports whose last probe was refused for a missing or wrong API key."""
-        return next((p for p in ports if p in self.locked), None)
+        return next((p for p in ports if self._identity(p, key, kind, origin) in self._locked), None)
 
 
 # ---------------------------------------------------------------- the breakdown
@@ -346,6 +375,7 @@ class LlmView:
     flags: dict = field(default_factory=dict)
     server: ServerInfo | None = None
     host: ServerInfo | None = None  # managing front-end (Ollama / LM Studio) when the runner has its own server
+    server_source: str | None = None  # process | parent; an API report, not proof of worker residency
     log_source: str | None = None
     log: dict | None = None
     segments: list[Segment] = field(default_factory=list)
@@ -406,8 +436,16 @@ def _merge_api(files: list[MappedModel], server: ServerInfo | None, host: Server
 
 
 def build_view(d: ProcDetail, vram: float, shared: float, server: ServerInfo | None,
-               log_path: str | None = None, host: ServerInfo | None = None, attributed: bool = True) -> LlmView:
-    v = LlmView(flags=parse_flags(d.cmdline), server=server, host=host)
+               log_path: str | None = None, host: ServerInfo | None = None, attributed: bool = True,
+               server_source: str | None = None) -> LlmView:
+    v = LlmView(flags=parse_flags(d.cmdline), server=server, host=host,
+                server_source=(server_source or "process") if server else None)
+    if server and server.kind == "vllm":
+        source = "parent process" if v.server_source == "parent" else "process's own listener"
+        v.notes.append(f"vLLM API reported via {source}; model IDs do not prove this process's "
+                       "model residency, weights, KV cache or GPU placement.")
+    elif d.vllm_role and not server:
+        v.notes.append("vLLM process signature only; no unambiguous local API association was established.")
     files = [dataclasses.replace(m, sources=list(m.sources)) for m in d.models]  # cached details stay untouched
     matched = _merge_api(files, server, host)
     for m in files:

@@ -857,6 +857,8 @@ class GpuTaskManager(App):
             if v.server:
                 sv = v.server
                 st = Text.assemble(("server ", "bold"), (f"{sv.kind} {sv.url}", "cyan"))
+                if v.server_source == "parent":
+                    st.append(" (parent process; API report, not worker residency)")
                 if sv.n_ctx:
                     st.append(f"  ctx {sv.n_ctx:,}")
                 if sv.slots_total is not None:
@@ -868,6 +870,8 @@ class GpuTaskManager(App):
                 for m in sv.models[:4]:
                     if sv.kind == "lmstudio":
                         st.append(f"\n  loaded: {m['name']} {m.get('type') or ''} {m.get('quant') or ''} ctx {m.get('ctx') or '?'}")
+                    elif sv.kind == "vllm":
+                        st.append(f"\n  API-reported model ID: {m['name']}")
                 out.append(st)
             for n in v.notes:
                 out.append(Text("• " + n, style="bold red" if n.startswith("!") else "grey70"))

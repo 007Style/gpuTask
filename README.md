@@ -752,6 +752,7 @@ reading is NVML's memory-activity percentage, **not measured bandwidth in GB/s**
 | llama.cpp / llama-server | GGUF discovery, CLI settings, buffer logs, `/props` + `/v1/models` state; exercised live |
 | Ollama | Bundled runners, mapped GGUF blobs named from Ollama manifests (`qwen3:14b`), parent `/api/ps`, compatible `server.log`; exercised live |
 | LM Studio | Mapped files named from its models folder, `/api/v1/models` (falls back to `/api/v0/models`); tested with fixture responses, not yet end to end |
+| vLLM | Recognized launch/worker signatures; `/v1/models` identifiers from an own listener or a verified parent, labelled API-reported, never worker residency or memory placement. Fixture-tested, including a real lightweight child process and HTTP listener; live Linux single-GPU and TP hardware **not validated** |
 | stable-diffusion.cpp (`--diffusion-model`) | Diffusion, text-encoder and VAE files from launch arguments; no LLM memory breakdown |
 | Hugging Face cache | `models--org--repo` paths are named `org/repo` |
 | Other AI runtimes | DLL detection, plus model files installed with the app (marked *not proven loaded*) |
@@ -761,8 +762,26 @@ reading is NVML's memory-activity percentage, **not measured bandwidth in GB/s**
 
 WinML can select different execution backends; a local helper/service is still **local**, not
 cloud-hosted. The GPU counters belong to whichever process holds/uses the GPU resources.
-Parent-PID lookup currently helps find Ollama/LM Studio APIs; it is not a general cross-process
+Parent-PID lookup currently helps find Ollama/LM Studio and local vLLM APIs; it is not a general cross-process
 ownership graph for shared Windows services.
+
+For vLLM, `vllm serve`, `python -m vllm.entrypoints.openai.api_server`, `VLLM::EngineCore`,
+`VLLM::Worker` and `VLLM::Worker_TP<n>` are detection hints, not loading evidence. An inherited launch command
+also works without process titles. Worker discovery checks at most two live ancestors, their
+creation times and their signatures. Only one exclusively owned listening port on one recognized
+server is accepted; shared/multiple listeners, unrelated or inaccessible ancestry and explicit
+distributed/data-parallel options give no association. There is no port scanning or matching by
+model name. Processes outside the visible PID namespace are not linked to local servers.
+Source-grounded fixtures follow upstream vLLM commit
+[`499a3d1`](https://github.com/vllm-project/vllm/tree/499a3d1e1e338e3e866c0719cfe1f429e2b0b762):
+the default single-API launcher keeps its command line, starts EngineCore, and EngineCore starts
+TP workers. `VLLM::APIServer_<index>` belongs to the separate multi-API path and is not supported.
+
+The table, inspector and text label these identifiers as API-reported, with **parent process**
+when applicable. JSON has `llm.server_source` (`"process"`, `"parent"`, or `null`) alongside
+`llm.server.models[].name`. A reported ID is not a model file or evidence that a worker holds
+that model; it adds no weights, KV-cache, context-size or GPU-placement estimate. Measured memory
+and attributed totals are unchanged.
 
 GPU-backed WinML and Studio Effects paths have **not been validated on a Copilot+ PC**. A future
 hardware check should compare idle versus active workload samples, record the actual GPU adapter
@@ -833,6 +852,7 @@ Identification is designed to stay cheap. Measured on one Windows machine:
 | Memory-map scan (DLLs + mapped files) | 1-50 ms per process | New processes, a 64 MiB / 10% memory change, or every 2 min; at most 150 ms per refresh |
 | GGUF header, model-store manifests | ms, cached | Once per file / every 60 s |
 | Local API probes | ms, local only | llama-server `/v1/models` only when its model path changes |
+| vLLM `/v1/models` | 1.32 ms median, 21.36 ms max in 30 loopback fixture GETs; cached lookup ~0.0004 ms (Windows 11 build 28000, ARM64; no vLLM runtime/GPU workload) | One GET, 0.5 s timeout and 4 MiB response cap; success cached 3 s, misses/401 cached 30 s. No redirects; actual Linux/vLLM latency unmeasured |
 | `psutil.open_files()` | 0.6-2.5 s per process | Never |
 | AMD and Intel on Linux: DRM fdinfo scan (`readlink` every fd, read fdinfo of `/dev/dri` ones) | ~9 ms for ~8,000 fds (AMD, Linux desktop; Intel not measured) | Every refresh, only when an amdgpu or Intel card is shown; listing fds is bounded to 50 ms in the TUI and resumes next refresh, known GPU fds are still read |
 | macOS: `ioreg` device stats + Metal clients | ~10 ms | Every refresh |
@@ -866,6 +886,12 @@ to JSON, and the inspector shows it as `***`. A key in `--api-key-file` or `LLAM
 gputaskman does not open a path taken from another process's command line, and an environment variable
 can't be seen from outside the process. In that case the probe stops at the first 401, so the server logs
 one rejected request every 30 seconds, and the inspector says why server details are missing.
+
+vLLM uses only `/v1/models`, with the same request bounds and cache intervals. Parent-discovered
+ports are **always unauthenticated**, even when parent and worker launch arguments match:
+the worker's key is never sent there. A 401 is shown as **Parent-process API locked**.
+Probe caches separate own/parent origins, process creation times, runtime and credentials, so
+an authenticated own-port result cannot silently satisfy a parent request.
 
 Ollama's local `server.log` is considered when one Ollama runner is detected. Log formats,
 rotation, and stale load blocks can affect attribution, so compare the reported model and

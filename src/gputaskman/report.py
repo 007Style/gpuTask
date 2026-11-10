@@ -151,6 +151,7 @@ def to_dict(s: Snapshot) -> dict:
                 "segments": [dataclasses.asdict(x) for x in p.llm.segments],
                 "kv_bytes_per_token": p.llm.kv_per_token, "n_ctx": p.llm.n_ctx, "flags": p.llm.flags,
                 "server": dataclasses.asdict(p.llm.server) if p.llm.server else None,
+                "server_source": p.llm.server_source,
                 "log_source": p.llm.log_source, "notes": p.llm.notes,
             }
         procs.append(item)
@@ -270,6 +271,11 @@ def to_text(s: Snapshot, limit: int = 30) -> str:
             sv = p.llm.server
             out.append(f"   server: {sv.kind} {sv.url} ctx={sv.n_ctx} slots={sv.slots_busy}/{sv.slots_total}"
                        + (f" gen={sv.gen_tok_s:.1f} tok/s" if sv.gen_tok_s is not None else ""))
+            if p.llm.server_source == "parent":
+                out.append("   server source: parent process (API report, not worker residency)")
+            if sv.kind == "vllm":
+                for m in sv.models:
+                    out.append(f"   API-reported model ID: {m['name']}")
         if p.llm.log_source:
             out.append(f"   exact sizes from log: {p.llm.log_source}")
         for n in p.llm.notes:

@@ -79,6 +79,9 @@ class ProcRow:
                 return f"Handy last log ({self.handy.last_event}): {self.handy.last_model.rsplit('/', 1)[-1]}"
             if self.handy.selected_model:
                 return f"Handy selected (not load proof): {self.handy.selected_model.rsplit('/', 1)[-1]}"
+        if self.llm and self.llm.server and self.llm.server.kind == "vllm" and self.llm.server.models:
+            source = "parent API" if self.llm.server_source == "parent" else "API"
+            return f"reported ({source}): " + ", ".join(m["name"] for m in self.llm.server.models)
         if self.llm and self.llm.models:
             parts = []
             for i, g in enumerate(self.llm.models):
@@ -246,8 +249,43 @@ class Collector:
         self._own_start = time.time()  # our NVML context is created now, not when the process started
         self._host_restarted = time.time()
 
-    def _parent_ports(self, pid: int, depth: int = 2) -> list[int]:
+    def _parent_ports(self, pid: int, depth: int = 2, *, vllm: bool = False) -> list[int]:
         d = self.inspector.get(pid)
+        if vllm:
+            d.parents = []
+            candidates = []
+            try:
+                p = psutil.Process(pid)
+                if not d.create_time or p.create_time() != d.create_time or d.vllm_ambiguous:
+                    return []
+                child_start = d.create_time
+                seen = {pid}
+                for _ in range(depth):
+                    p = p.parent()
+                    if p is None:
+                        break
+                    parent = self.inspector.get(p.pid)
+                    if p.pid in seen or not parent.create_time or parent.create_time != p.create_time():
+                        return []
+                    if parent.create_time > child_start:
+                        return []
+                    if not parent.vllm_role:
+                        break
+                    if parent.vllm_ambiguous:
+                        return []
+                    seen.add(p.pid)
+                    d.parents.append(p.pid)
+                    child_start = parent.create_time
+                    ports = self.inspector.exclusive_ports(p.pid)
+                    if parent.ports and set(parent.ports) != set(ports):
+                        return []  # a shared listener cannot identify a server
+                    if parent.vllm_role == "worker" and ports:
+                        return []
+                    if parent.vllm_role == "server":
+                        candidates.extend(ports)
+                return candidates if len(candidates) == 1 else []
+            except (psutil.Error, OSError):
+                return []
         if d.parents is None:
             d.parents = []
             try:
@@ -349,20 +387,37 @@ class Collector:
                 continue
             ports = self.inspector.exclusive_ports(row.pid)
             key = api_key(row.detail.cmdline)
-            own = self.prober.get(ports, key)
-            host = self.prober.get(self._parent_ports(row.pid))  # Ollama / LM Studio front-end process
+            vllm = bool(row.detail.vllm_role)
+            kind = "vllm" if vllm else None
+            own_origin = ("process", row.pid, row.detail.create_time)
+            if vllm and (row.detail.vllm_ambiguous or len(ports) > 1 or
+                         set(ports) != set(row.detail.ports)):
+                ports = []
+                parent_ports = []
+            else:
+                parent_ports = self._parent_ports(row.pid, vllm=vllm)
+            if vllm and ports and parent_ports:
+                ports, parent_ports = [], []  # two possible server processes: do not pick one
+            parent_origin = ("parent", tuple((pid, self.inspector.get(pid).create_time)
+                                            for pid in row.detail.parents or []))
+            own = self.prober.get(ports, key, kind=kind, origin=own_origin)
+            host = self.prober.get(parent_ports, kind=kind, origin=parent_origin)
             log = ollama_log_path() if row in ollama_runners and len(ollama_runners) == 1 else None
             # On an APU, GTT is the GPU's ordinary memory (often most of it), not spill: count it as held memory.
             held = (row.gpu.shown_vram or 0) + (0 if snap.shared_is_spill else (row.gpu.shared or 0))
             row.llm = build_view(row.detail, held, row.gpu.shared if snap.shared_is_spill else 0,
                                  own or host, log, host=host if own else None,
-                                 attributed=row.gpu.shown_vram is not None)
-            locked = None if own else self.prober.locked_port(ports)
+                                 attributed=row.gpu.shown_vram is not None,
+                                 server_source="process" if own else "parent" if host else None)
+            locked = None if own else self.prober.locked_port(ports, key, kind=kind, origin=own_origin)
             if locked:
                 why = ("rejected the key from the launch arguments" if key else
                        "wants an API key, and none was found in the launch arguments (keys from LLAMA_API_KEY "
                        "or --api-key-file are not read)")
                 row.llm.notes.append(f"Local API on port {locked} {why}. Server details are skipped.")
+            if not host and self.prober.locked_port(parent_ports, kind=kind, origin=parent_origin):
+                row.llm.notes.append("Parent-process API locked (401). Parent probes never send the worker's "
+                                     "API key; parent server details are skipped.")
 
         self.inspector.prune(set(procs))
         return snap
